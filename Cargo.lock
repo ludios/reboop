@@ -304,7 +304,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "template"
+name = "reboop"
 version = "0.1.0"
 dependencies = [
  "anyhow",

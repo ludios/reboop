@@ -7,9 +7,9 @@ use tracing_subscriber::EnvFilter;
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
-#[clap(name = "template", version)]
-/// template
-enum TemplateCommand {
+#[clap(name = "reboop", version)]
+/// reboop
+enum ReboopCommand {
     /// Do something
     #[clap(name = "something")]
     Something {}
@@ -24,9 +24,9 @@ fn main() {
         .with_env_filter(env_filter)
         .init();
 
-    let command = TemplateCommand::parse();
+    let command = ReboopCommand::parse();
     match command {
-        TemplateCommand::Something {} => {
+        ReboopCommand::Something {} => {
             info!("something");
         }
     }
