@@ -24,11 +24,21 @@ Managing LUKS keys:
 
 ## Configuration file
 
+~/.config/reboop/defaults.json (use JSON5 or JSONC, whatever's better for Rust)
+
+{
+    "ssh_port": 904,
+    "initrd_ssh_port": 23,
+    "scrub_mounts": ["/"],
+    "max_network_transfer_bytes_per_sec": 1000000,
+    "max_load_average_1min": 2,
+}
+
 ~/.config/reboop/machines.jsonl
 
-{"hostname": "one", "ipv4": "..."}
+{"hostname": "one", "ipv4": "...", "ssh_port": 22, "initrd_ssh_port": 23}
 {"hostname": "two", "ipv4": "...", "scrub_mounts": ["/", "/small"]}
-{"hostname": "three", "ipv4": "...", "max_network_transfer_per_sec": 1000000, "max_load_average_1min": 2}
+{"hostname": "three", "ipv4": "...", "max_network_transfer_bytes_per_sec": 1000000, "max_load_average_1min": 2}
 
 ## Preflight
 
