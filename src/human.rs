@@ -26,6 +26,7 @@ pub fn bytes(bytes: u64) -> String {
 /// Formats a rate in bytes per second, in kB/s or more so that every rate
 /// has two decimals, e.g. "0.52 kB/s" or "1.39 GB/s".
 pub fn rate(bytes_per_sec: f64) -> String {
+    assert!(bytes_per_sec.is_finite() && bytes_per_sec >= 0.0, "not a rate: {bytes_per_sec}");
     format!("{}/s", kilobytes_or_more(bytes_per_sec))
 }
 

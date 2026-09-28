@@ -328,7 +328,7 @@ impl ScrubStatus {
                 let left = self.seconds_left.map_or("unknown time".to_string(), human::seconds);
                 let total = self.total_bytes.unwrap_or(0);
                 let percent = if total == 0 { 0.0 } else { 100.0 * self.scrubbed_bytes as f64 / total as f64 };
-                let rate = self.bytes_per_sec.map_or("?/s".to_string(), |rate| human::rate(rate as f64));
+                let rate = self.bytes_per_sec.map_or("?/s".to_string(), |bytes_per_sec| human::rate(bytes_per_sec as f64));
                 format!("scrub has {left} left, {scrubbed} of {} ({percent:.2}%) scrubbed at {rate}, {errors}", human::bytes(total))
             }
             ScrubState::Finished => format!("scrub finished, {scrubbed} scrubbed, {errors}"),
