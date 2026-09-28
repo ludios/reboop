@@ -4,7 +4,7 @@
 
 use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
@@ -48,7 +48,7 @@ pub fn kernel_release(session: &mut Session, system: &str) -> Result<String> {
 }
 
 /// The NixOS configurations and kernels involved in a reboot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Systems {
     /// The configuration that's active now (it changes on switch).
     pub current: String,

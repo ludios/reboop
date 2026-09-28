@@ -4,15 +4,16 @@
 //! interrupt, and scrubs.
 
 use crate::deadline::Deadline;
+use crate::human;
 use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
 
 /// A mounted btrfs filesystem.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Filesystem {
     pub uuid: String,
     /// One of the places it's mounted.
@@ -60,7 +61,8 @@ pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Re
     Ok(session.run_ok(&format!("cat {}", shell_quote(&path)), QUICK)?.trim_end().to_string())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScrubState {
     /// btrfs-progs has no record of a scrub.
     NeverRan,
@@ -73,7 +75,7 @@ pub enum ScrubState {
 }
 
 /// The state of the latest scrub of a filesystem.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScrubStatus {
     pub state: ScrubState,
     /// When the scrub started or was last resumed, as btrfs-progs prints it.
@@ -219,39 +221,11 @@ pub fn wait_for_scrub(
     }
 }
 
-/// Formats a byte count with SI units, e.g. "130.50GB".
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
-    if bytes < 1000 {
-        return format!("{bytes}B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = "B";
-    for next in UNITS {
-        if value < 1000.0 {
-            break;
-        }
-        value /= 1000.0;
-        unit = next;
-    }
-    format!("{value:.2}{unit}")
-}
-
-/// Formats seconds like "1h 2m 3s", leaving out leading zero units.
-fn format_seconds(seconds: u64) -> String {
-    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    match (hours, minutes) {
-        (0, 0) => format!("{seconds}s"),
-        (0, _) => format!("{minutes}m {seconds}s"),
-        _ => format!("{hours}h {minutes}m {seconds}s"),
-    }
-}
-
 impl ScrubStatus {
     /// One line for people, e.g. "scrub has 3m 30s left, 130.50GB of
     /// 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found".
     pub fn summary(&self) -> String {
-        let scrubbed = format_bytes(self.scrubbed_bytes);
+        let scrubbed = human::bytes(self.scrubbed_bytes);
         let errors = if self.errors.is_empty() {
             "no errors found".to_string()
         } else {
@@ -261,11 +235,11 @@ impl ScrubStatus {
         match self.state {
             ScrubState::NeverRan => "no scrub has run".to_string(),
             ScrubState::Running => {
-                let left = self.seconds_left.map_or("unknown time".to_string(), format_seconds);
+                let left = self.seconds_left.map_or("unknown time".to_string(), human::seconds);
                 let total = self.total_bytes.unwrap_or(0);
                 let percent = if total == 0 { 0.0 } else { 100.0 * self.scrubbed_bytes as f64 / total as f64 };
-                let rate = self.bytes_per_sec.map_or("?".to_string(), format_bytes);
-                format!("scrub has {left} left, {scrubbed} of {} ({percent:.2}%) scrubbed at {rate}/s, {errors}", format_bytes(total))
+                let rate = self.bytes_per_sec.map_or("?".to_string(), human::bytes);
+                format!("scrub has {left} left, {scrubbed} of {} ({percent:.2}%) scrubbed at {rate}/s, {errors}", human::bytes(total))
             }
             ScrubState::Finished => format!("scrub finished, {scrubbed} scrubbed, {errors}"),
             ScrubState::Aborted => format!("scrub was cancelled after {scrubbed}, {errors}"),
@@ -367,15 +341,5 @@ mod tests {
                 Filesystem { uuid: "bbb".into(), mountpoint: "/mnt/with space".into() },
             ]
         );
-    }
-
-    #[test]
-    fn formats() {
-        assert_eq!(format_bytes(999), "999B");
-        assert_eq!(format_bytes(1_000), "1.00kB");
-        assert_eq!(format_bytes(391_560_000_000), "391.56GB");
-        assert_eq!(format_seconds(5), "5s");
-        assert_eq!(format_seconds(210), "3m 30s");
-        assert_eq!(format_seconds(3723), "1h 2m 3s");
     }
 }

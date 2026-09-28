@@ -1,6 +1,9 @@
+// Model-output: Claude Opus 5.5
+
 use clap::Parser;
 use mimalloc::MiMalloc;
-use tracing::info;
+use reboop::check;
+use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -8,14 +11,21 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[clap(name = "reboop", version)]
-/// reboop
+/// Carefully reboots NixOS machines
 enum ReboopCommand {
-    /// Do something
-    #[clap(name = "something")]
-    Something {}
+    /// Show whether machines are okay to reboot, and the facts behind that.
+    /// Exits 0 if all are, 2 if any isn't, or 1 if any couldn't be checked.
+    #[clap(name = "check")]
+    Check {
+        /// Machines from machines.jsonl (default: all of them)
+        hostnames: Vec<String>,
+        /// Print JSON instead of a table
+        #[clap(long)]
+        json: bool,
+    },
 }
 
-fn main() {
+fn main() -> ExitCode {
     let env_filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("warn"))
         .unwrap();
@@ -25,9 +35,14 @@ fn main() {
         .init();
 
     let command = ReboopCommand::parse();
-    match command {
-        ReboopCommand::Something {} => {
-            info!("something");
+    let result = match command {
+        ReboopCommand::Check { hostnames, json } => check::run(&hostnames, json),
+    };
+    match result {
+        Ok(status) => ExitCode::from(status),
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
         }
     }
 }

@@ -14,14 +14,17 @@ use anyhow::{Result, bail, ensure};
 use harness::{Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::btrfs::{self, ScrubState};
+use reboop::config::Machine;
 use reboop::deadline::{Deadline, Permanent};
 use reboop::facts;
 use reboop::initrd::{self, UnlockError};
+use reboop::preflight;
 use reboop::processes::{self, Activity};
 use reboop::reboot::{self, Stopped};
 use reboop::ssh::{Session, wait_for_session};
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,6 +216,33 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     // The builder goes away a moment after the build is stopped.
     clean_up(&mut session)?;
     wait_for(|| Ok(activities(&mut session)?.is_empty()))?;
+    Ok(())
+}
+
+fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert!(preflight::gather(&mut session, "someone-else").is_err());
+
+    let machine = Machine {
+        hostname: harness::HOSTNAME.into(),
+        ipv4: Ipv4Addr::LOCALHOST,
+        ssh_port: vm.target.port,
+        initrd_ssh_port: vm.initrd_target.port,
+        scrub_mounts: vec!["/".into()],
+        max_network_transfer_bytes_per_sec: 1_000_000,
+        // The VM's load depends on whatever else its host is doing.
+        max_load_average_1min: 100.0,
+    };
+    let facts = preflight::gather(&mut session, &machine.hostname)?;
+    assert_eq!(facts.systems, facts::systems(&mut session)?);
+    assert!(facts.btrfs.iter().any(|fs| fs.filesystem.mountpoint == "/"), "{facts:#?}");
+    assert_eq!(preflight::blockers(&machine, &facts), Vec::<String>::new(), "{facts:#?}");
+
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
+    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
+    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: pid ")), "{blockers:?}");
+    clean_up(&mut session)?;
     Ok(())
 }
 
@@ -409,6 +439,7 @@ fn main() {
         ("identity_and_systems", identity_and_systems),
         ("network_sample_sees_traffic", network_sample_sees_traffic),
         ("activities_are_detected", activities_are_detected),
+        ("preflight_finds_blockers", preflight_finds_blockers),
         ("btrfs_root_is_idle", btrfs_root_is_idle),
         ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
         ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),

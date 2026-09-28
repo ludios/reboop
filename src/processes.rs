@@ -4,9 +4,11 @@
 
 use crate::ssh::{QUICK, Session};
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
+use std::fmt;
 
 /// A process, as listed by ps(1).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
@@ -17,13 +19,25 @@ pub struct Process {
 }
 
 /// Something going on that a reboot would interrupt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Activity {
     /// A Nix command, a remote build or copy being served, or a builder.
     Nix,
     SwitchToConfiguration,
     Tmux,
     Rsync,
+}
+
+impl fmt::Display for Activity {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Activity::Nix => "nix",
+            Activity::SwitchToConfiguration => "switch-to-configuration",
+            Activity::Tmux => "tmux",
+            Activity::Rsync => "rsync",
+        })
+    }
 }
 
 /// Programs that are Nix clients.  (Not nix-daemon itself: it has a worker
