@@ -2,11 +2,12 @@
 
 //! Formatting quantities and tables for people.
 
-/// Formats a byte count with SI units, e.g. "130.50 GB".
-pub fn bytes(bytes: u64) -> String {
+/// A byte count in SI units: the number (with two decimals unless the unit
+/// is bytes) and the unit, e.g. ("130.50", "GB").
+fn scaled(bytes: u64) -> (String, &'static str) {
     const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
     if bytes < 1000 {
-        return format!("{bytes} B");
+        return (bytes.to_string(), "B");
     }
     let mut value = bytes as f64;
     let mut unit = "B";
@@ -18,12 +19,26 @@ pub fn bytes(bytes: u64) -> String {
         value /= 1000.0;
         unit = next;
     }
-    format!("{value:.2} {unit}")
+    (format!("{value:.2}"), unit)
+}
+
+/// Formats a byte count with SI units, e.g. "130.50 GB".
+pub fn bytes(bytes: u64) -> String {
+    let (number, unit) = scaled(bytes);
+    format!("{number} {unit}")
 }
 
 /// Formats a rate in bytes per second, e.g. "1.39 GB/s".
 pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", bytes(bytes_per_sec.round() as u64))
+}
+
+/// Formats a rate like [`rate`], but with "B" padded to the width of the
+/// other units, e.g. "524  B/s", so that the numbers of rates right-aligned
+/// in a column line up.
+pub fn column_rate(bytes_per_sec: f64) -> String {
+    let (number, unit) = scaled(bytes_per_sec.round() as u64);
+    format!("{number} {unit:>2}/s")
 }
 
 /// Formats seconds like "1h 2m 3s", leaving out leading zero units.
@@ -147,6 +162,9 @@ mod tests {
         assert_eq!(bytes(999_994), "999.99 kB");
         assert_eq!(bytes(999_999), "1.00 MB");
         assert_eq!(rate(1_389_999.6), "1.39 MB/s");
+        assert_eq!(rate(524.0), "524 B/s");
+        assert_eq!(column_rate(524.0), "524  B/s");
+        assert_eq!(column_rate(5_290.0), "5.29 kB/s");
         assert_eq!(seconds(5), "5s");
         assert_eq!(seconds(210), "3m 30s");
         assert_eq!(seconds(3723), "1h 2m 3s");
