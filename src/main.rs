@@ -1,13 +1,32 @@
 // Model-output: Claude Opus 5.5
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use mimalloc::MiMalloc;
-use reboop::{check, luks_password};
+use reboop::{check, human, luks_password};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// When to style output for a terminal.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Color {
+    /// If stdout is a terminal, TERM is set and isn't "dumb", and NO_COLOR isn't set
+    Auto,
+    Always,
+    Never,
+}
+
+impl Color {
+    fn enabled(self) -> bool {
+        match self {
+            Color::Auto   => human::color_stdout(),
+            Color::Always => true,
+            Color::Never  => false,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[clap(name = "reboop", version)]
@@ -22,6 +41,9 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
+        /// When to color the table
+        #[clap(long, value_enum, value_name = "WHEN", default_value_t = Color::Auto, num_args = 0..=1, require_equals = true, default_missing_value = "always")]
+        color: Color,
     },
     /// Ask for a machine's LUKS password, check over SSH that it opens the
     /// LUKS device beneath /, and store it encrypted with the machine's
@@ -60,7 +82,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        ReboopCommand::Check { hostnames, json } => check::run(&hostnames, json),
+        ReboopCommand::Check { hostnames, json, color } => check::run(&hostnames, json, color.enabled()),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };

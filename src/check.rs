@@ -135,9 +135,10 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 }
 
 /// Checks the configured machines called `hostnames` (all of them if
-/// empty) at the same time, and prints a table about them, or JSON if
-/// `json`.  Returns the exit status: see [`exit_status`].
-pub fn run(hostnames: &[String], json: bool) -> Result<u8> {
+/// empty) at the same time, and prints a table about them (styled if
+/// `color`), or JSON if `json`.  Returns the exit status: see
+/// [`exit_status`].
+pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
     let ssh = &Ssh::default();
@@ -152,7 +153,7 @@ pub fn run(hostnames: &[String], json: bool) -> Result<u8> {
         let reports: Vec<_> = outcomes.iter().map(|(machine, outcome)| json_report(machine, outcome)).collect();
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
-        print!("{}", table(&outcomes, human::color_stdout()));
+        print!("{}", table(&outcomes, color));
     }
     Ok(exit_status(&outcomes))
 }
