@@ -1,7 +1,9 @@
 // Model-output: Claude Opus 5.5
 
-//! `reboop set-luks-password`: asks for a machine's LUKS password, makes sure
-//! it's right, and keeps it encrypted in [`config::passwords_dir`].
+//! `reboop set-luks-password`, which asks for a machine's LUKS password,
+//! makes sure it's right, and keeps it encrypted in
+//! [`config::passwords_dir`]; and `reboop get-luks-password`, which prints
+//! it.
 
 use crate::config;
 use crate::deadline::Deadline;
@@ -51,5 +53,14 @@ pub fn set(hostname: &str, test: bool) -> Result<()> {
     let dir = config::passwords_dir()?;
     passwords::save(&dir, hostname, &password, &machine.luks_signing_key)?;
     println!("Saved the LUKS password for {hostname} in {}", passwords::password_file(&dir, hostname)?.display());
+    Ok(())
+}
+
+/// Prints the saved LUKS password of the configured machine `hostname`,
+/// decrypted with the machine's luks_signing_key, and a newline.
+pub fn get(hostname: &str) -> Result<()> {
+    let machines = config::load(&config::config_dir()?)?;
+    let machine = config::find(&machines, hostname)?;
+    println!("{}", passwords::load(&config::passwords_dir()?, hostname, &machine.luks_signing_key)?);
     Ok(())
 }

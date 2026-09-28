@@ -34,6 +34,12 @@ enum ReboopCommand {
         #[clap(long)]
         no_test_passphrase: bool,
     },
+    /// Print a machine's stored LUKS password
+    #[clap(name = "get-luks-password")]
+    GetLuksPassword {
+        /// A machine from machines.jsonl
+        hostname: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -56,6 +62,7 @@ fn main() -> ExitCode {
     let result = match command {
         ReboopCommand::Check { hostnames, json } => check::run(&hostnames, json),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
+        ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };
     match result {
         Ok(status) => ExitCode::from(status),
