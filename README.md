@@ -12,3 +12,7 @@ Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:
 6. Scrubs btrfs, failing loudly on errors.
 
 LUKS passwords are stored in `~/.config/reboop/luks/`, encrypted with a key derived from an `ssh-keygen -Y sign` signature, so they're usable wherever your Ed25519 or RSA SSH key is. Machines and limits go in `~/.config/reboop/defaults.json` and `machines.jsonl`; see [doc/spec.md](doc/spec.md).
+
+## Contributing
+
+Well-conceived pull requests by humans or frontier LLMs are welcome. Please provide the motivation and some evidence that it solved something, when possible. 
