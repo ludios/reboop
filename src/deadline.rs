@@ -3,6 +3,7 @@
 //! Deadlines, and retrying until one passes.
 
 use anyhow::Result;
+use std::fmt;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -31,9 +32,21 @@ impl Deadline {
     }
 }
 
+/// An error that trying again won't fix, which makes [`retry`] give up.
+#[derive(Debug)]
+pub struct Permanent(pub String);
+
+impl fmt::Display for Permanent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
+
 /// Calls `attempt` until it succeeds, starting attempts at most once per
-/// `interval`, and gives up with the last error when the next attempt would
-/// start after `deadline`.
+/// `interval`.  Gives up with the last error if it's [`Permanent`] or when
+/// the next attempt would start after `deadline`.
 ///
 /// `attempt` is given the overall deadline, which it should not exceed.
 pub fn retry<T>(
@@ -47,8 +60,11 @@ pub fn retry<T>(
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
+        if error.downcast_ref::<Permanent>().is_some() {
+            return Err(error);
+        }
         let next = Deadline(started + interval);
-        if next > deadline {
+        if next > deadline || deadline.has_passed() {
             return Err(error.context("gave up retrying at the deadline"));
         }
         debug!("attempt failed, retrying in {:?}: {error:#}", next.remaining());
@@ -70,6 +86,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value, 3);
+    }
+
+    #[test]
+    fn retry_gives_up_on_permanent_errors() {
+        let mut calls = 0;
+        let error = retry(Deadline::after(Duration::from_secs(5)), Duration::ZERO, |_| -> Result<()> {
+            calls += 1;
+            Err(Permanent("no".into()).into())
+        })
+        .unwrap_err();
+        assert_eq!((calls, error.to_string()), (1, "no".to_string()));
     }
 
     #[test]

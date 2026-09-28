@@ -3,8 +3,8 @@
 //! Unlocking a machine's LUKS devices over SSH to its systemd initrd.
 
 use crate::child::ChildProcess;
-use crate::deadline::{Deadline, retry};
-use crate::ssh::{Ssh, Target};
+use crate::deadline::{Deadline, Permanent, retry};
+use crate::ssh::{Ssh, Target, is_permanent_failure};
 use anyhow::{Result, anyhow, bail};
 use std::fmt;
 use std::time::Duration;
@@ -47,82 +47,6 @@ impl From<anyhow::Error> for UnlockError {
     }
 }
 
-/// Connects to the initrd's sshd at `target`, runs systemd's password agent
-/// there, and answers each passphrase prompt with `password`.
-///
-/// Returns the prompts it answered once the connection closes, or once
-/// [`SETTLE`] passes after the last answer with no new prompt.  Fails if a
-/// prompt comes back, since that means `password` is wrong.
-///
-/// Only connects to hosts whose key is already in known_hosts, whatever the
-/// user's ssh config says, since we're sending a secret.
-pub fn unlock(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<Vec<String>, UnlockError> {
-    check_password(password)?;
-    // --watch rather than the default --query, which exits if the initrd
-    // hasn't asked for a passphrase yet.
-    let command = ssh.command(
-        target,
-        &["-tt", "-o", "EscapeChar=none", "-o", "StrictHostKeyChecking=yes"],
-        "systemd-tty-ask-password-agent --watch",
-    );
-    let mut child = ChildProcess::spawn(command)?;
-    // Output since the last answer
-    let mut screen = Vec::new();
-    let mut received_output = false;
-    let mut answered: Vec<String> = Vec::new();
-    let mut settled = None;
-
-    loop {
-        let wait_until = settled.map_or(deadline, |settled: Deadline| settled.min(deadline));
-        match child.read_stdout(wait_until) {
-            Ok(Some(chunk)) => {
-                received_output = true;
-                screen.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(_) if settled.is_some_and(Deadline::has_passed) => {
-                info!("no new prompt within {SETTLE:?} of the last answer; assuming the initrd is done with us");
-                return Ok(answered);
-            }
-            Err(error) => {
-                let screen = redact(&String::from_utf8_lossy(&screen), password);
-                return Err(error.context(format!("waiting for a passphrase prompt from {target}; output so far: {screen:?}")).into());
-            }
-        }
-        if let Some(prompt) = find_prompt(&screen) {
-            if answered.contains(&prompt) {
-                return Err(UnlockError::WrongPassword { prompt });
-            }
-            info!("answering {prompt:?}");
-            child.write_stdin(format!("{password}\n").as_bytes())?;
-            answered.push(prompt);
-            screen.clear();
-            settled = Some(Deadline::after(SETTLE));
-        }
-    }
-
-    let stderr = child.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-    if !answered.is_empty() {
-        Ok(answered)
-    } else if !received_output {
-        Err(UnlockError::Unreachable(stderr))
-    } else {
-        let screen = redact(&String::from_utf8_lossy(&screen), password);
-        Err(anyhow!("the connection to {target} closed before any passphrase prompt; output: {screen:?} {stderr}").into())
-    }
-}
-
-/// Like [`unlock`], but when the initrd's sshd is unreachable, tries again
-/// once per `interval` until `deadline`.
-pub fn wait_and_unlock(ssh: &Ssh, target: &Target, password: &str, interval: Duration, deadline: Deadline) -> Result<Vec<String>> {
-    let result = retry(deadline, interval, |deadline| match unlock(ssh, target, password, deadline) {
-        Ok(prompts) => Ok(Ok(prompts)),
-        Err(UnlockError::Unreachable(stderr)) => bail!("couldn't reach the initrd at {target}: {stderr}"),
-        Err(fatal) => Ok(Err(fatal)),
-    })?;
-    Ok(result?)
-}
-
 /// Checks that `password` will get through a terminal intact.
 pub fn check_password(password: &str) -> Result<()> {
     if password.is_empty() {
@@ -132,14 +56,6 @@ pub fn check_password(password: &str) -> Result<()> {
         bail!("the password contains control characters, which a terminal would interpret");
     }
     Ok(())
-}
-
-/// The prompt at the end of `screen` (the text before [`PROMPT_END`] on the
-/// last line), if the last line is a complete passphrase prompt.
-fn find_prompt(screen: &[u8]) -> Option<String> {
-    let text = strip_escapes(&String::from_utf8_lossy(screen));
-    let last_line = text.rsplit('\n').next()?.trim();
-    Some(last_line.strip_suffix(PROMPT_END)?.trim().to_string())
 }
 
 /// Removes terminal escape sequences, which systemd uses for colors.
@@ -174,8 +90,97 @@ fn strip_escapes(text: &str) -> String {
     out
 }
 
-fn redact(text: &str, password: &str) -> String {
-    text.replace(password, "<password>")
+/// The prompt at the end of `screen` (the text before [`PROMPT_END`] on the
+/// last line), if the last line is a complete passphrase prompt.
+fn find_prompt(screen: &[u8]) -> Option<String> {
+    let text = strip_escapes(&String::from_utf8_lossy(screen));
+    let last_line = text.rsplit('\n').next()?.trim();
+    Some(last_line.strip_suffix(PROMPT_END)?.trim().to_string())
+}
+
+/// `screen` as text, for error messages, without `password` in case the
+/// terminal echoed it.
+fn redact(screen: &[u8], password: &str) -> String {
+    String::from_utf8_lossy(screen).replace(password, "<password>")
+}
+
+/// Connects to the initrd's sshd at `target`, runs systemd's password agent
+/// there, and answers each passphrase prompt with `password`.
+///
+/// Returns the prompts it answered once the connection closes, or once
+/// [`SETTLE`] (or `deadline`) passes after the last answer with no new
+/// prompt.  Fails if a prompt comes back, since that means `password` is
+/// wrong.
+///
+/// Only connects to hosts whose key is already in known_hosts, whatever the
+/// user's ssh config says, since we're sending a secret.
+pub fn unlock(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<Vec<String>, UnlockError> {
+    check_password(password)?;
+    // --watch rather than the default --query, which exits if the initrd
+    // hasn't asked for a passphrase yet.
+    let command = ssh.command(
+        target,
+        &["-tt", "-o", "EscapeChar=none", "-o", "StrictHostKeyChecking=yes"],
+        "systemd-tty-ask-password-agent --watch",
+    );
+    let mut child = ChildProcess::spawn(command)?;
+    // Output since the last answer
+    let mut screen = Vec::new();
+    let mut received_output = false;
+    let mut answered: Vec<String> = Vec::new();
+    let mut settled = None;
+
+    loop {
+        let wait_until = settled.map_or(deadline, |settled: Deadline| settled.min(deadline));
+        match child.read_stdout(wait_until) {
+            Ok(Some(chunk)) => {
+                received_output = true;
+                screen.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) if !answered.is_empty() => {
+                info!("no new prompt since the last answer; assuming the initrd is done with us");
+                return Ok(answered);
+            }
+            Err(error) => {
+                let screen = redact(&screen, password);
+                return Err(error.context(format!("waiting for a passphrase prompt from {target}; output so far: {screen:?}")).into());
+            }
+        }
+        if let Some(prompt) = find_prompt(&screen) {
+            if answered.contains(&prompt) {
+                return Err(UnlockError::WrongPassword { prompt });
+            }
+            info!("answering {prompt:?}");
+            child.write_stdin(format!("{password}\n").as_bytes(), deadline)?;
+            answered.push(prompt);
+            screen.clear();
+            settled = Some(Deadline::after(SETTLE));
+        }
+    }
+
+    let stderr = child.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
+    if !answered.is_empty() {
+        Ok(answered)
+    } else if !received_output && is_permanent_failure(&stderr) {
+        Err(anyhow::Error::new(Permanent(format!("couldn't log in to the initrd at {target}: {stderr}"))).into())
+    } else if !received_output {
+        Err(UnlockError::Unreachable(stderr))
+    } else {
+        let screen = redact(&screen, password);
+        Err(anyhow!("the connection to {target} closed before any passphrase prompt; output: {screen:?} {stderr}").into())
+    }
+}
+
+/// Like [`unlock`], but when the initrd's sshd is unreachable, tries again
+/// once per `interval` until `deadline`.
+pub fn wait_and_unlock(ssh: &Ssh, target: &Target, password: &str, interval: Duration, deadline: Deadline) -> Result<Vec<String>> {
+    let result = retry(deadline, interval, |deadline| match unlock(ssh, target, password, deadline) {
+        Ok(prompts) => Ok(Ok(prompts)),
+        Err(UnlockError::Unreachable(stderr)) => bail!("couldn't reach the initrd at {target}: {stderr}"),
+        Err(fatal) => Ok(Err(fatal)),
+    })?;
+    Ok(result?)
 }
 
 #[cfg(test)]

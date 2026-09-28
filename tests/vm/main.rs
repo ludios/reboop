@@ -10,11 +10,11 @@
 
 mod harness;
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use harness::{Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::btrfs::{self, ScrubState};
-use reboop::deadline::Deadline;
+use reboop::deadline::{Deadline, Permanent};
 use reboop::facts;
 use reboop::initrd::{self, UnlockError};
 use reboop::processes::{self, Activity};
@@ -33,37 +33,6 @@ const MINUTE: Duration = Duration::from_secs(60);
 
 type Test = fn(&Vm) -> Result<()>;
 
-fn main() {
-    let mut args = Arguments::from_args();
-    // The tests share the VM, and some reboot it.
-    args.test_threads = Some(1);
-    let tests: &[(&str, Test)] = &[
-        ("session_runs_commands", session_runs_commands),
-        ("session_breaks_on_timeout", session_breaks_on_timeout),
-        ("unreachable_ports_fail_fast", unreachable_ports_fail_fast),
-        ("identity_and_systems", identity_and_systems),
-        ("network_sample_sees_traffic", network_sample_sees_traffic),
-        ("activities_are_detected", activities_are_detected),
-        ("btrfs_root_is_idle", btrfs_root_is_idle),
-        ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
-        ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
-        ("scrub_finds_corruption", scrub_finds_corruption),
-        ("stop_unit", stop_unit),
-        ("postflight_facts", postflight_facts),
-        ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
-        ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
-    ];
-    let trials = tests.iter().map(|&(name, test)| Trial::test(name, move || run(test))).collect();
-    libtest_mimic::run(&args, trials).exit();
-}
-
-/// Runs `test` against the VM, which is set up by the first test to run.
-fn run(test: Test) -> Result<(), Failed> {
-    static VM: OnceLock<Result<Vm, String>> = OnceLock::new();
-    let vm = VM.get_or_init(|| Vm::get().map_err(|error| format!("{error:?}"))).as_ref()?;
-    test(vm).map_err(|error| format!("{error:?}").into())
-}
-
 /// A session in which everything left over from earlier tests is gone.
 fn clean_session(vm: &Vm) -> Result<Session> {
     let mut session = vm.session()?;
@@ -73,6 +42,16 @@ fn clean_session(vm: &Vm) -> Result<Session> {
 
 fn sh(session: &mut Session, script: &str) -> Result<String> {
     session.run_ok(script, MINUTE)
+}
+
+/// Waits up to a minute for `condition` to be true.
+fn wait_for(mut condition: impl FnMut() -> Result<bool>) -> Result<()> {
+    let deadline = Deadline::after(MINUTE);
+    while !condition()? {
+        ensure!(!deadline.has_passed(), "timed out waiting for a condition");
+        sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 fn session_runs_commands(vm: &Vm) -> Result<()> {
@@ -129,6 +108,16 @@ fn unreachable_ports_fail_fast(vm: &Vm) -> Result<()> {
     let deadline = Deadline::after(Duration::from_secs(3));
     assert!(wait_for_session(&vm.ssh, &vm.initrd_target, Duration::from_secs(1), deadline).is_err());
     assert!(started.elapsed() < Duration::from_secs(10));
+
+    // An unknown host key won't go away, so there's no retrying.
+    let mut ssh = vm.ssh.clone();
+    ssh.extra_args.extend(["-o".into(), "UserKnownHostsFile=/dev/null".into()]);
+    let started = Instant::now();
+    let Err(error) = wait_for_session(&ssh, &vm.target, Duration::from_secs(1), Deadline::after(MINUTE)) else {
+        bail!("connected despite the unknown host key");
+    };
+    assert!(error.downcast_ref::<Permanent>().is_some(), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())
 }
 
@@ -170,10 +159,11 @@ fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
     });
     sleep(Duration::from_millis(500));
     let busy = facts::sample_network(&mut session, Duration::from_secs(2));
+    // Killing ssh first unblocks the writer, should it be stuck writing.
     stop.store(true, Ordering::Relaxed);
-    writer.join().unwrap();
     sink.kill()?;
     sink.wait()?;
+    writer.join().unwrap();
     let busy = busy?;
     assert!(busy.bytes_per_sec() > 1_000_000.0, "{busy:?}");
     Ok(())
@@ -220,8 +210,9 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
         sleep(Duration::from_millis(500));
     }
 
+    // The builder goes away a moment after the build is stopped.
     clean_up(&mut session)?;
-    assert_eq!(activities(&mut session)?, BTreeSet::new());
+    wait_for(|| Ok(activities(&mut session)?.is_empty()))?;
     Ok(())
 }
 
@@ -273,8 +264,11 @@ fn btrfs_running_scrub_and_balance_are_detected(vm: &Vm) -> Result<()> {
     sh(&mut session, &format!("btrfs scrub cancel {mountpoint}"))?;
     assert_eq!(btrfs::scrub_status(&mut session, &mountpoint)?.state, ScrubState::Aborted);
 
-    // Pause a balance so it stays in progress.
-    sh(&mut session, &format!("btrfs balance start --bg --full-balance {mountpoint} && btrfs balance pause {mountpoint}"))?;
+    // Pause a balance so it stays in progress.  (`start --bg` returns before
+    // the balance has started.)
+    sh(&mut session, &format!("btrfs balance start --bg --full-balance {mountpoint}"))?;
+    wait_for(|| Ok(btrfs::exclusive_operation(&mut session, &filesystem)? == "balance"))?;
+    sh(&mut session, &format!("btrfs balance pause {mountpoint}"))?;
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "balance paused");
     sh(&mut session, &format!("btrfs balance cancel {mountpoint}"))?;
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "none");
@@ -395,4 +389,35 @@ fn reboot_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_eq!(after.running_kernel, expected.default_kernel);
     assert_eq!(sh(&mut session, "cat /etc/reboop-test-variant")?, next_variant);
     Ok(())
+}
+
+/// Runs `test` against the VM, which is set up by the first test to run.
+fn run(test: Test) -> Result<(), Failed> {
+    static VM: OnceLock<Result<Vm, String>> = OnceLock::new();
+    let vm = VM.get_or_init(|| Vm::get().map_err(|error| format!("{error:?}"))).as_ref()?;
+    test(vm).map_err(|error| format!("{error:?}").into())
+}
+
+fn main() {
+    let mut args = Arguments::from_args();
+    // The tests share the VM, and some reboot it.
+    args.test_threads = Some(1);
+    let tests: &[(&str, Test)] = &[
+        ("session_runs_commands", session_runs_commands),
+        ("session_breaks_on_timeout", session_breaks_on_timeout),
+        ("unreachable_ports_fail_fast", unreachable_ports_fail_fast),
+        ("identity_and_systems", identity_and_systems),
+        ("network_sample_sees_traffic", network_sample_sees_traffic),
+        ("activities_are_detected", activities_are_detected),
+        ("btrfs_root_is_idle", btrfs_root_is_idle),
+        ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
+        ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
+        ("scrub_finds_corruption", scrub_finds_corruption),
+        ("stop_unit", stop_unit),
+        ("postflight_facts", postflight_facts),
+        ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
+        ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
+    ];
+    let trials = tests.iter().map(|&(name, test)| Trial::test(name, move || run(test))).collect();
+    libtest_mimic::run(&args, trials).exit();
 }

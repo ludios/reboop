@@ -2,9 +2,8 @@
 
 //! Finding processes that make rebooting a bad idea.
 
-use crate::ssh::Session;
+use crate::ssh::{QUICK, Session};
 use anyhow::{Context, Result, anyhow};
-use std::time::Duration;
 
 /// A process, as listed by ps(1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,11 +43,6 @@ const NIX_PROGRAMS: &[&str] = &[
     "nixos-rebuild",
 ];
 
-/// Lists all processes on the remote machine.
-pub fn list(session: &mut Session) -> Result<Vec<Process>> {
-    parse_ps(&session.run_ok("ps -e -ww -o pid=,ppid=,user:64=,args=", Duration::from_secs(30))?)
-}
-
 fn parse_ps(output: &str) -> Result<Vec<Process>> {
     output
         .lines()
@@ -64,6 +58,34 @@ fn parse_ps(output: &str) -> Result<Vec<Process>> {
         })
         .collect::<Result<_>>()
         .with_context(|| anyhow!("unexpected ps output: {output:?}"))
+}
+
+/// Lists all processes on the remote machine.
+pub fn list(session: &mut Session) -> Result<Vec<Process>> {
+    parse_ps(&session.run_ok("ps -e -ww -o pid=,ppid=,user:64=,args=", QUICK)?)
+}
+
+/// The name of the program at `path`, normalized so that a nixpkgs
+/// wrapper's ".foo-wrapped" is "foo".
+fn program_name(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = name.strip_prefix('.').unwrap_or(name);
+    let name = name.strip_suffix("-wrapped").unwrap_or(name);
+    // e.g. "sshd:" from "sshd: root [priv]"
+    name.strip_suffix(':').unwrap_or(name).to_string()
+}
+
+/// The names of the program(s) a command line runs: that of its first word,
+/// and for an interpreter like bash or python, also that of its script.
+fn program_names(args: &str) -> Vec<String> {
+    let mut words = args.split_whitespace();
+    let Some(first) = words.next() else { return vec![] };
+    let mut names = vec![program_name(first)];
+    let interpreter = matches!(names[0].as_str(), "sh" | "bash" | "dash" | "zsh" | "perl") || names[0].starts_with("python");
+    if interpreter && let Some(script) = words.find(|word| !word.starts_with('-')) {
+        names.push(program_name(script));
+    }
+    names
 }
 
 /// What `process` is doing that a reboot would interrupt, if anything.
@@ -88,28 +110,6 @@ pub fn activity(process: &Process) -> Option<Activity> {
     } else {
         None
     }
-}
-
-/// The names of the program(s) a command line runs: that of its first word,
-/// and for an interpreter like bash or python, also that of its script.
-/// Names are normalized so that a nixpkgs wrapper's ".foo-wrapped" is "foo".
-fn program_names(args: &str) -> Vec<String> {
-    let mut words = args.split_whitespace();
-    let Some(first) = words.next() else { return vec![] };
-    let mut names = vec![program_name(first)];
-    let interpreter = matches!(names[0].as_str(), "sh" | "bash" | "dash" | "zsh" | "perl") || names[0].starts_with("python");
-    if interpreter && let Some(script) = words.find(|word| !word.starts_with('-')) {
-        names.push(program_name(script));
-    }
-    names
-}
-
-fn program_name(path: &str) -> String {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let name = name.strip_prefix('.').unwrap_or(name);
-    let name = name.strip_suffix("-wrapped").unwrap_or(name);
-    // e.g. "sshd:" from "sshd: root [priv]"
-    name.strip_suffix(':').unwrap_or(name).to_string()
 }
 
 #[cfg(test)]

@@ -14,6 +14,19 @@ use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+/// Checks that `hostname` is a plain hostname, which also makes it safe to
+/// use as a file name.
+pub fn check_hostname(hostname: &str) -> Result<()> {
+    let valid = !hostname.is_empty()
+        && hostname.len() <= 253
+        && !hostname.starts_with(['.', '-'])
+        && hostname.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !valid {
+        bail!("{hostname:?} isn't a valid hostname");
+    }
+    Ok(())
+}
+
 /// A machine and all its settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
@@ -63,49 +76,7 @@ struct MachineLine {
     max_load_average_1min: Option<f64>,
 }
 
-/// ~/.config/reboop, or its equivalent under $XDG_CONFIG_HOME.
-pub fn config_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?).join(".config"),
-    };
-    Ok(base.join("reboop"))
-}
-
-/// Reads the machines configured in `dir`.  defaults.json is optional.
-pub fn load(dir: &Path) -> Result<Vec<Machine>> {
-    let defaults_path = dir.join("defaults.json");
-    let defaults = match fs::read_to_string(&defaults_path) {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context(format!("failed to read {}", defaults_path.display())),
-    };
-    let machines_path = dir.join("machines.jsonl");
-    let machines = fs::read_to_string(&machines_path).with_context(|| format!("failed to read {}", machines_path.display()))?;
-    parse(defaults.as_deref(), &machines).with_context(|| format!("bad configuration in {}", dir.display()))
-}
-
-/// Parses the contents of defaults.json (if any) and machines.jsonl.
-pub fn parse(defaults: Option<&str>, machines: &str) -> Result<Vec<Machine>> {
-    let defaults: Defaults = match defaults {
-        Some(text) => json5::from_str(text).context("in defaults.json")?,
-        None => Defaults::default(),
-    };
-    let mut hostnames = HashSet::new();
-    let mut result = Vec::new();
-    for (index, line) in machines.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let context = || format!("on line {} of machines.jsonl", index + 1);
-        let line: MachineLine = serde_json::from_str(line).with_context(context)?;
-        let machine = resolve(&defaults, line).with_context(context)?;
-        ensure!(hostnames.insert(machine.hostname.clone()), "{} is configured twice", machine.hostname);
-        result.push(machine);
-    }
-    Ok(result)
-}
-
+/// Combines a line of machines.jsonl with the defaults, and checks the result.
 fn resolve(defaults: &Defaults, line: MachineLine) -> Result<Machine> {
     check_hostname(&line.hostname)?;
     let missing = |name: &str| anyhow!("{} has no {name}, and defaults.json doesn't either", line.hostname);
@@ -136,17 +107,47 @@ fn resolve(defaults: &Defaults, line: MachineLine) -> Result<Machine> {
     Ok(machine)
 }
 
-/// Checks that `hostname` is a plain hostname, which also makes it safe to
-/// use as a file name.
-pub fn check_hostname(hostname: &str) -> Result<()> {
-    let valid = !hostname.is_empty()
-        && hostname.len() <= 253
-        && !hostname.starts_with(['.', '-'])
-        && hostname.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    if !valid {
-        bail!("{hostname:?} isn't a valid hostname");
+/// Parses the contents of defaults.json (if any) and machines.jsonl.
+pub fn parse(defaults: Option<&str>, machines: &str) -> Result<Vec<Machine>> {
+    let defaults: Defaults = match defaults {
+        Some(text) => json5::from_str(text).context("in defaults.json")?,
+        None => Defaults::default(),
+    };
+    let mut hostnames = HashSet::new();
+    let mut result = Vec::new();
+    for (index, line) in machines.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let context = || format!("on line {} of machines.jsonl", index + 1);
+        let line: MachineLine = serde_json::from_str(line).with_context(context)?;
+        let machine = resolve(&defaults, line).with_context(context)?;
+        ensure!(hostnames.insert(machine.hostname.clone()), "{} is configured twice", machine.hostname);
+        result.push(machine);
     }
-    Ok(())
+    Ok(result)
+}
+
+/// Reads the machines configured in `dir`.  defaults.json is optional.
+pub fn load(dir: &Path) -> Result<Vec<Machine>> {
+    let defaults_path = dir.join("defaults.json");
+    let defaults = match fs::read_to_string(&defaults_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context(format!("failed to read {}", defaults_path.display())),
+    };
+    let machines_path = dir.join("machines.jsonl");
+    let machines = fs::read_to_string(&machines_path).with_context(|| format!("failed to read {}", machines_path.display()))?;
+    parse(defaults.as_deref(), &machines).with_context(|| format!("bad configuration in {}", dir.display()))
+}
+
+/// ~/.config/reboop, or its equivalent under $XDG_CONFIG_HOME.
+pub fn config_dir() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?).join(".config"),
+    };
+    Ok(base.join("reboop"))
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ libc = "0.2"
 libtest-mimic = "0.8"
 tempfile = "3"
 
-# Runs against a NixOS VM; see tests/vm.rs.
+# Runs against a NixOS VM; see tests/vm/main.rs.
 [[test]]
 name = "vm"
 harness = false

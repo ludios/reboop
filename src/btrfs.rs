@@ -4,14 +4,12 @@
 //! interrupt, and scrubs.
 
 use crate::deadline::Deadline;
-use crate::ssh::{Session, shell_quote};
+use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
-
-const QUICK: Duration = Duration::from_secs(30);
 
 /// A mounted btrfs filesystem.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,17 +19,7 @@ pub struct Filesystem {
     pub mountpoint: String,
 }
 
-/// Lists mounted btrfs filesystems.
-pub fn filesystems(session: &mut Session) -> Result<Vec<Filesystem>> {
-    let output = session.run("findmnt --list --json --types btrfs --output UUID,TARGET", QUICK)?;
-    // findmnt exits 1 without output when nothing matches.
-    if output.status == 1 && output.stdout.is_empty() {
-        return Ok(vec![]);
-    }
-    ensure!(output.status == 0, "findmnt exited with status {}: {}", output.status, output.stderr_text());
-    parse_findmnt(&output.stdout_text())
-}
-
+/// Parses `findmnt --json` output into filesystems, one per UUID.
 fn parse_findmnt(json: &str) -> Result<Vec<Filesystem>> {
     #[derive(Deserialize)]
     struct Findmnt {
@@ -52,6 +40,17 @@ fn parse_findmnt(json: &str) -> Result<Vec<Filesystem>> {
         }
     }
     Ok(filesystems)
+}
+
+/// Lists mounted btrfs filesystems.
+pub fn filesystems(session: &mut Session) -> Result<Vec<Filesystem>> {
+    let output = session.run("findmnt --list --json --types btrfs --output UUID,TARGET", QUICK)?;
+    // findmnt exits 1 without output when nothing matches.
+    if output.status == 1 && output.stdout.is_empty() {
+        return Ok(vec![]);
+    }
+    ensure!(output.status == 0, "findmnt exited with status {}: {}", output.status, output.stderr_text());
+    parse_findmnt(&output.stdout_text())
 }
 
 /// The exclusive operation (balance, device replace, add, remove, resize…)
@@ -102,17 +101,25 @@ const ERROR_COUNTERS: &[&str] = &[
     "corrected_errors",
 ];
 
-pub fn scrub_status(session: &mut Session, mountpoint: &str) -> Result<ScrubStatus> {
-    let mountpoint = shell_quote(mountpoint);
-    let summary = session.run_ok(&format!("btrfs scrub status --raw -- {mountpoint}"), QUICK)?;
-    let raw = session.run_ok(&format!("btrfs scrub status -R -- {mountpoint}"), QUICK)?;
-    parse_scrub_status(&summary, &raw)
+/// Parses lines of "Key: value" into a map, ignoring other lines.
+fn colon_fields(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+/// Parses "H:MM:SS" into seconds.
+fn parse_hms(time: &str) -> Result<u64> {
+    let parts: Vec<u64> = time.split(':').map(str::parse).collect::<Result<_, _>>()?;
+    let [hours, minutes, seconds] = parts[..] else { bail!("not H:MM:SS: {time:?}") };
+    Ok(hours * 3600 + minutes * 60 + seconds)
 }
 
 /// Parses the output of `btrfs scrub status --raw` (`summary`, with sizes in
-/// bytes) and `btrfs scrub status -R` (`raw`, with counters).  The state and
-/// counters come from `raw`, so they agree even if the scrub moved on between
-/// the two commands; `summary` only provides progress estimates.
+/// bytes) and then `btrfs scrub status -R` (`raw`, with counters).  The state
+/// and counters come from `raw`, so they agree even if the scrub moved on
+/// between the two commands; `summary` provides progress estimates.
 fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     let context = || format!("unexpected btrfs scrub status output:\n{summary}\n{raw}");
     let estimates = colon_fields(summary);
@@ -142,6 +149,10 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
             errors.insert(name.to_string(), count);
         }
     }
+    // Counters only grow, so errors in the earlier summary must show up in
+    // the later counters, or we're missing a counter.
+    let summary_has_errors = estimates.get("Error summary").is_some_and(|summary| summary != "no errors found");
+    ensure!(!summary_has_errors || !errors.is_empty(), "the summary reports errors that no known counter has\n{}", context());
     let seconds_left = match estimates.get("Time left") {
         Some(time) => Some(parse_hms(time).with_context(context)?),
         None => None,
@@ -158,19 +169,13 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     })
 }
 
-/// Parses lines of "Key: value" into a map, ignoring other lines.
-fn colon_fields(text: &str) -> BTreeMap<String, String> {
-    text.lines()
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-        .collect()
-}
-
-/// Parses "H:MM:SS" into seconds.
-fn parse_hms(time: &str) -> Result<u64> {
-    let parts: Vec<u64> = time.split(':').map(str::parse).collect::<Result<_, _>>()?;
-    let [hours, minutes, seconds] = parts[..] else { bail!("not H:MM:SS: {time:?}") };
-    Ok(hours * 3600 + minutes * 60 + seconds)
+/// The state of the latest scrub of the btrfs filesystem mounted at
+/// `mountpoint`.
+pub fn scrub_status(session: &mut Session, mountpoint: &str) -> Result<ScrubStatus> {
+    let mountpoint = shell_quote(mountpoint);
+    let summary = session.run_ok(&format!("btrfs scrub status --raw -- {mountpoint}"), QUICK)?;
+    let raw = session.run_ok(&format!("btrfs scrub status -R -- {mountpoint}"), QUICK)?;
+    parse_scrub_status(&summary, &raw)
 }
 
 /// Starts scrubbing the btrfs filesystem mounted at `mountpoint`, and waits
@@ -189,7 +194,7 @@ pub fn start_scrub(session: &mut Session, mountpoint: &str, timeout: Duration) -
             return Ok(());
         }
         ensure!(!deadline.has_passed(), "the scrub of {mountpoint} didn't start");
-        sleep(Duration::from_millis(200));
+        sleep(Duration::from_millis(200).min(deadline.remaining()));
     }
 }
 
@@ -206,39 +211,11 @@ pub fn wait_for_scrub(
     loop {
         let status = scrub_status(session, mountpoint)?;
         progress(&status);
-        // NeverRan can briefly show up while a scrub is starting.
-        if !matches!(status.state, ScrubState::Running | ScrubState::NeverRan) {
+        if status.state != ScrubState::Running {
             return Ok(status);
         }
         ensure!(!deadline.has_passed(), "the scrub of {mountpoint} is still running at the deadline");
-        sleep(interval);
-    }
-}
-
-impl ScrubStatus {
-    /// One line for people, e.g. "scrub has 3m 30s left, 130.50GB of
-    /// 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found".
-    pub fn summary(&self) -> String {
-        let scrubbed = format_bytes(self.scrubbed_bytes);
-        let errors = if self.errors.is_empty() {
-            "no errors found".to_string()
-        } else {
-            let counts: Vec<_> = self.errors.iter().map(|(name, count)| format!("{name}={count}")).collect();
-            format!("ERRORS FOUND: {}", counts.join(" "))
-        };
-        match self.state {
-            ScrubState::NeverRan => "no scrub has run".to_string(),
-            ScrubState::Running => {
-                let left = self.seconds_left.map_or("unknown time".to_string(), format_seconds);
-                let total = self.total_bytes.unwrap_or(0);
-                let percent = if total == 0 { 0.0 } else { 100.0 * self.scrubbed_bytes as f64 / total as f64 };
-                let rate = self.bytes_per_sec.map_or("?".to_string(), format_bytes);
-                format!("scrub has {left} left, {scrubbed} of {} ({percent:.2}%) scrubbed at {rate}/s, {errors}", format_bytes(total))
-            }
-            ScrubState::Finished => format!("scrub finished, {scrubbed} scrubbed, {errors}"),
-            ScrubState::Aborted => format!("scrub was cancelled after {scrubbed}, {errors}"),
-            ScrubState::Interrupted => format!("scrub was interrupted after {scrubbed}, {errors}"),
-        }
+        sleep(interval.min(deadline.remaining()));
     }
 }
 
@@ -267,6 +244,33 @@ fn format_seconds(seconds: u64) -> String {
         (0, 0) => format!("{seconds}s"),
         (0, _) => format!("{minutes}m {seconds}s"),
         _ => format!("{hours}h {minutes}m {seconds}s"),
+    }
+}
+
+impl ScrubStatus {
+    /// One line for people, e.g. "scrub has 3m 30s left, 130.50GB of
+    /// 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found".
+    pub fn summary(&self) -> String {
+        let scrubbed = format_bytes(self.scrubbed_bytes);
+        let errors = if self.errors.is_empty() {
+            "no errors found".to_string()
+        } else {
+            let counts: Vec<_> = self.errors.iter().map(|(name, count)| format!("{name}={count}")).collect();
+            format!("ERRORS FOUND: {}", counts.join(" "))
+        };
+        match self.state {
+            ScrubState::NeverRan => "no scrub has run".to_string(),
+            ScrubState::Running => {
+                let left = self.seconds_left.map_or("unknown time".to_string(), format_seconds);
+                let total = self.total_bytes.unwrap_or(0);
+                let percent = if total == 0 { 0.0 } else { 100.0 * self.scrubbed_bytes as f64 / total as f64 };
+                let rate = self.bytes_per_sec.map_or("?".to_string(), format_bytes);
+                format!("scrub has {left} left, {scrubbed} of {} ({percent:.2}%) scrubbed at {rate}/s, {errors}", format_bytes(total))
+            }
+            ScrubState::Finished => format!("scrub finished, {scrubbed} scrubbed, {errors}"),
+            ScrubState::Aborted => format!("scrub was cancelled after {scrubbed}, {errors}"),
+            ScrubState::Interrupted => format!("scrub was interrupted after {scrubbed}, {errors}"),
+        }
     }
 }
 
@@ -333,6 +337,9 @@ mod tests {
         let without_csum = RAW_COUNTERS.replace("\tcsum_errors: 0\n", "");
         assert!(parse_scrub_status(summary, &raw("x", "finished", &without_csum)).is_err());
         assert!(parse_scrub_status(summary, &raw("x", "exploded", RAW_COUNTERS)).is_err());
+        // Errors that the counters we know don't account for
+        let with_errors = summary.replace("no errors found", "novel=1");
+        assert!(parse_scrub_status(&with_errors, &raw("x", "finished", RAW_COUNTERS)).is_err());
     }
 
     #[test]

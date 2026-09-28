@@ -95,11 +95,7 @@
   environment.systemPackages = with pkgs; [
     tmux
     rsync
-    lvm2 # for dmsetup
   ];
-
-  # For tests that slow down a block device.
-  boot.kernelModules = [ "dm_delay" ];
 
   services.timesyncd.enable = false;
   services.logrotate.enable = false;

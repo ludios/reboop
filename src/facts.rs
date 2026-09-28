@@ -2,14 +2,12 @@
 
 //! Facts about a remote NixOS machine, from before and after rebooting it.
 
-use crate::ssh::{Session, shell_quote, store_path};
+use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
-
-const QUICK: Duration = Duration::from_secs(30);
 
 pub fn hostname(session: &mut Session) -> Result<String> {
     Ok(session.run_ok("cat /proc/sys/kernel/hostname", QUICK)?.trim_end().to_string())
@@ -29,6 +27,26 @@ pub fn load_average_1min(session: &mut Session) -> Result<f64> {
     first.parse().with_context(|| format!("unexpected /proc/loadavg {loadavg:?}"))
 }
 
+/// Parses a store path printed by a command, checking that it is one.
+fn store_path(output: &str) -> Result<String> {
+    let path = output.trim_end_matches('\n');
+    let name = path.strip_prefix("/nix/store/").ok_or_else(|| anyhow!("not a store path: {path:?}"))?;
+    ensure!(!name.is_empty() && !name.contains('/'), "not a store path: {path:?}");
+    Ok(path.to_string())
+}
+
+/// The release of `system`'s kernel (a toplevel store path), as `uname -r`
+/// would show it once booted: the name of its modules directory.
+pub fn kernel_release(session: &mut Session, system: &str) -> Result<String> {
+    let script = format!("ls -1 {}/kernel-modules/lib/modules", shell_quote(system));
+    let listing = session.run_ok(&script, QUICK)?;
+    let releases: Vec<_> = listing.lines().collect();
+    let [release] = releases[..] else {
+        bail!("expected one kernel release for {system}, found {releases:?}");
+    };
+    Ok(release.to_string())
+}
+
 /// The NixOS configurations and kernels involved in a reboot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Systems {
@@ -45,6 +63,8 @@ pub struct Systems {
     pub default_kernel: String,
 }
 
+/// Finds out which configurations and kernels the machine is running and
+/// would boot.
 pub fn systems(session: &mut Session) -> Result<Systems> {
     let current = store_path(&session.run_ok("readlink /run/current-system", QUICK)?)?;
     let booted = store_path(&session.run_ok("readlink /run/booted-system", QUICK)?)?;
@@ -52,44 +72,6 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
     let default_kernel = kernel_release(session, &default)?;
     Ok(Systems { current, booted, running_kernel, default, default_kernel })
-}
-
-/// The release of `system`'s kernel, as `uname -r` would show it once
-/// booted: the name of its modules directory.
-pub fn kernel_release(session: &mut Session, system: &str) -> Result<String> {
-    let script = format!("ls -1 {}/kernel-modules/lib/modules", shell_quote(system));
-    let listing = session.run_ok(&script, QUICK)?;
-    let releases: Vec<_> = listing.lines().collect();
-    let [release] = releases[..] else {
-        bail!("expected one kernel release for {system}, found {releases:?}");
-    };
-    Ok(release.to_string())
-}
-
-/// Traffic through each network interface during a sampling period.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NetworkSample {
-    pub seconds: f64,
-    /// Bytes (received, sent) by each interface, except loopback.
-    pub interfaces: BTreeMap<String, (u64, u64)>,
-}
-
-impl NetworkSample {
-    /// Bytes received plus sent per second, over all interfaces.  (Traffic
-    /// through both a VPN and the interface under it counts twice.)
-    pub fn bytes_per_sec(&self) -> f64 {
-        let total: u64 = self.interfaces.values().map(|(received, sent)| received + sent).sum();
-        total as f64 / self.seconds
-    }
-}
-
-/// Measures network traffic on the remote machine over `duration`.
-pub fn sample_network(session: &mut Session, duration: Duration) -> Result<NetworkSample> {
-    let script = "cat /proc/uptime /proc/net/dev";
-    let before = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
-    sleep(duration);
-    let after = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
-    network_sample(&before, &after)
 }
 
 /// Seconds since boot and each interface's (received, sent) byte counters.
@@ -113,6 +95,24 @@ fn parse_net_snapshot(output: &str) -> Result<NetSnapshot> {
     Ok((uptime, counters))
 }
 
+/// Traffic through each network interface during a sampling period.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkSample {
+    pub seconds: f64,
+    /// Bytes (received, sent) by each interface, except loopback.
+    pub interfaces: BTreeMap<String, (u64, u64)>,
+}
+
+impl NetworkSample {
+    /// Bytes received plus sent per second, over all interfaces.  (Traffic
+    /// through both a VPN and the interface under it counts twice.)
+    pub fn bytes_per_sec(&self) -> f64 {
+        let total: u64 = self.interfaces.values().map(|(received, sent)| received + sent).sum();
+        total as f64 / self.seconds
+    }
+}
+
+/// The traffic between two snapshots.
 fn network_sample(before: &NetSnapshot, after: &NetSnapshot) -> Result<NetworkSample> {
     let seconds = after.0 - before.0;
     ensure!(seconds > 0.0, "uptime didn't advance while sampling the network");
@@ -128,6 +128,15 @@ fn network_sample(before: &NetSnapshot, after: &NetSnapshot) -> Result<NetworkSa
         interfaces.insert(name.clone(), deltas);
     }
     Ok(NetworkSample { seconds, interfaces })
+}
+
+/// Measures network traffic on the remote machine over `duration`.
+pub fn sample_network(session: &mut Session, duration: Duration) -> Result<NetworkSample> {
+    let script = "cat /proc/uptime /proc/net/dev";
+    let before = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
+    sleep(duration);
+    let after = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
+    network_sample(&before, &after)
 }
 
 /// Waits for the machine to finish booting (or `timeout`) and returns
@@ -190,6 +199,13 @@ mod tests {
         let before = parse_net_snapshot(&snapshot("100", (1_000, 2_000))).unwrap();
         let after = parse_net_snapshot(&snapshot("101", (500, 2_000))).unwrap();
         assert!(network_sample(&before, &after).is_err());
+    }
+
+    #[test]
+    fn store_paths() {
+        assert_eq!(store_path("/nix/store/abc-foo\n").unwrap(), "/nix/store/abc-foo");
+        assert!(store_path("/nix/store/abc-foo/bin").is_err());
+        assert!(store_path("/run/current-system").is_err());
     }
 
     #[test]

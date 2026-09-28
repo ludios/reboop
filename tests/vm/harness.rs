@@ -51,81 +51,6 @@ struct State {
     initrd_ssh_port: u16,
 }
 
-/// The running test VM.
-pub struct Vm {
-    pub ssh: Ssh,
-    /// sshd on the booted system
-    pub target: Target,
-    /// sshd in the initrd
-    pub initrd_target: Target,
-    pub manifest: Manifest,
-    pub dir: PathBuf,
-    /// Held for as long as the tests run, so concurrent runs don't share the VM.
-    _lock: File,
-}
-
-impl Vm {
-    /// Builds, starts or reuses, and brings up the VM.
-    pub fn get() -> Result<Vm> {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reboop-vm");
-        fs::create_dir_all(&dir)?;
-        let lock = File::create(dir.join("lock"))?;
-        lock.lock().context("failed to lock the VM")?;
-
-        let bundle = build(&dir)?;
-        let manifest: Manifest = serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
-        let state_path = dir.join("state.json");
-        let old_state: Option<State> = fs::read(&state_path).ok().and_then(|json| serde_json::from_slice(&json).ok());
-        let state = match old_state {
-            Some(state) if state.bundle == bundle && qemu_is_running(&dir, state.pid) => state,
-            old_state => {
-                if let Some(old) = old_state {
-                    stop_qemu(&dir, old.pid)?;
-                }
-                let state = start_qemu(&dir, &bundle, &manifest)?;
-                fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
-                state
-            }
-        };
-
-        let vm = Vm {
-            ssh: Ssh { extra_args: vec!["-F".into(), write_ssh_files(&dir, &manifest, &state)?.display().to_string()] },
-            target: Target { host: "127.0.0.1".into(), port: state.ssh_port },
-            initrd_target: Target { host: "127.0.0.1".into(), port: state.initrd_ssh_port },
-            manifest,
-            dir,
-            _lock: lock,
-        };
-        if let Err(error) = vm.bring_up() {
-            // Don't leave a broken VM for the next run.
-            let _ = stop_qemu(&vm.dir, state.pid);
-            return Err(error.context(format!("the VM didn't come up; see {}", vm.dir.join("console.log").display())));
-        }
-        Ok(vm)
-    }
-
-    pub fn session(&self) -> Result<Session> {
-        Session::open(&self.ssh, &self.target, Duration::from_secs(30))
-    }
-
-    /// Waits for the VM to accept SSH connections, unlocking its disk if
-    /// it's waiting for that.
-    fn bring_up(&self) -> Result<()> {
-        let deadline = Deadline::after(Duration::from_secs(300));
-        loop {
-            if Session::open(&self.ssh, &self.target, Duration::from_secs(10)).is_ok() {
-                return Ok(());
-            }
-            match initrd::unlock(&self.ssh, &self.initrd_target, &self.manifest.luks_password, deadline.at_most(Duration::from_secs(60))) {
-                Ok(_) | Err(UnlockError::Unreachable(_)) => {}
-                Err(error) => eprintln!("while bringing up the VM: {error}"),
-            }
-            ensure!(!deadline.has_passed(), "timed out");
-            sleep(Duration::from_secs(1));
-        }
-    }
-}
-
 /// Builds tests/vm with Nix, returning the result.
 fn build(dir: &Path) -> Result<PathBuf> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vm");
@@ -235,15 +160,6 @@ fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<Pat
     Ok(config)
 }
 
-/// Undoes whatever tests may have left behind in the VM (including tests
-/// that were interrupted), so each test starts from the same state.
-pub fn clean_up(session: &mut Session) -> Result<()> {
-    session
-        .run_ok(CLEAN_UP, Duration::from_secs(120))
-        .map(drop)
-        .map_err(|error| anyhow!("cleaning up the VM failed: {error:#}"))
-}
-
 /// Tests name everything they create "reboop-test-*".
 const CLEAN_UP: &str = r#"
 systemctl stop 'reboop-test-*' 2>/dev/null
@@ -255,9 +171,6 @@ for m in /mnt/reboop-test-*; do
     if mountpoint -q "$m"; then umount "$m" || exit 1; fi
     rmdir "$m"
 done
-for d in /dev/mapper/reboop-test-*; do
-    [ -e "$d" ] && { dmsetup remove "${d##*/}" || exit 1; }
-done
 for i in /var/tmp/reboop-test-*.img; do
     [ -e "$i" ] || continue
     for l in $(losetup -j "$i" -n -O NAME); do losetup -d "$l"; done
@@ -266,3 +179,87 @@ rm -rf /var/tmp/reboop-test-*
 btrfs scrub cancel / >/dev/null 2>&1
 exit 0
 "#;
+
+/// The running test VM.
+pub struct Vm {
+    pub ssh: Ssh,
+    /// sshd on the booted system
+    pub target: Target,
+    /// sshd in the initrd
+    pub initrd_target: Target,
+    pub manifest: Manifest,
+    pub dir: PathBuf,
+    /// Held for as long as the tests run, so concurrent runs don't share the VM.
+    _lock: File,
+}
+
+impl Vm {
+    /// Builds, starts or reuses, and brings up the VM.
+    pub fn get() -> Result<Vm> {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reboop-vm");
+        fs::create_dir_all(&dir)?;
+        let lock = File::create(dir.join("lock"))?;
+        lock.lock().context("failed to lock the VM")?;
+
+        let bundle = build(&dir)?;
+        let manifest: Manifest = serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
+        let state_path = dir.join("state.json");
+        let old_state: Option<State> = fs::read(&state_path).ok().and_then(|json| serde_json::from_slice(&json).ok());
+        let state = match old_state {
+            Some(state) if state.bundle == bundle && qemu_is_running(&dir, state.pid) => state,
+            old_state => {
+                if let Some(old) = old_state {
+                    stop_qemu(&dir, old.pid)?;
+                }
+                let state = start_qemu(&dir, &bundle, &manifest)?;
+                fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+                state
+            }
+        };
+
+        let vm = Vm {
+            ssh: Ssh { extra_args: vec!["-F".into(), write_ssh_files(&dir, &manifest, &state)?.display().to_string()] },
+            target: Target { host: "127.0.0.1".into(), port: state.ssh_port },
+            initrd_target: Target { host: "127.0.0.1".into(), port: state.initrd_ssh_port },
+            manifest,
+            dir,
+            _lock: lock,
+        };
+        if let Err(error) = vm.bring_up() {
+            // Don't leave a broken VM for the next run.
+            let _ = stop_qemu(&vm.dir, state.pid);
+            return Err(error.context(format!("the VM didn't come up; see {}", vm.dir.join("console.log").display())));
+        }
+        Ok(vm)
+    }
+
+    pub fn session(&self) -> Result<Session> {
+        Session::open(&self.ssh, &self.target, Duration::from_secs(30))
+    }
+
+    /// Waits for the VM to accept SSH connections, unlocking its disk if
+    /// it's waiting for that.
+    fn bring_up(&self) -> Result<()> {
+        let deadline = Deadline::after(Duration::from_secs(300));
+        loop {
+            if Session::open(&self.ssh, &self.target, Duration::from_secs(10)).is_ok() {
+                return Ok(());
+            }
+            match initrd::unlock(&self.ssh, &self.initrd_target, &self.manifest.luks_password, deadline.at_most(Duration::from_secs(60))) {
+                Ok(_) | Err(UnlockError::Unreachable(_)) => {}
+                Err(error) => eprintln!("while bringing up the VM: {error}"),
+            }
+            ensure!(!deadline.has_passed(), "timed out");
+            sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Undoes whatever tests may have left behind in the VM (including tests
+/// that were interrupted), so each test starts from the same state.
+pub fn clean_up(session: &mut Session) -> Result<()> {
+    session
+        .run_ok(CLEAN_UP, Duration::from_secs(120))
+        .map(drop)
+        .map_err(|error| anyhow!("cleaning up the VM failed: {error:#}"))
+}

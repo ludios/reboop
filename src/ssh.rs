@@ -4,20 +4,33 @@
 //! config, agent and known_hosts all apply), and running commands there.
 
 use crate::child::ChildProcess;
-use crate::deadline::{Deadline, retry};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use crate::deadline::{Deadline, Permanent, retry};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::fmt;
 use std::process::Command;
 use std::time::Duration;
 
-/// How to run ssh(1).
-#[derive(Clone, Debug, Default)]
-pub struct Ssh {
-    /// Arguments for every ssh invocation, placed before the destination;
-    /// e.g. `-F some_config`.
-    pub extra_args: Vec<String>,
+/// A timeout for commands that should finish right away.
+pub const QUICK: Duration = Duration::from_secs(30);
+
+/// How long [`wait_for_session`] lets each attempt take, which is long
+/// enough to authenticate with a key that needs a touch.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Quotes `s` as a single word for sh(1).
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Whether ssh's `stderr` shows a failure that trying again won't fix: the
+/// server's host key isn't the known one.  (Not "Permission denied", which
+/// can also mean the user missed touching their key.)
+pub fn is_permanent_failure(stderr: &str) -> bool {
+    ["Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED"]
+        .iter()
+        .any(|message| stderr.contains(message))
 }
 
 /// An SSH server to log in to as root.
@@ -31,6 +44,14 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "root@{} port {}", self.host, self.port)
     }
+}
+
+/// How to run ssh(1).
+#[derive(Clone, Debug, Default)]
+pub struct Ssh {
+    /// Arguments for every ssh invocation, placed before the destination;
+    /// e.g. `-F some_config`.
+    pub extra_args: Vec<String>,
 }
 
 impl Ssh {
@@ -57,11 +78,6 @@ impl Ssh {
             .arg(remote_command);
         command
     }
-}
-
-/// Quotes `s` as a single word for sh(1).
-pub fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// What a command run in a [`Session`] did.
@@ -110,6 +126,19 @@ while IFS= read -r c; do
 done
 "#;
 
+/// Parses a line of [`SESSION_SHELL`]'s output about a command.
+fn parse_response(line: &[u8]) -> Result<CommandOutput> {
+    let text = std::str::from_utf8(line)?;
+    let [status, stdout, stderr] = text.split(' ').collect::<Vec<_>>()[..] else {
+        bail!("malformed response from the remote shell: {text:?}");
+    };
+    Ok(CommandOutput {
+        status: status.parse().with_context(|| format!("malformed status in {text:?}"))?,
+        stdout: BASE64.decode(stdout)?,
+        stderr: BASE64.decode(stderr)?,
+    })
+}
+
 /// A root shell on a remote machine that runs commands one at a time over a
 /// single SSH connection.  (Some users' keys need a touch per connection.)
 ///
@@ -120,18 +149,39 @@ pub struct Session {
     target: Target,
     /// Output received but not yet consumed as lines.
     pending: Vec<u8>,
+    /// How much of `pending` is known to have no newline.
+    scanned: usize,
     broken: bool,
 }
 
 impl Session {
+    /// Returns the next line of output without its newline, or `None` if ssh
+    /// closed its stdout.
+    fn read_line(&mut self, deadline: Deadline) -> Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(offset) = self.pending[self.scanned..].iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = self.pending.drain(..=self.scanned + offset).collect();
+                line.pop();
+                self.scanned = 0;
+                return Ok(Some(line));
+            }
+            self.scanned = self.pending.len();
+            match self.ssh.read_stdout(deadline)? {
+                Some(chunk) => self.pending.extend_from_slice(&chunk),
+                None => return Ok(None),
+            }
+        }
+    }
+
     /// Logs in to `target` and waits until it's ready to run commands.
+    /// Failures that trying again won't fix are [`Permanent`].
     pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
         let deadline = Deadline::after(timeout);
         // Base64 keeps the script intact through root's login shell, whatever
         // that is.
         let remote_command = format!(r#"exec /bin/sh -c "$(printf %s '{}' | base64 -d)""#, BASE64.encode(SESSION_SHELL));
         let child = ChildProcess::spawn(ssh.command(target, &["-T"], &remote_command))?;
-        let mut session = Session { ssh: child, target: target.clone(), pending: Vec::new(), broken: false };
+        let mut session = Session { ssh: child, target: target.clone(), pending: Vec::new(), scanned: 0, broken: false };
         loop {
             // Skip anything that root's shell startup files print.
             match session.read_line(deadline).with_context(|| format!("failed to open a session to {target}"))? {
@@ -139,7 +189,11 @@ impl Session {
                 Some(_) => {}
                 None => {
                     let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-                    bail!("failed to open a session to {target}: {stderr}");
+                    let message = format!("failed to open a session to {target}: {stderr}");
+                    if is_permanent_failure(&stderr) {
+                        return Err(Permanent(message).into());
+                    }
+                    bail!(message);
                 }
             }
         }
@@ -149,40 +203,39 @@ impl Session {
         &self.target
     }
 
-    /// Returns the next line of output without its newline, or `None` if ssh
-    /// closed its stdout.
-    fn read_line(&mut self, deadline: Deadline) -> Result<Option<Vec<u8>>> {
-        loop {
-            if let Some(newline) = self.pending.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = self.pending.drain(..=newline).collect();
-                line.pop();
-                return Ok(Some(line));
-            }
-            match self.ssh.read_stdout(deadline)? {
-                Some(chunk) => self.pending.extend_from_slice(&chunk),
-                None => return Ok(None),
+    /// Sends `script` and waits for its result, which is `None` if the
+    /// connection closed first.
+    fn exchange(&mut self, script: &str, deadline: Deadline) -> Result<Option<CommandOutput>> {
+        self.ssh.write_stdin(format!("{}\n", BASE64.encode(script)).as_bytes(), deadline)?;
+        match self.read_line(deadline)? {
+            Some(line) => Ok(Some(parse_response(&line)?)),
+            None => {
+                // So that ssh's stderr is complete
+                let _ = self.ssh.finish(deadline);
+                Ok(None)
             }
         }
     }
 
-    /// Runs `script` with /bin/sh on the remote machine.
-    pub fn run(&mut self, script: &str, timeout: Duration) -> Result<CommandOutput> {
+    /// Like [`Session::run`], but for a command that may end the connection,
+    /// like a reboot: returns `None` if the connection closed after the
+    /// command was sent but before its result came back.
+    pub fn run_or_disconnect(&mut self, script: &str, timeout: Duration) -> Result<Option<CommandOutput>> {
         ensure!(!self.broken, "the session to {} broke earlier", self.target);
-        let result = self.run_inner(script, Deadline::after(timeout));
-        if result.is_err() {
+        let result = self.exchange(script, Deadline::after(timeout));
+        if !matches!(result, Ok(Some(_))) {
             self.broken = true;
             self.ssh.kill();
         }
         result.with_context(|| format!("failed to run {script:?} on {}", self.target))
     }
 
-    fn run_inner(&mut self, script: &str, deadline: Deadline) -> Result<CommandOutput> {
-        self.ssh.write_stdin(format!("{}\n", BASE64.encode(script)).as_bytes())?;
-        let Some(line) = self.read_line(deadline)? else {
-            let stderr = self.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-            bail!("the connection closed: {stderr}");
-        };
-        parse_response(&line)
+    /// Runs `script` with /bin/sh on the remote machine.
+    pub fn run(&mut self, script: &str, timeout: Duration) -> Result<CommandOutput> {
+        match self.run_or_disconnect(script, timeout)? {
+            Some(output) => Ok(output),
+            None => bail!("the connection to {} closed while running {script:?}: {}", self.target, self.ssh.stderr()),
+        }
     }
 
     /// Like [`Session::run`], but fails unless the command exits 0, and
@@ -200,31 +253,11 @@ impl Session {
     }
 }
 
-fn parse_response(line: &[u8]) -> Result<CommandOutput> {
-    let text = std::str::from_utf8(line)?;
-    let [status, stdout, stderr] = text.split(' ').collect::<Vec<_>>()[..] else {
-        bail!("malformed response from the remote shell: {text:?}");
-    };
-    Ok(CommandOutput {
-        status: status.parse().with_context(|| format!("malformed status in {text:?}"))?,
-        stdout: BASE64.decode(stdout)?,
-        stderr: BASE64.decode(stderr)?,
-    })
-}
-
-/// Tries to open a session to `target` once per `interval` (each attempt
-/// allowed up to `interval` too) until one succeeds or `deadline` passes.
+/// Tries to open a session to `target` once per `interval` until one
+/// succeeds, `deadline` passes, or a failure is [`Permanent`].
 pub fn wait_for_session(ssh: &Ssh, target: &Target, interval: Duration, deadline: Deadline) -> Result<Session> {
-    retry(deadline, interval, |deadline| Session::open(ssh, target, deadline.at_most(interval).remaining()))
+    retry(deadline, interval, |deadline| Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining()))
         .with_context(|| format!("couldn't open a session to {target}"))
-}
-
-/// Parses a store path printed by a command, checking that it is one.
-pub fn store_path(output: &str) -> Result<String> {
-    let path = output.trim_end_matches('\n');
-    let name = path.strip_prefix("/nix/store/").ok_or_else(|| anyhow!("not a store path: {path:?}"))?;
-    ensure!(!name.is_empty() && !name.contains('/'), "not a store path: {path:?}");
-    Ok(path.to_string())
 }
 
 #[cfg(test)]
@@ -282,12 +315,5 @@ mod tests {
         assert_eq!((third.status, third.stdout.len()), (0, 0));
         let fifth = parse_response(lines[5].as_bytes()).unwrap();
         assert_eq!((fifth.stdout_text().as_str(), fifth.stderr.len()), ("on time\n", 0));
-    }
-
-    #[test]
-    fn store_paths() {
-        assert_eq!(store_path("/nix/store/abc-foo\n").unwrap(), "/nix/store/abc-foo");
-        assert!(store_path("/nix/store/abc-foo/bin").is_err());
-        assert!(store_path("/run/current-system").is_err());
     }
 }

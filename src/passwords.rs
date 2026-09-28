@@ -39,6 +39,19 @@ const NONCE_LEN: usize = 24;
 #[derive(Clone, PartialEq, Eq)]
 pub struct MasterKey([u8; 32]);
 
+/// Decodes an armored SSH signature ("-----BEGIN SSH SIGNATURE-----"...).
+fn decode_armor(armored: &str) -> Result<Vec<u8>> {
+    let body = armored
+        .trim()
+        .strip_prefix("-----BEGIN SSH SIGNATURE-----")
+        .and_then(|rest| rest.strip_suffix("-----END SSH SIGNATURE-----"))
+        .ok_or_else(|| anyhow!("unexpected ssh-keygen output {armored:?}"))?;
+    let base64: String = body.split_whitespace().collect();
+    let blob = BASE64.decode(base64).context("bad base64 in ssh-keygen output")?;
+    ensure!(blob.starts_with(b"SSHSIG"), "ssh-keygen output isn't an SSH signature");
+    Ok(blob)
+}
+
 /// Derives the master key by signing with `signing_key`: a private key file,
 /// or a public key file whose private half is in ssh-agent.
 pub fn master_key(signing_key: &Path) -> Result<MasterKey> {
@@ -58,22 +71,61 @@ pub fn master_key(signing_key: &Path) -> Result<MasterKey> {
     Ok(MasterKey(hash.into()))
 }
 
-/// Decodes an armored SSH signature ("-----BEGIN SSH SIGNATURE-----"...).
-fn decode_armor(armored: &str) -> Result<Vec<u8>> {
-    let body = armored
-        .trim()
-        .strip_prefix("-----BEGIN SSH SIGNATURE-----")
-        .and_then(|rest| rest.strip_suffix("-----END SSH SIGNATURE-----"))
-        .ok_or_else(|| anyhow!("unexpected ssh-keygen output {armored:?}"))?;
-    let base64: String = body.split_whitespace().collect();
-    let blob = BASE64.decode(base64).context("bad base64 in ssh-keygen output")?;
-    ensure!(blob.starts_with(b"SSHSIG"), "ssh-keygen output isn't an SSH signature");
-    Ok(blob)
-}
-
+/// Where the password for machine `hostname` is kept in `dir`.
 pub fn password_file(dir: &Path, hostname: &str) -> Result<PathBuf> {
     check_hostname(hostname)?;
     Ok(dir.join(hostname))
+}
+
+/// Additional authenticated data, which binds a file to its machine.
+fn aad(hostname: &str) -> Vec<u8> {
+    [MAGIC, hostname.as_bytes()].concat()
+}
+
+/// Encrypts `password` for machine `hostname` into the contents of a
+/// password file: [`MAGIC`], a random nonce, then the XChaCha20-Poly1305
+/// ciphertext (with its tag).
+fn encrypt(key: &MasterKey, hostname: &str, password: &str) -> Result<Vec<u8>> {
+    let mut nonce = [0; NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|error| anyhow!("failed to get random bytes: {error}"))?;
+    let cipher = XChaCha20Poly1305::new(&key.0.into());
+    let payload = Payload { msg: password.as_bytes(), aad: &aad(hostname) };
+    let ciphertext = cipher.encrypt(&XNonce::from(nonce), payload).map_err(|_| anyhow!("encryption failed"))?;
+    Ok([MAGIC, &nonce, &ciphertext].concat())
+}
+
+/// Decrypts the `contents` of machine `hostname`'s password file (see
+/// [`encrypt`]).
+fn decrypt(key: &MasterKey, hostname: &str, contents: &[u8]) -> Result<String> {
+    let rest = contents.strip_prefix(MAGIC).ok_or_else(|| anyhow!("not a reboop password file"))?;
+    ensure!(rest.len() > NONCE_LEN, "truncated password file");
+    let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
+    let nonce = XNonce::try_from(nonce).expect("NONCE_LEN is the nonce length");
+    let cipher = XChaCha20Poly1305::new(&key.0.into());
+    let payload = Payload { msg: ciphertext, aad: &aad(hostname) };
+    let plaintext = cipher
+        .decrypt(&nonce, payload)
+        .map_err(|_| anyhow!("couldn't decrypt the password for {hostname}: wrong SSH key, or the file isn't this machine's"))?;
+    String::from_utf8(plaintext).context("the decrypted password isn't UTF-8")
+}
+
+/// Replaces `path` with a mode-0600 file holding `contents`, via a temporary
+/// file named ".NAME.tmp", such that a crash leaves either the old file or
+/// the new one.
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let name = path.file_name().ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(name);
+    temporary_name.push(".tmp");
+    let temporary = path.with_file_name(temporary_name);
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
+    // In case a stale temporary file had other permissions.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(())
 }
 
 /// Encrypts `password` for machine `hostname` into a file in `dir`,
@@ -90,6 +142,8 @@ pub fn save(dir: &Path, hostname: &str, password: &str, signing_key: &Path) -> R
     );
 
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    // The temporary file can't be another machine's, as hostnames don't
+    // start with a dot.
     write_atomically(&path, &encrypt(&key, hostname, password)?)?;
     let saved = decrypt(&key, hostname, &fs::read(&path)?)?;
     ensure!(saved == password, "{} doesn't hold the password after writing it", path.display());
@@ -101,49 +155,6 @@ pub fn load(dir: &Path, hostname: &str, signing_key: &Path) -> Result<String> {
     let path = password_file(dir, hostname)?;
     let contents = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     decrypt(&master_key(signing_key)?, hostname, &contents)
-}
-
-/// Additional authenticated data, which binds a file to its machine.
-fn aad(hostname: &str) -> Vec<u8> {
-    [MAGIC, hostname.as_bytes()].concat()
-}
-
-fn encrypt(key: &MasterKey, hostname: &str, password: &str) -> Result<Vec<u8>> {
-    let mut nonce = [0; NONCE_LEN];
-    getrandom::fill(&mut nonce).map_err(|error| anyhow!("failed to get random bytes: {error}"))?;
-    let cipher = XChaCha20Poly1305::new(&key.0.into());
-    let payload = Payload { msg: password.as_bytes(), aad: &aad(hostname) };
-    let ciphertext = cipher.encrypt(&XNonce::from(nonce), payload).map_err(|_| anyhow!("encryption failed"))?;
-    Ok([MAGIC, &nonce, &ciphertext].concat())
-}
-
-fn decrypt(key: &MasterKey, hostname: &str, contents: &[u8]) -> Result<String> {
-    let rest = contents.strip_prefix(MAGIC).ok_or_else(|| anyhow!("not a reboop password file"))?;
-    ensure!(rest.len() > NONCE_LEN, "truncated password file");
-    let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
-    let nonce = XNonce::try_from(nonce).expect("NONCE_LEN is the nonce length");
-    let cipher = XChaCha20Poly1305::new(&key.0.into());
-    let payload = Payload { msg: ciphertext, aad: &aad(hostname) };
-    let plaintext = cipher
-        .decrypt(&nonce, payload)
-        .map_err(|_| anyhow!("couldn't decrypt the password for {hostname}: wrong SSH key, or the file isn't this machine's"))?;
-    String::from_utf8(plaintext).context("the decrypted password isn't UTF-8")
-}
-
-/// Replaces `path` with a mode-0600 file holding `contents`, such that a
-/// crash leaves either the old file or the new one.
-fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
-    let mut temporary = OsString::from(path);
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
-    // In case a stale temporary file had other permissions.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -172,6 +183,11 @@ mod tests {
         assert!(load(&dir, "two", &key).is_err());
         let other_key = keygen(temp.path(), "other", "ed25519");
         assert!(load(&dir, "one", &other_key).is_err());
+
+        // Saving doesn't disturb the file of a machine with a similar name.
+        save(&dir, "one.tmp", "another password", &key).unwrap();
+        save(&dir, "one", "correct horse battery staple", &key).unwrap();
+        assert_eq!(load(&dir, "one.tmp", &key).unwrap(), "another password");
 
         // Nor does a modified file.
         let mut contents = fs::read(dir.join("one")).unwrap();

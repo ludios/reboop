@@ -5,7 +5,7 @@
 
 use crate::deadline::Deadline;
 use anyhow::{Context, Result, anyhow, bail};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -15,13 +15,27 @@ use std::time::Duration;
 /// How much of a child's stderr to keep; the rest is dropped.
 const STDERR_LIMIT: usize = 64 * 1024;
 
+/// Reads from `pipe` into `buffer`, returning how many bytes were read, or
+/// `None` at EOF or on an error (other than being interrupted by a signal).
+fn read_chunk(pipe: &mut impl Read, buffer: &mut [u8]) -> Option<usize> {
+    loop {
+        match pipe.read(buffer) {
+            Ok(0) => return None,
+            Ok(n) => return Some(n),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
 /// A running child process with piped stdin, stdout and stderr.  Background
 /// threads read its stdout (delivered in chunks) and collect its stderr.  The
 /// process is killed when this is dropped.
 pub struct ChildProcess {
     child: Child,
     program: String,
-    stdin: Option<ChildStdin>,
+    /// Shared with the threads that write to it.
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
     stdout: Receiver<Vec<u8>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     /// Closed (never sent to) when stderr reaches EOF.
@@ -43,7 +57,7 @@ impl ChildProcess {
         thread::spawn(move || {
             let mut buffer = vec![0; 64 * 1024];
             // Ends on EOF or a read error, either of which closes the channel.
-            while let Ok(n @ 1..) = stdout.read(&mut buffer) {
+            while let Some(n) = read_chunk(&mut stdout, &mut buffer) {
                 if sender.send(buffer[..n].to_vec()).is_err() {
                     break;
                 }
@@ -57,14 +71,15 @@ impl ChildProcess {
         thread::spawn(move || {
             let _closed_sender = closed_sender;
             let mut buffer = vec![0; 4096];
-            while let Ok(n @ 1..) = stderr_pipe.read(&mut buffer) {
+            while let Some(n) = read_chunk(&mut stderr_pipe, &mut buffer) {
                 let mut collected = stderr_writer.lock().unwrap();
                 let room = STDERR_LIMIT.saturating_sub(collected.len());
                 collected.extend_from_slice(&buffer[..n.min(room)]);
             }
         });
 
-        Ok(ChildProcess { stdin: child.stdin.take(), child, program, stdout: receiver, stderr, stderr_closed })
+        let stdin = child.stdin.take().map(|stdin| Arc::new(Mutex::new(stdin)));
+        Ok(ChildProcess { stdin, child, program, stdout: receiver, stderr, stderr_closed })
     }
 
     /// Waits for the next chunk of stdout.  Returns `None` once stdout is
@@ -77,9 +92,21 @@ impl ChildProcess {
         }
     }
 
-    pub fn write_stdin(&mut self, data: &[u8]) -> Result<()> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("stdin of {} is closed", self.program))?;
-        stdin.write_all(data).and_then(|()| stdin.flush()).with_context(|| format!("failed to write to {}", self.program))
+    /// Writes `data` to the process's stdin, failing if that takes past
+    /// `deadline` (because the process isn't reading).
+    pub fn write_stdin(&mut self, data: &[u8], deadline: Deadline) -> Result<()> {
+        let stdin = Arc::clone(self.stdin.as_ref().ok_or_else(|| anyhow!("stdin of {} is closed", self.program))?);
+        let data = data.to_vec();
+        let (sender, receiver) = mpsc::channel();
+        // The thread may block until the process dies, if it never reads.
+        thread::spawn(move || {
+            let mut stdin = stdin.lock().unwrap();
+            let _ = sender.send(stdin.write_all(&data).and_then(|()| stdin.flush()));
+        });
+        match receiver.recv_timeout(deadline.remaining()) {
+            Ok(result) => result.with_context(|| format!("failed to write to {}", self.program)),
+            Err(_) => bail!("timed out writing to {}", self.program),
+        }
     }
 
     pub fn close_stdin(&mut self) {
@@ -132,7 +159,7 @@ impl Drop for ChildProcess {
 /// hasn't finished by `deadline`.
 pub fn run(command: Command, stdin: &[u8], deadline: Deadline) -> Result<Output> {
     let mut child = ChildProcess::spawn(command)?;
-    child.write_stdin(stdin)?;
+    child.write_stdin(stdin, deadline)?;
     child.close_stdin();
     let mut stdout = Vec::new();
     while let Some(chunk) = child.read_stdout(deadline)? {
@@ -157,6 +184,15 @@ mod tests {
         let output = run(sh("cat; echo err >&2; exit 3"), b"hello", Deadline::after(Duration::from_secs(10))).unwrap();
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.status.code(), Some(3));
+    }
+
+    #[test]
+    fn run_kills_a_child_that_doesnt_read_at_deadline() {
+        let started = std::time::Instant::now();
+        let input = vec![0; 1 << 20];
+        let error = run(sh("sleep 10"), &input, Deadline::after(Duration::from_millis(200))).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

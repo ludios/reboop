@@ -27,15 +27,16 @@ pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result
     }
 }
 
-/// Asks systemd to reboot the machine.  The connection usually dies before
-/// systemctl can report back, so success here doesn't prove the machine is
-/// rebooting; compare boot IDs afterwards.
+/// Asks systemd to reboot the machine.  The connection often closes before
+/// systemctl can report back, which is fine, so success here doesn't prove
+/// the machine is rebooting; compare boot IDs afterwards.  Fails if the
+/// request can't have reached the machine, or systemctl failed or hung.
 pub fn reboot(mut session: Session) -> Result<()> {
-    match session.run("systemctl reboot", Duration::from_secs(60)) {
-        Ok(output) if output.status == 0 => Ok(()),
-        Ok(output) => bail!("systemctl reboot exited with status {}: {}", output.status, output.stderr_text()),
-        Err(error) => {
-            info!("lost the connection after asking for a reboot, as expected: {error:#}");
+    match session.run_or_disconnect("systemctl reboot", Duration::from_secs(60))? {
+        Some(output) if output.status == 0 => Ok(()),
+        Some(output) => bail!("systemctl reboot exited with status {}: {}", output.status, output.stderr_text()),
+        None => {
+            info!("the connection closed after asking for a reboot, as expected");
             Ok(())
         }
     }
