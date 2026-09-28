@@ -4,7 +4,7 @@
 
 Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:
 
-1. Refuses if the machine is busy: a btrfs scrub (which would hang shutdown), balance or other exclusive operation; a Nix command or build, or switch-to-configuration; a tmux server; rsync; network traffic or load average over a limit. `reboop check` shows this for all machines without rebooting any.
+1. Refuses if the machine is busy: a btrfs scrub (which would hang shutdown), balance or other exclusive operation; a Nix command or build, or switch-to-configuration; a tmux server; rsync; an inhibitor lock against shutdown (see `systemd-inhibit`); network traffic or load average over a limit. `reboop check` shows this for all machines without rebooting any.
 2. If / is on LUKS, checks that the stored password still opens it.
 3. Stops the machine's `stop_services` (e.g. PostgreSQL) and reboots.
 4. Unlocks LUKS (if any) by SSHing into the systemd initrd.

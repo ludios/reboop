@@ -4,7 +4,7 @@
 
 use crate::btrfs::{self, Filesystem, ScrubState, ScrubStatus};
 use crate::config::Machine;
-use crate::facts::{self, Systems};
+use crate::facts::{self, Inhibitor, Systems};
 use crate::human;
 use crate::processes::{self, Activity, Process};
 use crate::ssh::Session;
@@ -43,6 +43,8 @@ pub struct Facts {
     pub network_bytes_per_sec: f64,
     /// Processes that a reboot would interrupt, by what they're doing.
     pub busy_processes: BTreeMap<Activity, Vec<Process>>,
+    /// All inhibitor locks, including those that don't block a reboot.
+    pub inhibitors: Vec<Inhibitor>,
     /// Every mounted btrfs filesystem, not just those to scrub.
     pub btrfs: Vec<BtrfsFacts>,
 }
@@ -74,6 +76,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         load_average_1min: facts::load_average_1min(session)?,
         network_bytes_per_sec: facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec(),
         busy_processes,
+        inhibitors: facts::inhibitors(session)?,
         btrfs,
     })
 }
@@ -120,6 +123,10 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
             more => blockers.push(format!("{activity}: {more} more processes")),
         }
     }
+    for inhibitor in facts.inhibitors.iter().filter(|inhibitor| inhibitor.blocks_shutdown()) {
+        let why = if inhibitor.why.is_empty() { String::new() } else { format!(" ({})", inhibitor.why) };
+        blockers.push(format!("inhibitor: {}{why}, pid {} ({})", inhibitor.who, inhibitor.pid, inhibitor.user));
+    }
     if network_over_limit(machine, facts) {
         let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(machine.max_network_transfer_bytes_per_sec as f64));
         blockers.push(format!("network: {rate} is over the limit of {limit}"));
@@ -155,6 +162,7 @@ pub(crate) fn idle_facts() -> Facts {
         load_average_1min: 0.5,
         network_bytes_per_sec: 1_000.0,
         busy_processes: BTreeMap::new(),
+        inhibitors: vec![],
         btrfs: vec![BtrfsFacts {
             filesystem: Filesystem { uuid: "4c8a".into(), mountpoint: "/".into() },
             exclusive_operation: "none".into(),
@@ -209,6 +217,15 @@ mod tests {
             scrub: idle_facts().btrfs[0].scrub.clone(),
         });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
+        let inhibitor = |mode: &str, why: &str| Inhibitor {
+            what: "shutdown".into(),
+            who: "crawl".into(),
+            why: why.into(),
+            mode: mode.into(),
+            pid: 42,
+            user: "at".into(),
+        };
+        facts.inhibitors = vec![inhibitor("block", "archiving"), inhibitor("delay", "flushing"), inhibitor("block-weak", "")];
         facts.load_average_1min = 2.01;
         facts.network_bytes_per_sec = 1_500_000.0;
         assert_eq!(
@@ -217,6 +234,8 @@ mod tests {
                 "btrfs on /: scrub has 3m 30s left, 500.00kB of 1.00MB (50.00%) scrubbed at 100.00kB/s, no errors found",
                 "btrfs on /small: balance paused",
                 "tmux: pid 1234 (at): tmux new -s work",
+                "inhibitor: crawl (archiving), pid 42 (at)",
+                "inhibitor: crawl, pid 42 (at)",
                 "network: 1.50MB/s is over the limit of 1.00MB/s",
                 "load average: 2.01 is over the limit of 2",
             ]

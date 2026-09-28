@@ -171,9 +171,62 @@ pub fn kernel_errors(session: &mut Session) -> Result<String> {
     session.run_ok("dmesg --level=err,crit,alert,emerg", QUICK)
 }
 
+/// A lock that a program holds to delay or block shutdown, sleep, etc.: see
+/// systemd-inhibit(1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inhibitor {
+    /// What it inhibits, e.g. "shutdown:sleep"
+    pub what: String,
+    pub who: String,
+    pub why: String,
+    /// "block", "block-weak" (which privileged users can override), or
+    /// "delay"
+    pub mode: String,
+    pub pid: u32,
+    pub user: String,
+}
+
+impl Inhibitor {
+    /// Whether it keeps the machine from shutting down or rebooting, at
+    /// least unless overridden.
+    pub fn blocks_shutdown(&self) -> bool {
+        self.what.split(':').any(|what| what == "shutdown") && (self.mode == "block" || self.mode == "block-weak")
+    }
+}
+
+/// Parses `systemd-inhibit --list --json=short`, which prints nothing at all
+/// when there are no locks.
+fn parse_inhibitors(json: &str) -> Result<Vec<Inhibitor>> {
+    if json.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    serde_json::from_str(json).with_context(|| format!("unexpected systemd-inhibit output {json:?}"))
+}
+
+/// The inhibitor locks held on the machine.
+pub fn inhibitors(session: &mut Session) -> Result<Vec<Inhibitor>> {
+    parse_inhibitors(&session.run_ok("systemd-inhibit --list --json=short --no-pager", QUICK)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_inhibitors() {
+        assert_eq!(parse_inhibitors("\n").unwrap(), []);
+        let json = r#"[{"who":"delayer","uid":0,"user":"root","pid":937,"comm":"systemd-inhibit","what":"shutdown","why":"d","mode":"delay"},
+                       {"who":"crawl","uid":1000,"user":"at","pid":932,"comm":"systemd-inhibit","what":"sleep:shutdown","why":"archiving","mode":"block"},
+                       {"who":"weak","uid":0,"user":"root","pid":934,"comm":"systemd-inhibit","what":"shutdown","why":"w","mode":"block-weak"},
+                       {"who":"xfce4-power-manager","uid":1000,"user":"at","pid":2000,"comm":"xfce4-power-man","what":"handle-power-key","why":"","mode":"block"}]"#;
+        let inhibitors = parse_inhibitors(json).unwrap();
+        assert_eq!(
+            inhibitors[1],
+            Inhibitor { what: "sleep:shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 932, user: "at".into() }
+        );
+        assert_eq!(inhibitors.iter().map(Inhibitor::blocks_shutdown).collect::<Vec<_>>(), [false, true, true, false]);
+        assert!(parse_inhibitors("No inhibitors.").is_err());
+    }
 
     const NET_DEV_HEADER: &str = "Inter-|   Receive                                                |  Transmit\n \
          face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";

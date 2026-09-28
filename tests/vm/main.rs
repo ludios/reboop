@@ -257,6 +257,17 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
     assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: pid ")), "{blockers:?}");
     clean_up(&mut session)?;
+
+    // Programs holding inhibitor locks, one of which only delays a reboot.
+    // (See START_TMUX about -E PATH.)
+    for (name, mode) in [("reboop-test-inhibit", "block"), ("reboop-test-delay", "delay")] {
+        sh(&mut session, &format!("systemd-run --quiet --unit={name} -E PATH systemd-inhibit --what=shutdown --who={name} --why=testing --mode={mode} sleep 600"))?;
+    }
+    wait_for(|| Ok(facts::inhibitors(&mut session)?.len() == 2))?;
+    let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
+    let [blocker] = &blockers[..] else { bail!("{blockers:?}") };
+    assert!(blocker.starts_with("inhibitor: reboop-test-inhibit (testing), pid ") && blocker.ends_with(" (root)"), "{blocker}");
+    clean_up(&mut session)?;
     Ok(())
 }
 

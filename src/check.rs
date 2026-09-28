@@ -5,6 +5,7 @@
 
 use crate::btrfs::ScrubState;
 use crate::config::{self, Machine};
+use crate::facts::Inhibitor;
 use crate::human::{self, Cell, Style::{Bold, Gray, Green, Plain, Red}};
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
@@ -25,7 +26,17 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     Ok((facts, blockers))
 }
 
-const HEADER: [&str; 11] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "KERNEL"];
+const HEADER: [&str; 12] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "OTHER", "KERNEL"];
+
+/// Short names for the reasons in `facts` not to reboot that have no column
+/// of their own.
+fn other_reasons(facts: &Facts) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if facts.inhibitors.iter().any(Inhibitor::blocks_shutdown) {
+        reasons.push("inhibitor".to_string());
+    }
+    reasons
+}
 
 /// The table row about `machine`: the facts that decide whether to reboot
 /// it, red where they block a reboot, and the kernel it runs (and the one it
@@ -58,6 +69,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         count(Activity::Rsync),
         red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
+        list(other_reasons(facts).iter().map(String::as_str).collect()),
         Plain.cell(kernel),
     ]
 }
@@ -176,6 +188,8 @@ mod tests {
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.load_average_1min = 2.5;
+        let crawl = Inhibitor { what: "shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 42, user: "at".into() };
+        facts.inhibitors.push(crawl);
         let blockers = preflight::blockers(&test_machine(), &facts);
         Ok((facts, blockers))
     }
@@ -190,21 +204,22 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER      KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  inhibitor  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -          6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
+             one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
              one: load average: 2.50 is over the limit of 2\n\
              \n\
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Red, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Gray, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert_eq!(exit_status(&outcomes[..2]), 2);
@@ -220,7 +235,8 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 4);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 5);
+        assert_eq!(report["facts"]["inhibitors"][0]["who"], "crawl");
         assert_eq!(report["facts"]["busy_processes"]["tmux"][0]["pid"], 1234);
         assert_eq!(report["facts"]["btrfs"][0]["mountpoint"], "/");
         assert_eq!(report["facts"]["btrfs"][0]["scrub"]["state"], "finished");
