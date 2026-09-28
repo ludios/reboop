@@ -363,9 +363,16 @@ fn stop_unit(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     assert_eq!(reboot::stop_unit(&mut session, "reboop-test-nonexistent.service", MINUTE)?, Stopped::NotLoaded);
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
-    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-sleep.service", MINUTE)?, Stopped::Stopped);
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-sleep.service", MINUTE)?, Stopped::Cleanly);
     let output = session.run("systemctl is-active reboop-test-sleep.service", MINUTE)?;
     assert_ne!(output.stdout_text().trim(), "active");
+
+    // One that ignores SIGTERM, so systemd has to kill it, once it's
+    // ignoring it.  (See START_TMUX about -E PATH.)
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-stubborn -E PATH -p TimeoutStopSec=2 \
+                      sh -c 'trap \"\" TERM; touch /var/tmp/reboop-test-stubborn; while :; do sleep 1; done'")?;
+    wait_for(|| Ok(session.run("test -e /var/tmp/reboop-test-stubborn", MINUTE)?.status == 0))?;
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-stubborn.service", MINUTE)?, Stopped::Uncleanly("timeout".into()));
     Ok(())
 }
 
@@ -419,7 +426,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     // Bounces the VM, printing what it says, and returns that too.
     let bounce_vm = || -> Result<(Outcome, String)> {
         let mut printed = Vec::new();
-        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, false));
+        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, None));
         let printed = String::from_utf8(printed)?;
         print!("{printed}");
         Ok((outcome?, printed))
@@ -452,7 +459,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     let (outcome, printed) = bounce_vm()?;
     assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
-    assert!(printed.contains("\nStopped reboop-test-sleep.service\nThere's no reboop-test-nonexistent.service to stop\n"));
+    assert!(printed.contains("\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n"));
     let mut session = vm.session()?;
     assert_ne!(facts::boot_id(&mut session)?, boot_id);
     assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Finished);

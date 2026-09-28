@@ -131,11 +131,9 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
         ensure!(mount.starts_with('/'), "scrub mount {mount:?} of {} isn't an absolute path", machine.hostname);
     }
     for service in &machine.stop_services {
-        ensure!(
-            !service.is_empty() && !service.contains(char::is_whitespace),
-            "{service:?} in stop_services of {} isn't a unit name",
-            machine.hostname
-        );
+        // The characters systemd allows, which leave out globs
+        let valid = !service.is_empty() && service.chars().all(|c| c.is_ascii_alphanumeric() || ":-_.\\@".contains(c));
+        ensure!(valid, "{service:?} in stop_services of {} isn't a unit name", machine.hostname);
     }
     ensure!(
         machine.max_load_average_1min.is_finite() && machine.max_load_average_1min >= 0.0,
@@ -270,6 +268,8 @@ mod tests {
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": [""]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql nginx"]}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgres*"]}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql", "container@db.service"]}"#).is_ok());
         assert!(line("{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\"}\n{\"hostname\": \"one\", \"ipv4\": \"10.0.0.2\"}").is_err());
         assert!(parse(Some(r#"{"ssh_port": 904, "extra": 1}"#), "", Path::new(HOME)).is_err());
         let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#, Path::new(HOME)).unwrap_err();

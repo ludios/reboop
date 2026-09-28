@@ -2,15 +2,20 @@
 
 //! Taking a remote machine down.
 
-use crate::ssh::{Session, shell_quote};
+use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Result, bail};
 use std::time::Duration;
 use tracing::info;
 
 /// What [`stop_unit`] found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stopped {
-    Stopped,
+    /// The unit is stopped, and systemd's result for it is "success".
+    Cleanly,
+    /// The unit is stopped, but systemd's result for it is this instead of
+    /// "success": e.g. "timeout" if systemd had to kill it, or whatever made
+    /// it fail before.  (systemctl stop succeeds either way.)
+    Uncleanly(String),
     /// There's no such unit on the machine.
     NotLoaded,
 }
@@ -18,13 +23,19 @@ pub enum Stopped {
 /// Stops systemd unit `unit` (e.g. "postgresql.service"), waiting up to
 /// `timeout` for it to stop.
 pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result<Stopped> {
-    let output = session.run(&format!("systemctl stop -- {}", shell_quote(unit)), timeout)?;
+    let unit_word = shell_quote(unit);
+    let output = session.run(&format!("systemctl stop -- {unit_word}"), timeout)?;
     match output.status {
-        0 => Ok(Stopped::Stopped),
+        0 => {}
         // "program is not installed", in systemctl's LSB-style exit codes
-        5 => Ok(Stopped::NotLoaded),
+        5 => return Ok(Stopped::NotLoaded),
         status => bail!("systemctl stop {unit} exited with status {status}: {}", output.stderr_text()),
     }
+    let result = session.run_ok(&format!("systemctl show --property=Result --value -- {unit_word}"), QUICK)?;
+    Ok(match result.trim_end() {
+        "success" => Stopped::Cleanly,
+        other => Stopped::Uncleanly(other.to_string()),
+    })
 }
 
 /// Asks systemd to reboot the machine.  The connection often closes before
