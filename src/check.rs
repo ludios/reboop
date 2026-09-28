@@ -35,7 +35,8 @@ const HEADER: [&str; 11] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", 
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
 
 /// Short names for the reasons in `facts` not to reboot that have no column
-/// of their own, in the order of [`preflight::blockers`].
+/// of their own: boot, then btrfs, processes, inhibitors and jobs, as in
+/// [`preflight::blockers`].
 fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
     if !preflight::boot_problems(facts).is_empty() {
@@ -44,7 +45,7 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     reasons.extend(operations.into_iter().map(|op| format!("btrfs {op}")));
     if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(Device::has_trouble) {
-        reasons.push("btrfs device".to_string());
+        reasons.push("btrfs device trouble".to_string());
     }
     for activity in facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity)) {
         reasons.push(match activity {
@@ -241,9 +242,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                             OTHER                             KERNEL\n\
-             one      no     -        -     1      -  12.50 MB/s  12.50   98%  btrfs balance,btrfs device,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -        -     -      -   1.00 kB/s   0.50   45%  -                                                            6.18.54\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 KERNEL\n\
+             one      no     -        -     1      -  12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -        -     -      -   1.00 kB/s   0.50   45%  -                                                                    6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -275,6 +276,15 @@ mod tests {
         assert_eq!(other_reasons(&facts), Vec::<String>::new());
         facts.boot[0].missing_files.push("/boot/EFI/nixos/initrd.efi".into());
         assert_eq!(other_reasons(&facts), ["boot"]);
+    }
+
+    #[test]
+    fn names_each_btrfs_operation_once() {
+        let mut facts = idle_facts();
+        facts.btrfs[0].exclusive_operation = "device replace".into();
+        facts.btrfs[0].devices[0].missing = true;
+        facts.btrfs.push(facts.btrfs[0].clone());
+        assert_eq!(other_reasons(&facts), ["btrfs device replace", "btrfs device trouble"]);
     }
 
     #[test]
