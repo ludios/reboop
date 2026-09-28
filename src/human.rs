@@ -79,11 +79,13 @@ impl Style {
     }
 }
 
-/// Which side of its column a cell's text is flush with.
+/// Where a cell's text goes in its column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
     Left,
     Right,
+    /// Any odd space left over goes on the right.
+    Center,
 }
 
 /// Text in a table, and how it looks.
@@ -95,9 +97,9 @@ pub struct Cell {
 }
 
 impl Cell {
-    /// This cell, flush right, the way numbers line up.
-    pub fn right_aligned(self) -> Cell {
-        Cell { align: Align::Right, ..self }
+    /// This cell, aligned as `align` says.
+    pub fn aligned(self, align: Align) -> Cell {
+        Cell { align, ..self }
     }
 }
 
@@ -118,11 +120,13 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
                 // escape sequences (none around empty text) so that
                 // trim_end can remove it from the end of a row.
                 let shown = if color && !cell.text.is_empty() { cell.style.paint(&cell.text) } else { cell.text.clone() };
-                let padding = " ".repeat(width - cell.text.chars().count());
-                match cell.align {
-                    Align::Left  => shown + &padding,
-                    Align::Right => padding + &shown,
-                }
+                let padding = width - cell.text.chars().count();
+                let before = match cell.align {
+                    Align::Left   => 0,
+                    Align::Right  => padding,
+                    Align::Center => padding / 2,
+                };
+                " ".repeat(before) + &shown + &" ".repeat(padding - before)
             })
             .collect();
         text.push_str(cells.join("  ").trim_end());
@@ -157,8 +161,12 @@ mod tests {
         assert_eq!(table(&rows, false), "name   kernel             okay\none    6.18.54 → 6.18.55  no\nthree\n");
         assert_eq!(table(&rows, true), table(&rows, false));
         assert_eq!(table(&[], true), "");
-        let rows = [vec![Style::Plain.cell("load"), Style::Plain.cell("x")], vec![Style::Plain.cell("0.5").right_aligned(), Style::Plain.cell("").right_aligned()]];
-        assert_eq!(table(&rows, false), "load  x\n 0.5\n");
+        let cell = |text: &str, align| Style::Plain.cell(text).aligned(align);
+        let rows = [
+            vec![cell("net", Align::Center), cell("load", Align::Left), cell("x", Align::Left)],
+            vec![cell("1.5 kB/s", Align::Right), cell("0.5", Align::Right), cell("", Align::Right)],
+        ];
+        assert_eq!(table(&rows, false), "  net     load  x\n1.5 kB/s   0.5\n");
     }
 
     #[test]
@@ -167,7 +175,7 @@ mod tests {
         assert_eq!(table(&rows, true), "\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m\nthree  \x1b[31mno\x1b[0m\n");
         assert_eq!(table(&rows, false), "NAME   OKAY\nthree  no\n");
         assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
-        let rows = [vec![Style::Bold.cell("LOAD")], vec![Style::Red.cell("2.5").right_aligned()]];
+        let rows = [vec![Style::Bold.cell("LOAD")], vec![Style::Red.cell("2.5").aligned(Align::Right)]];
         assert_eq!(table(&rows, true), "\x1b[1mLOAD\x1b[0m\n \x1b[31m2.5\x1b[0m\n");
     }
 }

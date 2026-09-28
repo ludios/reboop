@@ -6,7 +6,7 @@
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::Inhibitor;
-use crate::human::{self, Cell, Style::{Bold, Gray, Green, Plain, Red}};
+use crate::human::{self, Align::{Center, Left, Right}, Cell, Style::{Bold, Gray, Green, Plain, Red}};
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
@@ -30,6 +30,9 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 const ACTIVITY_COLUMNS: [Activity; 4] = [Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync];
 
 const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
+
+/// The headers centered over their columns; the rest are flush left.
+const CENTERED: [&str; 2] = ["NET", "OTHER"];
 
 /// Short names for the reasons in `facts` not to reboot `machine` that have
 /// no column of their own.
@@ -65,7 +68,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
-    let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).right_aligned();
+    let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
         systems.running_kernel.clone()
@@ -94,7 +97,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
 /// further lines of the error indented), a blank line before each machine's.
 /// The table is styled if `color`.
 fn table(outcomes: &[(&Machine, Outcome)], color: bool) -> String {
-    let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title)))];
+    let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title).aligned(if CENTERED.contains(&title) { Center } else { Left })))];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
     let mut text = human::table(&rows, color);
 
@@ -233,7 +236,7 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET         LOAD   ROOT  OTHER                                   KERNEL\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC     NET      LOAD   ROOT                  OTHER                   KERNEL\n\
              one      no     -      balance   -    -       1     -      12.50 MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
              two      yes    -      -         -    -       -     -       1.00 kB/s   0.50   45%  -                                       6.18.54\n\
              three    error\n\
