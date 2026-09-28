@@ -2,10 +2,12 @@
 
 //! Formatting quantities and tables for people.
 
+/// The units above bytes, each 1000 times the last.
+const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
+
 /// A byte count in SI units: the number (with two decimals unless the unit
 /// is bytes) and the unit, e.g. ("130.50", "GB").
 fn scaled(bytes: u64) -> (String, &'static str) {
-    const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
     if bytes < 1000 {
         return (bytes.to_string(), "B");
     }
@@ -33,12 +35,13 @@ pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", bytes(bytes_per_sec.round() as u64))
 }
 
-/// Formats a rate like [`rate`], but with "B" padded to the width of the
-/// other units, e.g. "524  B/s", so that the numbers of rates right-aligned
+/// Formats a rate like [`rate`], but with the unit padded to the width of
+/// the widest, e.g. "524  B/s", so that the numbers of rates right-aligned
 /// in a column line up.
 pub fn column_rate(bytes_per_sec: f64) -> String {
     let (number, unit) = scaled(bytes_per_sec.round() as u64);
-    format!("{number} {unit:>2}/s")
+    let width = UNITS.iter().map(|unit| unit.chars().count()).max().unwrap();
+    format!("{number} {unit:>width$}/s")
 }
 
 /// Formats seconds like "1h 2m 3s", leaving out leading zero units.
