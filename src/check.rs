@@ -73,7 +73,10 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     };
     let list = |items: Vec<&str>| if items.is_empty() { Gray.cell("-") } else { Red.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
-    let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()).aligned(Right));
+    let count = |activity| match facts.busy_processes.get(&activity) {
+        Some(processes) => Red.cell(processes.len().to_string()).aligned(Right),
+        None            => Gray.cell("-"),
+    };
     let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
