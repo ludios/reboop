@@ -91,7 +91,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         count(Activity::Nix),
         count(Activity::Tmux),
         count(Activity::Rsync),
-        number(preflight::network_over_limit(machine, facts), human::column_rate(facts.network_bytes_per_sec)),
+        number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         list(other_reasons(facts).iter().map(String::as_str).collect()),

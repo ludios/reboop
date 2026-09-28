@@ -5,43 +5,28 @@
 /// The units above bytes, each 1000 times the last.
 const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
 
-/// A byte count in SI units: the number (with two decimals unless the unit
-/// is bytes) and the unit, e.g. ("130.50", "GB").
-fn scaled(bytes: u64) -> (String, &'static str) {
-    if bytes < 1000 {
-        return (bytes.to_string(), "B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = "B";
-    for next in UNITS {
-        // What would round up to "1000.00" goes to the next unit.
-        if value < 999.995 {
-            break;
-        }
+/// Formats `bytes` with two decimals in the first of [`UNITS`] that keeps
+/// the number under 1000 (or else the last), e.g. "0.52 kB" or "130.50 GB".
+fn kilobytes_or_more(bytes: f64) -> String {
+    let mut value = bytes / 1000.0;
+    let mut unit = 0;
+    // What would round up to "1000.00" goes to the next unit.
+    while value >= 999.995 && unit + 1 < UNITS.len() {
         value /= 1000.0;
-        unit = next;
+        unit += 1;
     }
-    (format!("{value:.2}"), unit)
+    format!("{value:.2} {}", UNITS[unit])
 }
 
-/// Formats a byte count with SI units, e.g. "130.50 GB".
+/// Formats a byte count with SI units, e.g. "999 B" or "130.50 GB".
 pub fn bytes(bytes: u64) -> String {
-    let (number, unit) = scaled(bytes);
-    format!("{number} {unit}")
+    if bytes < 1000 { format!("{bytes} B") } else { kilobytes_or_more(bytes as f64) }
 }
 
-/// Formats a rate in bytes per second, e.g. "1.39 GB/s".
+/// Formats a rate in bytes per second, in kB/s or more so that every rate
+/// has two decimals, e.g. "0.52 kB/s" or "1.39 GB/s".
 pub fn rate(bytes_per_sec: f64) -> String {
-    format!("{}/s", bytes(bytes_per_sec.round() as u64))
-}
-
-/// Formats a rate like [`rate`], but with the unit padded to the width of
-/// the widest, e.g. "524  B/s", so that the numbers of rates right-aligned
-/// in a column line up.
-pub fn column_rate(bytes_per_sec: f64) -> String {
-    let (number, unit) = scaled(bytes_per_sec.round() as u64);
-    let width = UNITS.iter().map(|unit| unit.chars().count()).max().unwrap();
-    format!("{number} {unit:>width$}/s")
+    format!("{}/s", kilobytes_or_more(bytes_per_sec))
 }
 
 /// Formats seconds like "1h 2m 3s", leaving out leading zero units.
@@ -161,9 +146,9 @@ mod tests {
         assert_eq!(bytes(999_994), "999.99 kB");
         assert_eq!(bytes(999_999), "1.00 MB");
         assert_eq!(rate(1_389_999.6), "1.39 MB/s");
-        assert_eq!(rate(524.0), "524 B/s");
-        assert_eq!(column_rate(524.0), "524  B/s");
-        assert_eq!(column_rate(5_290.0), "5.29 kB/s");
+        assert_eq!(bytes(u64::MAX), "18.45 EB");
+        assert_eq!(rate(524.0), "0.52 kB/s");
+        assert_eq!(rate(0.0), "0.00 kB/s");
         assert_eq!(seconds(5), "5s");
         assert_eq!(seconds(210), "3m 30s");
         assert_eq!(seconds(3723), "1h 2m 3s");
