@@ -43,7 +43,7 @@ pub fn set(hostname: &str, test: bool) -> Result<()> {
     check_password(&password)?;
     if test {
         let deadline = Deadline::after(OPEN_TIMEOUT + QUICK);
-        let (device, opens) = initrd::test_root_password(&Ssh::default(), &machine.target(), &password, deadline)?;
+        let (device, opens) = initrd::test_luks_password(&Ssh::default(), &machine.target(), &password, deadline)?;
         ensure!(opens, "the password doesn't open {device} beneath / on {hostname}");
         println!("The password opens {device} beneath / on {hostname}");
     } else {

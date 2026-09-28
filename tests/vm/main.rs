@@ -378,8 +378,8 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn root_password_is_tested(vm: &Vm) -> Result<()> {
-    let test = |password| initrd::test_root_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
+fn luks_password_is_tested(vm: &Vm) -> Result<()> {
+    let test = |password| initrd::test_luks_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
     assert_eq!(test(&vm.manifest.luks_password)?, ("/dev/vda2".into(), true));
     assert_eq!(test("not the password")?, ("/dev/vda2".into(), false));
     Ok(())
@@ -459,7 +459,7 @@ fn main() {
         ("scrub_finds_corruption", scrub_finds_corruption),
         ("stop_unit", stop_unit),
         ("postflight_facts", postflight_facts),
-        ("root_password_is_tested", root_password_is_tested),
+        ("luks_password_is_tested", luks_password_is_tested),
         ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
         ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
     ];

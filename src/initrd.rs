@@ -61,7 +61,7 @@ pub fn check_password(password: &str) -> Result<()> {
 
 /// Finds the one LUKS device beneath /, prints "reboop-luks-device DEVICE",
 /// and tests whether the password on stdin opens it.
-const TEST_ROOT_PASSWORD: &str = r#"
+const TEST_LUKS_PASSWORD: &str = r#"
 set -euf
 root=$(findmnt -nvo SOURCE /)
 set -- $(lsblk -rsnpo PATH,FSTYPE "$root" | awk '$2 == "crypto_LUKS" { print $1 }')
@@ -79,9 +79,9 @@ exec cryptsetup luksOpen --test-passphrase --key-file=- "$1"
 ///
 /// Only connects to hosts whose key is already in known_hosts, whatever the
 /// user's ssh config says, since we're sending a secret.
-pub fn test_root_password(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<(String, bool)> {
+pub fn test_luks_password(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<(String, bool)> {
     check_password(password)?;
-    let command = ssh.command(target, &["-T", "-o", "StrictHostKeyChecking=yes"], &sh_c(TEST_ROOT_PASSWORD));
+    let command = ssh.command(target, &["-T", "-o", "StrictHostKeyChecking=yes"], &sh_c(TEST_LUKS_PASSWORD));
     let output = child::run(command, password.as_bytes(), deadline)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let device = stdout.lines().find_map(|line| line.strip_prefix("reboop-luks-device "));
