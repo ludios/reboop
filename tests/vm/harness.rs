@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
+use std::io;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread::sleep;
@@ -162,6 +164,15 @@ fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Locks `file` unless something else has it locked, returning whether it did.
+fn try_lock(file: &File) -> Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 /// How long a VM keeps running after the last test run that used it.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
@@ -184,15 +195,15 @@ fn watch(dir: &Path, pid: u32) -> Result<()> {
     // the old one's to notice that its qemu is gone.
     let watching = File::create(dir.join("watchdog.lock"))?;
     watching.lock()?;
-    while qemu_is_running(dir, pid) {
+    loop {
         sleep(WATCHDOG_INTERVAL);
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                lock.lock()?;
-                lock.set_modified(SystemTime::now())?;
-            }
-            Err(TryLockError::Error(error)) => return Err(error.into()),
+        if !try_lock(&lock)? {
+            // A run is using the VM, so it was last used when the run ends.
+            lock.lock()?;
+            lock.set_modified(SystemTime::now())?;
+        }
+        if !qemu_is_running(dir, pid) {
+            return Ok(());
         }
         let idle = lock.metadata()?.modified()?.elapsed().unwrap_or_default();
         if idle >= IDLE_TIMEOUT {
@@ -202,16 +213,11 @@ fn watch(dir: &Path, pid: u32) -> Result<()> {
         }
         lock.unlock()?;
     }
-    Ok(())
 }
 
 /// Whether a watchdog is watching the VM in `dir`.
 fn is_watched(dir: &Path) -> Result<bool> {
-    match File::create(dir.join("watchdog.lock"))?.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error.into()),
-    }
+    Ok(!try_lock(&File::create(dir.join("watchdog.lock"))?)?)
 }
 
 /// Starts a watchdog (see [`watch`]) for the VM in `dir`, whose qemu is
@@ -219,16 +225,20 @@ fn is_watched(dir: &Path) -> Result<bool> {
 /// run and a Ctrl-C of it.
 fn start_watchdog(dir: &Path, pid: u32) -> Result<()> {
     let log = File::options().create(true).append(true).open(dir.join("watchdog.log"))?;
-    Command::new("setsid")
-        .arg(env::current_exe()?)
+    // Rather than current_exe(), which is gone if a build has replaced this
+    // program since it started.
+    let mut command = Command::new("/proc/self/exe");
+    command
         .arg(WATCHDOG_ARG)
         .arg(dir)
         .arg(pid.to_string())
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log)
-        .spawn()
-        .context("failed to start the VM's watchdog")?;
+        .stderr(log);
+    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    unsafe { command.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }) };
+    command.spawn().context("failed to start the VM's watchdog")?;
     Ok(())
 }
 
@@ -329,7 +339,8 @@ pub struct Vm {
     pub initrd_target: Target,
     pub manifest: Manifest,
     pub dir: PathBuf,
-    /// Held for as long as the tests run, so concurrent runs don't share the VM.
+    /// Held for as long as the tests run, so concurrent runs don't share the
+    /// VM, and so its watchdog knows it's in use (see [`watch`]).
     _lock: File,
 }
 
@@ -358,8 +369,10 @@ impl Vm {
                     stop_qemu(&dir, old.pid)?;
                 }
                 let state = start_qemu(&dir, &bundle, &manifest)?;
-                start_watchdog(&dir, state.pid)?;
+                // First, so that if the watchdog doesn't start, the next run
+                // finds the VM and tries again.
                 fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+                start_watchdog(&dir, state.pid)?;
                 state
             }
         };
