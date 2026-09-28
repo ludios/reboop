@@ -27,24 +27,30 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 }
 
 /// The activities that have columns of their own.
-const ACTIVITY_COLUMNS: [Activity; 4] = [Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync];
+const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Rsync];
 
-const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
+const HEADER: [&str; 11] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
 
 /// Short names for the reasons in `facts` not to reboot that have no column
-/// of their own.
+/// of their own, in the order of [`preflight::blockers`].
 fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
     if !preflight::boot_problems(facts).is_empty() {
         reasons.push("boot".to_string());
     }
-    let activities = facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity));
-    reasons.extend(activities.map(Activity::to_string));
+    let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
+    reasons.extend(operations.into_iter().map(|op| format!("btrfs {op}")));
     if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(Device::has_trouble) {
         reasons.push("btrfs device".to_string());
+    }
+    for activity in facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity)) {
+        reasons.push(match activity {
+            Activity::SwitchToConfiguration => "switch".to_string(),
+            _ => activity.to_string(),
+        });
     }
     if facts.inhibitors.iter().any(Inhibitor::blocks_shutdown) {
         reasons.push("inhibitor".to_string());
@@ -66,7 +72,6 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     };
     let list = |items: Vec<&str>| if items.is_empty() { Gray.cell("-") } else { Red.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
-    let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string())).aligned(Right);
     let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
@@ -79,9 +84,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         Plain.cell(machine.hostname.clone()),
         if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
         list(scrubbing.collect()),
-        list(operations.into_iter().collect()),
         count(Activity::Nix),
-        count(Activity::SwitchToConfiguration),
         count(Activity::Tmux),
         count(Activity::Rsync),
         number(preflight::network_over_limit(machine, facts), human::column_rate(facts.network_bytes_per_sec)),
@@ -206,6 +209,8 @@ mod tests {
         facts.btrfs[0].devices[0].missing = true;
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
+        let switch = Process { pid: 1236, ppid: 1, user: "root".into(), args: "/run/current-system/bin/switch-to-configuration boot".into() };
+        facts.busy_processes.insert(Activity::SwitchToConfiguration, vec![switch]);
         let reencrypt = Process { pid: 1235, ppid: 1, user: "root".into(), args: "cryptsetup reencrypt /dev/sda2".into() };
         facts.busy_processes.insert(Activity::Cryptsetup, vec![reencrypt]);
         facts.network_bytes_per_sec = 12_500_000.0;
@@ -236,13 +241,14 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC     NET      LOAD   ROOT                  OTHER                   KERNEL\n\
-             one      no     -      balance     -       -     1      -  12.50 MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -      -           -       -     -      -   1.00 kB/s   0.50   45%  -                                       6.18.54\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                             OTHER                             KERNEL\n\
+             one      no     -        -     1      -  12.50 MB/s  12.50   98%  btrfs balance,btrfs device,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -        -     -      -   1.00 kB/s   0.50   45%  -                                                            6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
+             one: switch-to-configuration: pid 1236 (root): /run/current-system/bin/switch-to-configuration boot\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
@@ -254,8 +260,8 @@ mod tests {
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Red, Red, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Green, Gray, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Gray, Red, Gray, Red, Red, Red, Red, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Green, Green, Green, Gray, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
@@ -280,7 +286,7 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 9);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 10);
         assert_eq!(report["facts"]["lasting_jobs"][0]["type"], "start");
         assert_eq!(report["facts"]["root_used_percent"], 98);
         assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);
