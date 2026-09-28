@@ -13,6 +13,7 @@ mod harness;
 use anyhow::{Result, bail, ensure};
 use harness::{Name, Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
+use reboop::boot;
 use reboop::bounce::{self, Outcome, Printer};
 use reboop::btrfs::{self, Device, ScrubState};
 use reboop::config::Machine;
@@ -467,6 +468,60 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
+fn systemd_boots_default_is_checked(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let default = facts::systems(&mut session)?.default;
+    let [boot] = &boot::default_boots(&mut session)?[..] else { bail!("not one default boot") };
+    assert_eq!((boot.loader.as_str(), boot.system(), boot.missing_files.len()), ("systemd-boot", Some(default.as_str()), 0), "{boot:?}");
+
+    // A one-time boot into the firmware's setup
+    sh(&mut session, "bootctl set-oneshot auto-reboot-to-firmware-setup")?;
+    let machine = vm_machine(vm);
+    let facts = preflight::gather(&mut session, &machine.hostname);
+    clean_up(&mut session)?;
+    let expected = r#"boot: systemd-boot's default, "auto-reboot-to-firmware-setup", doesn't boot a NixOS system (no init=/nix/store/…/init)"#;
+    assert_eq!(preflight::blockers(&machine, &facts?), [expected]);
+    Ok(())
+}
+
+fn grubs_defaults_are_checked(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let default = facts::systems(&mut session)?.default;
+    let boots = boot::default_boots(&mut session)?;
+    let loaders: Vec<_> = boots.iter().map(|boot| boot.loader.as_str()).collect();
+    assert_eq!(loaders, ["/boot/grub/grub.cfg", "/boot-fallback/grub/grub.cfg"]);
+    for boot in &boots {
+        assert_eq!((boot.entry.as_str(), boot.system(), boot.missing_files.len()), ("NixOS", Some(default.as_str()), 0), "{boot:?}");
+    }
+
+    // A mirror that's behind, and a kernel gone from the other /boot.
+    // (clean_up puts both back.)
+    let stale = "/nix/store/00000000000000000000000000000000-nixos-system-stale";
+    let kernel = sh(
+        &mut session,
+        &format!(
+            "set -e
+            cp /boot-fallback/grub/grub.cfg /var/tmp/reboop-test-grub.cfg
+            sed -i 's|init={default}/init|init={stale}/init|' /boot-fallback/grub/grub.cfg
+            kernel=$(ls /boot/kernels/*-bzImage)
+            printf %s $kernel >/var/tmp/reboop-test-kernel-path
+            mv $kernel /var/tmp/reboop-test-kernel
+            printf %s $kernel"
+        ),
+    )?;
+    let machine = vm_machine(vm);
+    let facts = preflight::gather(&mut session, &machine.hostname);
+    clean_up(&mut session)?;
+    assert_eq!(
+        preflight::blockers(&machine, &facts?),
+        [
+            format!(r#"boot: /boot/grub/grub.cfg's default, "NixOS", needs {kernel}, which is missing"#),
+            format!(r#"boot: /boot-fallback/grub/grub.cfg's default, "NixOS", boots {stale}, not the system profile's {default}"#),
+        ]
+    );
+    Ok(())
+}
+
 fn luks_password_is_tested(vm: &Vm) -> Result<()> {
     assert_eq!(initrd::luks_devices(&mut vm.session()?)?, ["/dev/vda2"]);
     let test = |password| initrd::test_luks_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
@@ -580,9 +635,11 @@ fn main() {
         ("scrub_finds_corruption", SystemdBoot, scrub_finds_corruption),
         ("stop_unit", SystemdBoot, stop_unit),
         ("postflight_facts", SystemdBoot, postflight_facts),
+        ("systemd_boots_default_is_checked", SystemdBoot, systemd_boots_default_is_checked),
         ("luks_password_is_tested", SystemdBoot, luks_password_is_tested),
         ("reboot_with_wrong_password_first", SystemdBoot, reboot_with_wrong_password_first),
         ("bounce_into_new_default_configuration", SystemdBoot, bounce_into_new_default_configuration),
+        ("grubs_defaults_are_checked", Grub, grubs_defaults_are_checked),
         ("grub_bounce_into_new_default_configuration", Grub, bounce_into_new_default_configuration),
     ];
     let trials = tests.iter().map(|&(name, vm, test)| Trial::test(name, move || run(vm, test))).collect();

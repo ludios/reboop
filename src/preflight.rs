@@ -2,6 +2,7 @@
 
 //! Finding out whether a machine is okay to reboot.
 
+use crate::boot::{self, DefaultBoot};
 use crate::btrfs::{self, Device, Filesystem, ScrubState, ScrubStatus};
 use crate::config::Machine;
 use crate::facts::{self, Inhibitor, Job, Systems};
@@ -11,6 +12,7 @@ use crate::ssh::Session;
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// How long [`gather`] watches network traffic.
@@ -39,6 +41,8 @@ pub struct BtrfsFacts {
 pub struct Facts {
     pub boot_id: String,
     pub systems: Systems,
+    /// What the boot loader will boot next, as from [`boot::default_boots`]
+    pub boot: Vec<DefaultBoot>,
     pub load_average_1min: f64,
     /// Bytes received plus sent per second over [`NETWORK_SAMPLE`].
     pub network_bytes_per_sec: f64,
@@ -85,6 +89,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
         systems: facts::systems(session)?,
+        boot: boot::default_boots(session)?,
         load_average_1min: facts::load_average_1min(session)?,
         network_bytes_per_sec,
         root_used_percent: facts::root_used_percent(session)?,
@@ -107,6 +112,36 @@ pub fn load_over_limit(machine: &Machine, facts: &Facts) -> bool {
     facts.load_average_1min > machine.max_load_average_1min
 }
 
+/// Why what `machine`'s boot loader will boot next (in `facts`) isn't what
+/// a reboot should boot: the system profile, from files that are there,
+/// with its initrd at the address that bounce will look for it.  One line
+/// each for people; empty if all is well.
+pub fn boot_problems(machine: &Machine, facts: &Facts) -> Vec<String> {
+    if facts.boot.is_empty() {
+        return vec!["boot: found neither systemd-boot's default entry nor a GRUB menu, so it's unclear what the machine will boot".into()];
+    }
+    let mut problems = Vec::new();
+    for boot in &facts.boot {
+        let default = format!("boot: {}'s default, {:?},", boot.loader, boot.entry);
+        match boot.system() {
+            None => problems.push(format!("{default} doesn't boot a NixOS system (no init=/nix/store/…/init)")),
+            Some(system) if system != facts.systems.default => {
+                problems.push(format!("{default} boots {system}, not the system profile's {}", facts.systems.default));
+            }
+            Some(_) => {}
+        }
+        for file in &boot.missing_files {
+            problems.push(format!("{default} needs {file}, which is missing"));
+        }
+        let addresses = boot.initrd_addresses();
+        if !addresses.is_empty() && !addresses.contains(&machine.ipv4) {
+            let addresses: Vec<_> = addresses.iter().map(Ipv4Addr::to_string).collect();
+            problems.push(format!("{default} has the initrd take {} (ip=), not {}", addresses.join(" and "), machine.ipv4));
+        }
+    }
+    problems
+}
+
 /// Whether `facts` show that `machine`'s / is too full to reboot: it might
 /// not boot properly.
 pub fn root_full(machine: &Machine, facts: &Facts) -> bool {
@@ -116,7 +151,7 @@ pub fn root_full(machine: &Machine, facts: &Facts) -> bool {
 /// The reasons not to reboot `machine`, given `facts` about it, one line
 /// each for people.  Empty if it's okay to reboot.
 pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
-    let mut blockers = Vec::new();
+    let mut blockers = boot_problems(machine, facts);
     for fs in &facts.btrfs {
         // Linux hangs on shutdown while a scrub is running.
         if fs.scrub.state == ScrubState::Running {
@@ -190,6 +225,12 @@ pub(crate) fn idle_facts() -> Facts {
         seconds_left: None,
         errors: BTreeMap::new(),
     };
+    let boot = DefaultBoot {
+        loader: "systemd-boot".into(),
+        entry: "nixos-generation-24.conf".into(),
+        options: format!("init={system}/init console=ttyS0 ip=10.0.0.1::10.0.0.254:255.255.255.0:one::none"),
+        missing_files: vec![],
+    };
     Facts {
         boot_id: "4f6f3fbb-4f0e-4ba0-9a8d-2f53f2c4f59e".into(),
         systems: Systems {
@@ -199,6 +240,7 @@ pub(crate) fn idle_facts() -> Facts {
             default: system,
             default_kernel: "6.18.54".into(),
         },
+        boot: vec![boot],
         load_average_1min: 0.5,
         network_bytes_per_sec: 1_000.0,
         root_used_percent: 45,
@@ -297,6 +339,40 @@ mod tests {
                 "root filesystem: 97% used, and it's full at 97%",
             ]
         );
+    }
+
+    #[test]
+    fn finds_boot_problems() {
+        let machine = test_machine();
+        let mut facts = idle_facts();
+        assert_eq!(boot_problems(&machine, &facts), Vec::<String>::new());
+
+        // A GRUB mirror that's behind, and one that lost its initrd
+        let grub = |loader: &str, system: &str, missing_files: Vec<String>| DefaultBoot {
+            loader: loader.into(),
+            entry: "NixOS".into(),
+            options: format!("init={system}/init ip=192.168.10.12::192.168.10.1:255.255.255.0:one::none"),
+            missing_files,
+        };
+        facts.boot = vec![
+            grub("/boot/grub/grub.cfg", "/nix/store/zzz-nixos-system-one-26.05", vec![]),
+            grub("/boot-fallback/grub/grub.cfg", &facts.systems.default, vec!["/boot-fallback/kernels/initrd".into()]),
+        ];
+        assert_eq!(
+            boot_problems(&machine, &facts),
+            [
+                "boot: /boot/grub/grub.cfg's default, \"NixOS\", boots /nix/store/zzz-nixos-system-one-26.05, not the system profile's /nix/store/aaa-nixos-system-one-26.05",
+                "boot: /boot/grub/grub.cfg's default, \"NixOS\", has the initrd take 192.168.10.12 (ip=), not 10.0.0.1",
+                "boot: /boot-fallback/grub/grub.cfg's default, \"NixOS\", needs /boot-fallback/kernels/initrd, which is missing",
+                "boot: /boot-fallback/grub/grub.cfg's default, \"NixOS\", has the initrd take 192.168.10.12 (ip=), not 10.0.0.1",
+            ]
+        );
+
+        facts.boot[0].options = "quiet".into();
+        assert!(boot_problems(&machine, &facts)[0].ends_with("doesn't boot a NixOS system (no init=/nix/store/…/init)"));
+        facts.boot.clear();
+        assert!(boot_problems(&machine, &facts)[0].starts_with("boot: found neither"));
+        assert_eq!(blockers(&machine, &facts).len(), 1);
     }
 
     #[test]

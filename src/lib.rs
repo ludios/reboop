@@ -2,6 +2,7 @@
 
 //! Primitives for carefully rebooting NixOS machines: see doc/spec.md.
 
+pub mod boot;
 pub mod bounce;
 pub mod btrfs;
 pub mod check;
