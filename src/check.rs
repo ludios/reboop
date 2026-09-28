@@ -258,6 +258,7 @@ mod tests {
         assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Green, Gray, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
+        assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
         assert_eq!(exit_status(&outcomes[..2]), 2);
         assert_eq!(exit_status(&outcomes[1..2]), 0);
     }

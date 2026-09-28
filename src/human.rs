@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(table(&rows, true), "\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m\nthree  \x1b[31mno\x1b[0m\n");
         assert_eq!(table(&rows, false), "NAME   OKAY\nthree  no\n");
         assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
-        let rows = [vec![Style::Bold.cell("LOAD")], vec![Style::Red.cell("2.5").aligned(Align::Right)]];
-        assert_eq!(table(&rows, true), "\x1b[1mLOAD\x1b[0m\n \x1b[31m2.5\x1b[0m\n");
+        let rows = [vec![Style::Bold.cell("NET").aligned(Align::Center)], vec![Style::Red.cell("12.50").aligned(Align::Right)], vec![Style::Red.cell("1.0").aligned(Align::Right)]];
+        assert_eq!(table(&rows, true), " \x1b[1mNET\x1b[0m\n\x1b[31m12.50\x1b[0m\n  \x1b[31m1.0\x1b[0m\n");
     }
 }
