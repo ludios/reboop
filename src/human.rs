@@ -11,13 +11,19 @@ pub fn bytes(bytes: u64) -> String {
     let mut value = bytes as f64;
     let mut unit = "B";
     for next in UNITS {
-        if value < 1000.0 {
+        // What would round up to "1000.00" goes to the next unit.
+        if value < 999.995 {
             break;
         }
         value /= 1000.0;
         unit = next;
     }
     format!("{value:.2}{unit}")
+}
+
+/// Formats a rate in bytes per second, e.g. "1.39GB/s".
+pub fn rate(bytes_per_sec: f64) -> String {
+    format!("{}/s", bytes(bytes_per_sec.round() as u64))
 }
 
 /// Formats seconds like "1h 2m 3s", leaving out leading zero units.
@@ -67,6 +73,9 @@ mod tests {
         assert_eq!(bytes(999), "999B");
         assert_eq!(bytes(1_000), "1.00kB");
         assert_eq!(bytes(391_560_000_000), "391.56GB");
+        assert_eq!(bytes(999_994), "999.99kB");
+        assert_eq!(bytes(999_999), "1.00MB");
+        assert_eq!(rate(1_389_999.6), "1.39MB/s");
         assert_eq!(seconds(5), "5s");
         assert_eq!(seconds(210), "3m 30s");
         assert_eq!(seconds(3723), "1h 2m 3s");

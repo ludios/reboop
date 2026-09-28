@@ -172,6 +172,10 @@ fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
+/// Starts a real tmux server, owned by someone other than root.  (Transient
+/// units get a minimal PATH, hence the -E PATH.)
+const START_TMUX: &str = "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600";
+
 fn activities(session: &mut Session) -> Result<BTreeSet<Activity>> {
     Ok(processes::list(session)?.iter().filter_map(processes::activity).collect())
 }
@@ -180,10 +184,8 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     assert_eq!(activities(&mut session)?, BTreeSet::new(), "{:#?}", processes::list(&mut session)?);
 
-    // Transient units get a minimal PATH, hence the -E PATH.
-    // A real tmux server, owned by someone other than root
-    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
-    // A real, slow rsync
+    sh(&mut session, START_TMUX)?;
+    // A real, slow rsync (see START_TMUX about -E PATH)
     sh(&mut session, "head -c 10M /dev/zero >/var/tmp/reboop-test-rsync && \
                       systemd-run --quiet --unit=reboop-test-rsync -E PATH rsync --bwlimit=10 /var/tmp/reboop-test-rsync /var/tmp/reboop-test-rsync-copy")?;
     // A real Nix build that sleeps.  (The expression is in a file because
@@ -221,7 +223,10 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
 
 fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    assert!(preflight::gather(&mut session, "someone-else").is_err());
+    let error = preflight::gather(&mut session, "someone-else").unwrap_err();
+    assert!(format!("{error:#}").contains(r#"calls itself "reboop-test", not "someone-else""#), "{error:#}");
+    // A fully qualified name for the machine will do.
+    preflight::gather(&mut session, &format!("{}.example.com", harness::HOSTNAME))?;
 
     let machine = Machine {
         hostname: harness::HOSTNAME.into(),
@@ -238,7 +243,7 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     assert!(facts.btrfs.iter().any(|fs| fs.filesystem.mountpoint == "/"), "{facts:#?}");
     assert_eq!(preflight::blockers(&machine, &facts), Vec::<String>::new(), "{facts:#?}");
 
-    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
+    sh(&mut session, START_TMUX)?;
     wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
     let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
     assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: pid ")), "{blockers:?}");

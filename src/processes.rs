@@ -4,7 +4,7 @@
 
 use crate::ssh::{QUICK, Session};
 use anyhow::{Context, Result, anyhow};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::fmt;
 
 /// A process, as listed by ps(1).
@@ -19,8 +19,7 @@ pub struct Process {
 }
 
 /// Something going on that a reboot would interrupt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Activity {
     /// A Nix command, a remote build or copy being served, or a builder.
     Nix,
@@ -37,6 +36,13 @@ impl fmt::Display for Activity {
             Activity::Tmux => "tmux",
             Activity::Rsync => "rsync",
         })
+    }
+}
+
+/// As its name, which is also what [`fmt::Display`] shows.
+impl Serialize for Activity {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 

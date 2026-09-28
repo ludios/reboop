@@ -8,23 +8,18 @@ use crate::config::{self, Machine};
 use crate::human;
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
-use crate::ssh::{Session, Ssh};
+use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
 use anyhow::{Result, anyhow, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::thread;
-use std::time::Duration;
-
-/// How long to wait for a login, which is long enough to touch a key that
-/// needs it.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The facts about a machine and the reasons not to reboot it (none if it's
 /// okay), or why it couldn't be checked.
 type Outcome = Result<(Facts, Vec<String>)>;
 
 fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
-    let mut session = Session::open(ssh, &machine.target(), LOGIN_TIMEOUT)?;
+    let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
     Ok((facts, blockers))
@@ -59,14 +54,15 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<String> {
         count(Activity::SwitchToConfiguration),
         count(Activity::Tmux),
         count(Activity::Rsync),
-        format!("{}/s", human::bytes(facts.network_bytes_per_sec.round() as u64)),
+        human::rate(facts.network_bytes_per_sec),
         format!("{:.2}", facts.load_average_1min),
         kernel,
     ]
 }
 
 /// A table with a row per machine, followed by a line per reason not to
-/// reboot a machine and per machine that couldn't be checked.
+/// reboot a machine and per machine that couldn't be checked (with any
+/// further lines of the error indented).
 fn table(outcomes: &[(&Machine, Outcome)]) -> String {
     let mut rows = vec![HEADER.map(String::from).to_vec()];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
@@ -76,7 +72,10 @@ fn table(outcomes: &[(&Machine, Outcome)]) -> String {
     for (machine, outcome) in outcomes {
         match outcome {
             Ok((_, blockers)) => details.extend(blockers.iter().map(|blocker| format!("{}: {blocker}", machine.hostname))),
-            Err(error) => details.push(format!("{}: {error:#}", machine.hostname)),
+            Err(error) => {
+                let error = format!("{error:#}").replace('\n', "\n    ");
+                details.push(format!("{}: {error}", machine.hostname));
+            }
         }
     }
     if !details.is_empty() {
@@ -119,19 +118,22 @@ fn exit_status(outcomes: &[(&Machine, Outcome)]) -> u8 {
     }
 }
 
-/// The machines called `hostnames`, or all of `machines` if none are.
+/// The machines called `hostnames` (each once, in order of first mention),
+/// or all of `machines` if none are.
 fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a Machine>> {
     if hostnames.is_empty() {
         ensure!(!machines.is_empty(), "no machines are configured");
         return Ok(machines.iter().collect());
     }
-    hostnames
-        .iter()
-        .map(|hostname| {
-            let machine = machines.iter().find(|machine| &machine.hostname == hostname);
-            machine.ok_or_else(|| anyhow!("{hostname:?} isn't in machines.jsonl"))
-        })
-        .collect()
+    let mut selected: Vec<&Machine> = Vec::new();
+    for hostname in hostnames {
+        let machine = machines.iter().find(|machine| &machine.hostname == hostname);
+        let machine = machine.ok_or_else(|| anyhow!("{hostname:?} isn't in machines.jsonl"))?;
+        if !selected.iter().any(|&chosen| std::ptr::eq(chosen, machine)) {
+            selected.push(machine);
+        }
+    }
+    Ok(selected)
 }
 
 /// Checks the configured machines called `hostnames` (all of them if
@@ -179,7 +181,7 @@ mod tests {
         let outcomes = [
             (&machines[0], Ok((blocked_facts(), vec!["btrfs on /: balance".into(), "tmux: pid 1234 (at): tmux new -s work".into()]))),
             (&machines[1], Ok((idle_facts(), vec![]))),
-            (&machines[2], Err(anyhow!("no route to host").context("failed to open a session"))),
+            (&machines[2], Err(anyhow!("no route to host\nsecond line").context("failed to open a session"))),
         ];
         assert_eq!(
             table(&outcomes),
@@ -190,7 +192,7 @@ mod tests {
              \n\
              one: btrfs on /: balance\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
-             three: failed to open a session: no route to host\n"
+             three: failed to open a session: no route to host\n    second line\n"
         );
         assert_eq!(exit_status(&outcomes), 1);
         assert_eq!(exit_status(&outcomes[..2]), 2);
@@ -219,7 +221,7 @@ mod tests {
         let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }];
         let hostnames = |selected: Vec<&Machine>| selected.iter().map(|machine| machine.hostname.clone()).collect::<Vec<_>>();
         assert_eq!(hostnames(select(&machines, &[]).unwrap()), ["one", "two"]);
-        assert_eq!(hostnames(select(&machines, &["two".into(), "one".into()]).unwrap()), ["two", "one"]);
+        assert_eq!(hostnames(select(&machines, &["two".into(), "one".into(), "two".into()]).unwrap()), ["two", "one"]);
         assert!(select(&machines, &["three".into()]).is_err());
         assert!(select(&[], &[]).is_err());
     }

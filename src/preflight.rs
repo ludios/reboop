@@ -48,11 +48,13 @@ pub struct Facts {
 }
 
 /// Collects the facts about the machine at the other end of `session`, after
-/// making sure it calls itself `hostname`.  Takes [`NETWORK_SAMPLE`] or a bit
-/// longer.
+/// making sure it calls itself `hostname`, or the first label of `hostname`
+/// if that's a fully qualified name (NixOS host names have no dots).  Takes
+/// [`NETWORK_SAMPLE`] or a bit longer.
 pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     let actual = facts::hostname(session)?;
-    ensure!(actual == hostname, "{} calls itself {actual:?}, not {hostname:?}", session.target());
+    let fqdn_of_actual = hostname.strip_prefix(actual.as_str()).is_some_and(|domain| domain.starts_with('.'));
+    ensure!(actual == hostname || fqdn_of_actual, "{} calls itself {actual:?}, not {hostname:?}", session.target());
 
     let mut busy_processes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for process in processes::list(session)? {
@@ -100,14 +102,16 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
             let args = human::truncate(&process.args, ARGS_SHOWN);
             blockers.push(format!("{activity}: pid {} ({}): {args}", process.pid, process.user));
         }
-        if processes.len() > named.len() {
-            blockers.push(format!("{activity}: {} more processes", processes.len() - named.len()));
+        match processes.len() - named.len() {
+            0 => {}
+            1 => blockers.push(format!("{activity}: 1 more process")),
+            more => blockers.push(format!("{activity}: {more} more processes")),
         }
     }
-    let max_network = machine.max_network_transfer_bytes_per_sec;
-    if facts.network_bytes_per_sec > max_network as f64 {
-        let rate = human::bytes(facts.network_bytes_per_sec.round() as u64);
-        blockers.push(format!("network: {rate}/s is over the limit of {}/s", human::bytes(max_network)));
+    let max_network = machine.max_network_transfer_bytes_per_sec as f64;
+    if facts.network_bytes_per_sec > max_network {
+        let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(max_network));
+        blockers.push(format!("network: {rate} is over the limit of {limit}"));
     }
     if facts.load_average_1min > machine.max_load_average_1min {
         blockers.push(format!("load average: {:.2} is over the limit of {}", facts.load_average_1min, machine.max_load_average_1min));
@@ -212,13 +216,13 @@ mod tests {
         let builders = (1..=5).map(|n| process(100 + n, 50, &format!("nixbld{n}"), &format!("bash -e builder-{n}.sh {}", "x".repeat(200))));
         facts.busy_processes.insert(Activity::Nix, builders.collect());
         // A local copy: rsync, and its copies of itself
-        let rsyncs = [(200, 1), (201, 200), (202, 201)].map(|(pid, ppid)| process(pid, ppid, "root", "rsync -a /a /b"));
+        let rsyncs = [(200, 1), (201, 200)].map(|(pid, ppid)| process(pid, ppid, "root", "rsync -a /a /b"));
         facts.busy_processes.insert(Activity::Rsync, rsyncs.to_vec());
         let blockers = blockers(&test_machine(), &facts);
         assert_eq!(blockers.len(), 6, "{blockers:#?}");
         assert!(blockers[0].starts_with("nix: pid 101 (nixbld1): bash -e builder-1.sh xxx"), "{}", blockers[0]);
         assert!(blockers[0].ends_with("x…"), "{}", blockers[0]);
         assert_eq!(blockers[3], "nix: 2 more processes");
-        assert_eq!(blockers[4..], ["rsync: pid 200 (root): rsync -a /a /b", "rsync: 2 more processes"]);
+        assert_eq!(blockers[4..], ["rsync: pid 200 (root): rsync -a /a /b", "rsync: 1 more process"]);
     }
 }

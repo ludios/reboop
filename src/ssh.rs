@@ -15,9 +15,9 @@ use std::time::Duration;
 /// A timeout for commands that should finish right away.
 pub const QUICK: Duration = Duration::from_secs(30);
 
-/// How long [`wait_for_session`] lets each attempt take, which is long
-/// enough to authenticate with a key that needs a touch.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to let [`Session::open`] take, which is long enough to
+/// authenticate with a key that needs a touch.
+pub const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Quotes `s` as a single word for sh(1).
 pub fn shell_quote(s: &str) -> String {

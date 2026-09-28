@@ -34,7 +34,14 @@ fn main() -> ExitCode {
         .with_env_filter(env_filter)
         .init();
 
-    let command = ReboopCommand::parse();
+    // clap exits 2 on usage errors, but that means "not okay to reboot".
+    let command = match ReboopCommand::try_parse() {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = error.print();
+            return if error.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+        }
+    };
     let result = match command {
         ReboopCommand::Check { hostnames, json } => check::run(&hostnames, json),
     };
