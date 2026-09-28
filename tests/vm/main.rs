@@ -100,12 +100,20 @@ fn session_runs_commands(vm: &Vm) -> Result<()> {
 }
 
 fn session_breaks_on_timeout(vm: &Vm) -> Result<()> {
+    let mut observer = vm.session()?;
+    let count_temporary_dirs = "find /tmp -maxdepth 1 -name 'tmp.*' | wc -l";
+    let temporary_dirs = sh(&mut observer, count_temporary_dirs)?;
+
     let mut session = vm.session()?;
     let started = Instant::now();
-    assert!(session.run("sleep 30", Duration::from_secs(1)).is_err());
+    assert!(session.run("sleep 3", Duration::from_secs(1)).is_err());
     assert!(started.elapsed() < Duration::from_secs(10));
     // The sleep might still be running, so the session is done for.
     assert!(session.run("true", MINUTE).is_err());
+
+    // Once the sleep ends, the remote shell cleans up after itself.
+    sleep(Duration::from_secs(4));
+    assert_eq!(sh(&mut observer, count_temporary_dirs)?, temporary_dirs);
     Ok(())
 }
 
@@ -179,35 +187,38 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     assert_eq!(activities(&mut session)?, BTreeSet::new(), "{:#?}", processes::list(&mut session)?);
 
+    // Transient units get a minimal PATH, hence the -E PATH.
     // A real tmux server, owned by someone other than root
-    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
     // A real, slow rsync
     sh(&mut session, "head -c 10M /dev/zero >/var/tmp/reboop-test-rsync && \
-                      systemd-run --quiet --unit=reboop-test-rsync rsync --bwlimit=10 /var/tmp/reboop-test-rsync /var/tmp/reboop-test-rsync-copy")?;
-    // A real Nix build that sleeps
-    sh(&mut session, r#"coreutils=$(readlink -f "$(command -v sleep)" | cut -d/ -f1-4) &&
-        systemd-run --quiet --unit=reboop-test-nix nix-build --no-out-link -E "
-            derivation {
-                name = \"reboop-test-build\";
-                system = builtins.currentSystem;
-                builder = \"\${builtins.storePath \"$coreutils\"}/bin/sleep\";
-                args = [ \"600\" ];
-            }""#)?;
-    // switch-to-configuration, as NixOS's wrapper script runs it
-    sh(&mut session, "systemd-run --quiet --unit=reboop-test-stc bash -c \
-                      'exec -a /run/current-system/bin/switch-to-configuration sleep 600'")?;
+                      systemd-run --quiet --unit=reboop-test-rsync -E PATH rsync --bwlimit=10 /var/tmp/reboop-test-rsync /var/tmp/reboop-test-rsync-copy")?;
+    // A real Nix build that sleeps.  (The expression is in a file because
+    // systemd would expand the ${} in a command line.)
+    sh(&mut session, r#"coreutils=$(readlink -f "$(command -v sleep)" | cut -d/ -f1-4)
+        printf 'derivation { name = "reboop-test-build"; system = builtins.currentSystem; builder = "${builtins.storePath "%s"}/bin/sleep"; args = [ "600" ]; }' \
+            "$coreutils" >/var/tmp/reboop-test-build.nix
+        systemd-run --quiet --unit=reboop-test-nix -E PATH nix-build --no-out-link /var/tmp/reboop-test-build.nix"#)?;
+    // switch-to-configuration as NixOS's wrapper script runs it, with exec -a.
+    // (Not with sleep, which is coreutils and goes by its argv[0]; the
+    // "; true" keeps bash from exec'ing sleep.)
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-stc -E PATH bash -c \
+                      'exec -a /run/current-system/bin/switch-to-configuration bash -c \"sleep 600; true\"'")?;
 
+    // Wait for them all to start, including the build's builder, which
+    // runs as a nixbld user.
     let expected = BTreeSet::from([Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync]);
     let deadline = Deadline::after(MINUTE);
-    let mut found = activities(&mut session)?;
-    while found != expected && !deadline.has_passed() {
+    loop {
+        let listing: Vec<_> = processes::list(&mut session)?.into_iter().filter(|p| processes::activity(p).is_some()).collect();
+        let found: BTreeSet<_> = listing.iter().filter_map(processes::activity).collect();
+        let builder = listing.iter().any(|p| p.user.starts_with("nixbld"));
+        if found == expected && builder {
+            break;
+        }
+        ensure!(!deadline.has_passed(), "found {found:?} (builder: {builder}) in {listing:#?}");
         sleep(Duration::from_millis(500));
-        found = activities(&mut session)?;
     }
-    let listing: Vec<_> = processes::list(&mut session)?.into_iter().filter(|p| processes::activity(p).is_some()).collect();
-    assert_eq!(found, expected, "{listing:#?}");
-    // The builder itself is also recognized, as it runs as a nixbld user.
-    assert!(listing.iter().any(|p| p.user.starts_with("nixbld")), "{listing:#?}");
 
     clean_up(&mut session)?;
     assert_eq!(activities(&mut session)?, BTreeSet::new());
@@ -236,7 +247,7 @@ fn test_filesystem(session: &mut Session, name: &str, setup: &str) -> Result<Str
             img=/var/tmp/reboop-test-{name}.img m={mountpoint}
             truncate -s 1G $img
             mkfs.btrfs -q --data single --metadata dup $img
-            mkdir $m
+            mkdir -p $m
             mount -o loop $img $m
             {setup}
             sync"

@@ -69,7 +69,8 @@ vmTools.runInLinuxVM (
       # bootctl finds the ESP's partition through /dev/block/MAJOR:MINOR.
       mkdir -p /dev/block
       ln -s /dev/vda1 /dev/block/$(cat /sys/class/block/vda1/dev)
-      NIXOS_INSTALL_BOOTLOADER=1 nixos-enter --root /mnt -- \
+      # Without the build's NIX_STATE_DIR and HOME, which would leave files in /tmp.
+      env -u NIX_STATE_DIR HOME=/root NIXOS_INSTALL_BOOTLOADER=1 nixos-enter --root /mnt -- \
         /nix/var/nix/profiles/system/bin/switch-to-configuration boot
 
       umount -R /mnt
