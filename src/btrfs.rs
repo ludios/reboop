@@ -61,49 +61,82 @@ pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Re
     Ok(session.run_ok(&format!("cat {}", shell_quote(&path)), QUICK)?.trim_end().to_string())
 }
 
+/// The nonzero ones among the counters called `names`, all of which
+/// `counter` must know, so that a change in their source can't hide errors.
+fn nonzero_counters(names: &[&str], counter: impl Fn(&str) -> Result<u64>) -> Result<BTreeMap<String, u64>> {
+    let mut nonzero = BTreeMap::new();
+    for &name in names {
+        let count = counter(name)?;
+        if count > 0 {
+            nonzero.insert(name.to_string(), count);
+        }
+    }
+    Ok(nonzero)
+}
+
+/// Counters for people, e.g. "csum_errors=3 read_errs=1".
+pub fn format_counters(counters: &BTreeMap<String, u64>) -> String {
+    let counts: Vec<_> = counters.iter().map(|(name, count)| format!("{name}={count}")).collect();
+    counts.join(" ")
+}
+
 /// A device of a mounted btrfs filesystem, and its troubles.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Device {
     pub devid: u64,
     /// Whether the filesystem is running without it.
     pub missing: bool,
-    /// Its error counters (e.g. "read_errs") that aren't zero.  They count
-    /// since the filesystem was made or they were reset (`btrfs device stats
-    /// -z`).
-    pub errors: BTreeMap<String, u64>,
+    /// Its error counters (e.g. "read_errs") that aren't zero, or `None` if
+    /// the kernel has none for it (e.g. on a filesystem mounted with
+    /// rescue=ibadroots).  They count since the filesystem was made or they
+    /// were reset (`btrfs device stats -z`).
+    pub errors: Option<BTreeMap<String, u64>>,
 }
 
-/// The counters in sysfs' error_stats, all of which we require to be present
-/// so that a change in the kernel can't hide errors.
+impl Device {
+    /// Whether it's missing or has had errors, which calls for a human to
+    /// look before rebooting.
+    pub fn has_trouble(&self) -> bool {
+        self.missing || self.errors.as_ref().is_some_and(|errors| !errors.is_empty())
+    }
+}
+
+/// The counters in sysfs' error_stats.
 const DEVICE_ERROR_COUNTERS: &[&str] = &["write_errs", "read_errs", "flush_errs", "corruption_errs", "generation_errs"];
 
-/// Parses lines of "DEVID missing 0|1" and "DEVID COUNTER VALUE" into
-/// devices, in order of devid.
+/// Parses lines of "DEVID missing 0|1", and "DEVID COUNTER VALUE" or "DEVID
+/// invalid" (when the kernel has no counters), into devices, in order of
+/// devid.
 fn parse_devices(text: &str) -> Result<Vec<Device>> {
-    let context = || format!("unexpected btrfs device info:\n{text}");
-    let mut fields: BTreeMap<u64, BTreeMap<&str, u64>> = BTreeMap::new();
-    for line in text.lines() {
-        let [devid, name, value] = line.split(' ').collect::<Vec<_>>()[..] else { bail!(context()) };
-        let value = value.parse().with_context(context)?;
-        fields.entry(devid.parse().with_context(context)?).or_default().insert(name, value);
+    /// What the lines say about a device.
+    #[derive(Default)]
+    struct Lines<'a> {
+        fields: BTreeMap<&'a str, u64>,
+        invalid_counters: bool,
     }
-    ensure!(!fields.is_empty(), "no devices\n{}", context());
-    fields
+    let context = || format!("unexpected btrfs device info:\n{text}");
+    let mut devices: BTreeMap<u64, Lines> = BTreeMap::new();
+    for line in text.lines() {
+        let (devid, rest) = line.split_once(' ').ok_or_else(|| anyhow!(context()))?;
+        let device = devices.entry(devid.parse().with_context(context)?).or_default();
+        if rest == "invalid" {
+            device.invalid_counters = true;
+        } else {
+            let (name, value) = rest.split_once(' ').ok_or_else(|| anyhow!(context()))?;
+            device.fields.insert(name, value.parse().with_context(context)?);
+        }
+    }
+    ensure!(!devices.is_empty(), "no devices\n{}", context());
+    devices
         .into_iter()
-        .map(|(devid, fields)| {
-            let field = |name| fields.get(name).copied().ok_or_else(|| anyhow!("no {name} for device {devid}\n{}", context()));
-            let mut errors = BTreeMap::new();
-            for &name in DEVICE_ERROR_COUNTERS {
-                let count = field(name)?;
-                if count > 0 {
-                    errors.insert(name.to_string(), count);
-                }
-            }
+        .map(|(devid, device)| {
+            let field = |name: &str| device.fields.get(name).copied().ok_or_else(|| anyhow!("no {name} for device {devid}\n{}", context()));
             let missing = match field("missing")? {
                 0 => false,
                 1 => true,
                 other => bail!("device {devid} has missing={other}\n{}", context()),
             };
+            let errors = if device.invalid_counters { None } else { Some(nonzero_counters(DEVICE_ERROR_COUNTERS, field)?) };
             Ok(Device { devid, missing, errors })
         })
         .collect()
@@ -118,8 +151,7 @@ pub fn devices(session: &mut Session, filesystem: &Filesystem) -> Result<Vec<Dev
         for d in *; do
             missing=$(cat "$d/missing")
             echo "$d missing $missing"
-            stats=$(cat "$d/error_stats")
-            printf '%s\n' "$stats" | sed "s|^|$d |"
+            sed "s|^|$d |" "$d/error_stats"
         done"#,
         shell_quote(&dir)
     );
@@ -209,13 +241,7 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
         None if raw.contains("no stats available") => ScrubState::NeverRan,
         other => bail!("unknown scrub state {other:?}\n{}", context()),
     };
-    let mut errors = BTreeMap::new();
-    for &name in ERROR_COUNTERS {
-        let count = counter(name).with_context(context)?;
-        if count > 0 {
-            errors.insert(name.to_string(), count);
-        }
-    }
+    let errors = nonzero_counters(ERROR_COUNTERS, counter).with_context(context)?;
     // Counters only grow, so errors in the earlier summary must show up in
     // the later counters, or we're missing a counter.
     let summary_has_errors = estimates.get("Error summary").is_some_and(|summary| summary != "no errors found");
@@ -294,8 +320,7 @@ impl ScrubStatus {
         let errors = if self.errors.is_empty() {
             "no errors found".to_string()
         } else {
-            let counts: Vec<_> = self.errors.iter().map(|(name, count)| format!("{name}={count}")).collect();
-            format!("ERRORS FOUND: {}", counts.join(" "))
+            format!("ERRORS FOUND: {}", format_counters(&self.errors))
         };
         match self.state {
             ScrubState::NeverRan => "no scrub has run".to_string(),
@@ -400,10 +425,14 @@ mod tests {
         assert_eq!(
             parse_devices(&text).unwrap(),
             [
-                Device { devid: 1, missing: false, errors: BTreeMap::from([("corruption_errs".into(), 3)]) },
-                Device { devid: 2, missing: true, errors: BTreeMap::new() },
+                Device { devid: 1, missing: false, errors: Some(BTreeMap::from([("corruption_errs".into(), 3)])) },
+                Device { devid: 2, missing: true, errors: Some(BTreeMap::new()) },
             ]
         );
+        let invalid = parse_devices("1 missing 1\n1 invalid\n").unwrap();
+        assert_eq!(invalid, [Device { devid: 1, missing: true, errors: None }]);
+        assert!(invalid[0].has_trouble());
+        assert!(!parse_devices(&format!("1 missing 0\n{}", counters(1, 0))).unwrap()[0].has_trouble());
         assert!(parse_devices("").is_err());
         assert!(parse_devices(&format!("1 missing 0\n{}", counters(1, 0).replace("1 read_errs 0\n", ""))).is_err());
         assert!(parse_devices(&format!("1 missing 2\n{}", counters(1, 0))).is_err());

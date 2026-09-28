@@ -51,6 +51,11 @@ Managing LUKS keys:
     - Is switch-to-configuration or a nix build running?
     - Any tmux servers running (any user, not just root)?
     - Is an rsync process running?
+    - Is a btrfs send or receive running, or cryptsetup?
+    - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?
+    - Inhibitor locks (logind's ListInhibitors)
+    - systemd jobs that last through the network sample
+    - How full the root filesystem is (df)
     - Network bytes in / out over 5 seconds
     - Load average over the last minute
     - The NixOS configuration we're currently on
@@ -64,6 +69,11 @@ Managing LUKS keys:
     - If switch-to-configuration or a nix build running, no.
     - If any tmux server running, no.
     - If any rsync process running, no.
+    - If a btrfs send or receive, or cryptsetup, is running, no.
+    - If a btrfs device is missing (the filesystem wouldn't mount at boot without the degraded option) or has had errors, no.
+    - If an inhibitor lock asks for no shutdown (mode block or block-weak), no.
+    - If a systemd job has lasted 5 seconds, no.
+    - If the root filesystem is root_full_percent (97%) used or more, no.
     - If more than 1MB/s being transferred over the network, no.
     - If load average over the last minute > 1, no.
 

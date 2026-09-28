@@ -282,7 +282,10 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     for (name, mode) in [("reboop-test-inhibit", "block"), ("reboop-test-delay", "delay")] {
         sh(&mut session, &format!("systemd-run --quiet --unit={name} -E PATH systemd-inhibit --what=shutdown --who={name} --why=testing --mode={mode} sleep 600"))?;
     }
-    wait_for(|| Ok(facts::inhibitors(&mut session)?.len() == 2))?;
+    wait_for(|| {
+        let inhibitors = facts::inhibitors(&mut session)?;
+        Ok(["reboop-test-inhibit", "reboop-test-delay"].iter().all(|&name| inhibitors.iter().any(|inhibitor| inhibitor.who == name)))
+    })?;
     let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
     let [blocker] = &blockers[..] else { bail!("{blockers:?}") };
     assert!(blocker.starts_with("inhibitor: reboop-test-inhibit (testing), pid ") && blocker.ends_with(" (root)"), "{blocker}");
@@ -303,7 +306,7 @@ fn btrfs_root_is_idle(vm: &Vm) -> Result<()> {
     assert_eq!(filesystems[0].mountpoint, "/");
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystems[0])?, "none");
     assert_ne!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Running);
-    assert_eq!(btrfs::devices(&mut session, &filesystems[0])?, [Device { devid: 1, missing: false, errors: BTreeMap::new() }]);
+    assert_eq!(btrfs::devices(&mut session, &filesystems[0])?, [Device { devid: 1, missing: false, errors: Some(BTreeMap::new()) }]);
     Ok(())
 }
 
@@ -425,7 +428,8 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
     // The device remembers the corruption.
     let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
     let devices = btrfs::devices(&mut session, &filesystem)?;
-    assert!(devices[0].errors.get("corruption_errs").is_some_and(|&n| n > 0), "{devices:?}");
+    let corruption = devices[0].errors.as_ref().and_then(|errors| errors.get("corruption_errs"));
+    assert!(corruption.is_some_and(|&n| n > 0), "{devices:?}");
     Ok(())
 }
 

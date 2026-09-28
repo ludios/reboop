@@ -39,7 +39,7 @@ impl fmt::Display for Activity {
             Activity::SwitchToConfiguration => "switch-to-configuration",
             Activity::Tmux => "tmux",
             Activity::Rsync => "rsync",
-            Activity::BtrfsSendReceive => "btrfs send/receive",
+            Activity::BtrfsSendReceive => "btrfs-send-receive",
             Activity::Cryptsetup => "cryptsetup",
         })
     }
@@ -114,10 +114,21 @@ fn program_names(args: &str) -> Vec<String> {
     names
 }
 
-/// The first argument of a command line that isn't an option, like "send"
-/// in "btrfs -q send /snapshot".
-fn subcommand(args: &str) -> Option<&str> {
-    args.split_whitespace().skip(1).find(|word| !word.starts_with('-'))
+/// Whether a btrfs command line runs `btrfs send` or `btrfs receive`, maybe
+/// abbreviated, as btrfs-progs allows any unambiguous prefix of a command.
+fn is_btrfs_send_receive(args: &str) -> bool {
+    let mut words = args.split_whitespace().skip(1);
+    while let Some(word) = words.next() {
+        match word {
+            // Global options that take a value
+            "--format" | "--log" => {
+                words.next();
+            }
+            _ if word.starts_with('-') => {}
+            command => return (command.len() >= 2 && "send".starts_with(command)) || (command.len() >= 3 && "receive".starts_with(command)),
+        }
+    }
+    false
 }
 
 /// What `process` is doing that a reboot would interrupt, if anything.
@@ -139,7 +150,7 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::Tmux)
     } else if is("rsync") {
         Some(Activity::Rsync)
-    } else if is("btrfs") && matches!(subcommand(&process.args), Some("send" | "receive")) {
+    } else if is("btrfs") && is_btrfs_send_receive(&process.args) {
         Some(Activity::BtrfsSendReceive)
     } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
         Some(Activity::Cryptsetup)
@@ -198,7 +209,15 @@ mod tests {
         assert_eq!(activity_of("root", stc_wrapper), Some(Activity::SwitchToConfiguration));
         assert_eq!(activity_of("at", "tmux new -s work"), Some(Activity::Tmux));
         assert_eq!(activity_of("root", "rsync --server -logDtpre.iLsfxCIvu . /backup/"), Some(Activity::Rsync));
-        for args in ["btrfs send -p /snap/a /snap/b", "/nix/store/abc-btrfs-progs-6.17/bin/btrfs -q receive /backup", "btrfs receive -f stream /x"] {
+        for args in [
+            "btrfs send -p /snap/a /snap/b",
+            "/nix/store/abc-btrfs-progs-6.17/bin/btrfs -q receive /backup",
+            "btrfs receive -f stream /x",
+            "btrfs --log info receive /backup",
+            "btrfs --format text send /snapshot",
+            "btrfs --format=json se /snapshot",
+            "btrfs rec /backup",
+        ] {
             assert_eq!(activity_of("root", args), Some(Activity::BtrfsSendReceive), "{args}");
         }
         for args in ["cryptsetup reencrypt /dev/sda2", "/nix/store/abc-cryptsetup-2.8.1/bin/cryptsetup luksOpen /dev/sdb x", "cryptsetup-reencrypt /dev/sdc"] {
@@ -213,6 +232,9 @@ mod tests {
             "btrfs subvolume snapshot /a /send",
             "btrfs scrub status /",
             "btrfs",
+            "btrfs --log receive",
+            "btrfs s /snapshot",
+            "btrfs re /backup",
             "systemd-cryptsetup attach data /dev/sdb",
         ] {
             assert_eq!(activity_of("root", args), None, "{args}");

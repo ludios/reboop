@@ -3,7 +3,7 @@
 //! `reboop check`: whether machines are okay to reboot, and the facts behind
 //! the answer.
 
-use crate::btrfs::ScrubState;
+use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::Inhibitor;
 use crate::human::{self, Cell, Style::{Bold, Gray, Green, Plain, Red}};
@@ -37,7 +37,7 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
     let activities = facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity));
     reasons.extend(activities.map(Activity::to_string));
-    if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(|device| device.missing || !device.errors.is_empty()) {
+    if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(Device::has_trouble) {
         reasons.push("btrfs device".to_string());
     }
     if facts.inhibitors.iter().any(Inhibitor::blocks_shutdown) {
@@ -62,7 +62,6 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
-    let [nix, switch, tmux, rsync] = ACTIVITY_COLUMNS.map(count);
     let red_or_green = |red: bool, text: String| if red { Red.cell(text) } else { Green.cell(text) };
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
@@ -75,10 +74,10 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
         list(scrubbing.collect()),
         list(operations.into_iter().collect()),
-        nix,
-        switch,
-        tmux,
-        rsync,
+        count(Activity::Nix),
+        count(Activity::SwitchToConfiguration),
+        count(Activity::Tmux),
+        count(Activity::Rsync),
         red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         red_or_green(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
@@ -192,8 +191,8 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::{Value, json};
 
-    /// The outcome of checking [`test_machine`] while it has a balance, a
-    /// tmux, and too much network traffic and load.
+    /// The outcome of checking [`test_machine`] while it has something wrong
+    /// for each column and each of the other reasons.
     fn blocked_outcome() -> Outcome {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
@@ -206,7 +205,15 @@ mod tests {
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.load_average_1min = 2.5;
         facts.root_used_percent = 98;
-        let crawl = Inhibitor { what: "shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 42, user: "at".into() };
+        let crawl = Inhibitor {
+            what: "shutdown".into(),
+            who: "crawl".into(),
+            why: "archiving".into(),
+            mode: "block".into(),
+            pid: 42,
+            uid: 1000,
+            user: "at".into(),
+        };
         facts.inhibitors.push(crawl);
         facts.lasting_jobs.push(Job { id: 361, unit: "nixos-upgrade.service".into(), job_type: "start".into(), state: "running".into() });
         let blockers = preflight::blockers(&test_machine(), &facts);

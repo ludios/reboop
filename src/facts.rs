@@ -176,9 +176,9 @@ fn parse_df_percent(output: &str) -> Result<u8> {
     let context = || format!("unexpected df output {output:?}");
     let [_, line] = output.lines().collect::<Vec<_>>()[..] else { bail!(context()) };
     let percent = line.trim().strip_suffix('%').ok_or_else(|| anyhow!(context()))?;
-    let percent = percent.parse().with_context(context)?;
-    ensure!(percent <= 100, context());
-    Ok(percent)
+    let percent: u16 = percent.parse().with_context(context)?;
+    // Over 100% when a filesystem reports negative space available
+    Ok(percent.min(100) as u8)
 }
 
 /// How much of the filesystem at / is used, as a percentage rounded up, the
@@ -221,7 +221,7 @@ pub fn jobs(session: &mut Session) -> Result<Vec<Job>> {
 
 /// A lock that a program holds to delay or block shutdown, sleep, etc.: see
 /// systemd-inhibit(1).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Inhibitor {
     /// What it inhibits, e.g. "shutdown:sleep"
     pub what: String,
@@ -231,29 +231,59 @@ pub struct Inhibitor {
     /// "delay"
     pub mode: String,
     pub pid: u32,
+    pub uid: u32,
+    /// The user name, or the numeric uid if the user has no name.
     pub user: String,
 }
 
 impl Inhibitor {
-    /// Whether it keeps the machine from shutting down or rebooting, at
-    /// least unless overridden.
+    /// Whether it asks for the machine not to shut down or reboot.  That
+    /// includes block-weak locks, which root could override.
     pub fn blocks_shutdown(&self) -> bool {
         self.what.split(':').any(|what| what == "shutdown") && (self.mode == "block" || self.mode == "block-weak")
     }
 }
 
-/// Parses `systemd-inhibit --list --json=short`, which prints nothing at all
-/// when there are no locks.
+/// Parses logind's ListInhibitors reply, as `busctl --json=short` prints it,
+/// into inhibitors whose `user` is their numeric uid.
 fn parse_inhibitors(json: &str) -> Result<Vec<Inhibitor>> {
-    if json.trim().is_empty() {
-        return Ok(vec![]);
+    /// (what, who, why, mode, uid, pid)
+    type Lock = (String, String, String, String, u32, u32);
+    #[derive(Deserialize)]
+    struct Reply {
+        #[serde(rename = "type")]
+        signature: String,
+        /// The one return value: all the locks
+        data: (Vec<Lock>,),
     }
-    serde_json::from_str(json).with_context(|| format!("unexpected systemd-inhibit output {json:?}"))
+    let context = || format!("unexpected ListInhibitors reply {json:?}");
+    let reply: Reply = serde_json::from_str(json).with_context(context)?;
+    ensure!(reply.signature == "a(ssssuu)", context());
+    let (locks,) = reply.data;
+    let inhibitor = |(what, who, why, mode, uid, pid): Lock| Inhibitor {
+        what,
+        who,
+        why,
+        mode,
+        pid,
+        uid,
+        user: uid.to_string(),
+    };
+    Ok(locks.into_iter().map(inhibitor).collect())
 }
 
-/// The inhibitor locks held on the machine.
+/// The inhibitor locks held on the machine.  (Straight from logind, since
+/// `systemd-inhibit --list` has no JSON before systemd 260.)
 pub fn inhibitors(session: &mut Session) -> Result<Vec<Inhibitor>> {
-    parse_inhibitors(&session.run_ok("systemd-inhibit --list --json=short --no-pager", QUICK)?)
+    let call = "busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ListInhibitors";
+    let mut inhibitors = parse_inhibitors(&session.run_ok(call, QUICK)?)?;
+    for inhibitor in &mut inhibitors {
+        let output = session.run(&format!("id -nu -- {}", inhibitor.uid), QUICK)?;
+        if output.status == 0 {
+            inhibitor.user = output.stdout_text().trim_end().to_string();
+        }
+    }
+    Ok(inhibitors)
 }
 
 #[cfg(test)]
@@ -275,23 +305,30 @@ mod tests {
         assert_eq!(parse_df_percent("Use%\n100%\n").unwrap(), 100);
         assert!(parse_df_percent("Use%\n  -\n").is_err());
         assert!(parse_df_percent("Use%\n 45%\n 46%\n").is_err());
-        assert!(parse_df_percent("Use%\n101%\n").is_err());
+        assert_eq!(parse_df_percent("Use%\n103%\n").unwrap(), 100);
     }
 
     #[test]
     fn parses_inhibitors() {
-        assert_eq!(parse_inhibitors("\n").unwrap(), []);
-        let json = r#"[{"who":"delayer","uid":0,"user":"root","pid":937,"comm":"systemd-inhibit","what":"shutdown","why":"d","mode":"delay"},
-                       {"who":"crawl","uid":1000,"user":"at","pid":932,"comm":"systemd-inhibit","what":"sleep:shutdown","why":"archiving","mode":"block"},
-                       {"who":"weak","uid":0,"user":"root","pid":934,"comm":"systemd-inhibit","what":"shutdown","why":"w","mode":"block-weak"},
-                       {"who":"xfce4-power-manager","uid":1000,"user":"at","pid":2000,"comm":"xfce4-power-man","what":"handle-power-key","why":"","mode":"block"}]"#;
+        assert_eq!(parse_inhibitors(r#"{"type":"a(ssssuu)","data":[[]]}"#).unwrap(), []);
+        let json = r#"{"type":"a(ssssuu)","data":[[["shutdown","delayer","d","delay",0,937],
+                                                    ["sleep:shutdown","crawl","archiving","block",1000,932],
+                                                    ["shutdown","weak","w","block-weak",0,934],
+                                                    ["handle-power-key","xfce4-power-manager","","block",1000,2000]]]}"#;
         let inhibitors = parse_inhibitors(json).unwrap();
-        assert_eq!(
-            inhibitors[1],
-            Inhibitor { what: "sleep:shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 932, user: "at".into() }
-        );
+        let crawl = Inhibitor {
+            what: "sleep:shutdown".into(),
+            who: "crawl".into(),
+            why: "archiving".into(),
+            mode: "block".into(),
+            pid: 932,
+            uid: 1000,
+            user: "1000".into(),
+        };
+        assert_eq!(inhibitors[1], crawl);
         assert_eq!(inhibitors.iter().map(Inhibitor::blocks_shutdown).collect::<Vec<_>>(), [false, true, true, false]);
-        assert!(parse_inhibitors("No inhibitors.").is_err());
+        assert!(parse_inhibitors(r#"{"type":"a(ss)","data":[[]]}"#).is_err());
+        assert!(parse_inhibitors("").is_err());
     }
 
     const NET_DEV_HEADER: &str = "Inter-|   Receive                                                |  Transmit\n \

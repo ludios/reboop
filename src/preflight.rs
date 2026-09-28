@@ -129,17 +129,16 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
         }
         // A filesystem missing a device won't mount at boot without the
         // degraded option.  One with errors may have a failing device.
-        for device in fs.devices.iter().filter(|device| device.missing) {
-            blockers.push(format!("btrfs on {}: device {} is missing", fs.filesystem.mountpoint, device.devid));
-        }
-        for device in fs.devices.iter().filter(|device| !device.errors.is_empty()) {
-            let counts: Vec<_> = device.errors.iter().map(|(name, count)| format!("{name}={count}")).collect();
-            let mountpoint = &fs.filesystem.mountpoint;
-            blockers.push(format!(
-                "btrfs on {mountpoint}: device {} has had errors: {} (once dealt with, `btrfs device stats -z {mountpoint}` resets them)",
-                device.devid,
-                counts.join(" ")
-            ));
+        let mountpoint = &fs.filesystem.mountpoint;
+        for device in &fs.devices {
+            if device.missing {
+                blockers.push(format!("btrfs on {mountpoint}: device {} is missing", device.devid));
+            }
+            if let Some(errors) = device.errors.as_ref().filter(|errors| !errors.is_empty()) {
+                let errors = btrfs::format_counters(errors);
+                let reset = format!("once dealt with, `btrfs device stats -z {mountpoint}` resets them");
+                blockers.push(format!("btrfs on {mountpoint}: device {} has had errors: {errors} ({reset})", device.devid));
+            }
         }
     }
     for (activity, processes) in &facts.busy_processes {
@@ -161,8 +160,8 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
         let why = if inhibitor.why.is_empty() { String::new() } else { format!(" ({})", inhibitor.why) };
         blockers.push(format!("inhibitor: {}{why}, pid {} ({})", inhibitor.who, inhibitor.pid, inhibitor.user));
     }
+    let seconds = NETWORK_SAMPLE.as_secs();
     for job in &facts.lasting_jobs {
-        let seconds = NETWORK_SAMPLE.as_secs();
         blockers.push(format!("systemd job: {} {} ({}) for {seconds}s or more", job.job_type, job.unit, job.state));
     }
     if network_over_limit(machine, facts) {
@@ -210,7 +209,7 @@ pub(crate) fn idle_facts() -> Facts {
             filesystem: Filesystem { uuid: "4c8a".into(), mountpoint: "/".into() },
             exclusive_operation: "none".into(),
             scrub,
-            devices: vec![Device { devid: 1, missing: false, errors: BTreeMap::new() }],
+            devices: vec![Device { devid: 1, missing: false, errors: Some(BTreeMap::new()) }],
         }],
     }
 }
@@ -262,8 +261,8 @@ mod tests {
             exclusive_operation: "balance paused".into(),
             scrub: idle_facts().btrfs[0].scrub.clone(),
             devices: vec![
-                Device { devid: 1, missing: false, errors: BTreeMap::from([("corruption_errs".into(), 3), ("read_errs".into(), 1)]) },
-                Device { devid: 2, missing: true, errors: BTreeMap::new() },
+                Device { devid: 1, missing: false, errors: Some(BTreeMap::from([("corruption_errs".into(), 3), ("read_errs".into(), 1)])) },
+                Device { devid: 2, missing: true, errors: Some(BTreeMap::new()) },
             ],
         });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
@@ -273,6 +272,7 @@ mod tests {
             why: why.into(),
             mode: mode.into(),
             pid: 42,
+            uid: 1000,
             user: "at".into(),
         };
         facts.inhibitors = vec![inhibitor("block", "archiving"), inhibitor("delay", "flushing"), inhibitor("block-weak", "")];
@@ -286,8 +286,8 @@ mod tests {
             [
                 "btrfs on /: scrub has 3m 30s left, 500.00kB of 1.00MB (50.00%) scrubbed at 100.00kB/s, no errors found",
                 "btrfs on /small: balance paused",
-                "btrfs on /small: device 2 is missing",
                 "btrfs on /small: device 1 has had errors: corruption_errs=3 read_errs=1 (once dealt with, `btrfs device stats -z /small` resets them)",
+                "btrfs on /small: device 2 is missing",
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",
