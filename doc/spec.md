@@ -2,29 +2,34 @@ This is a special-purpose utility for carefully rebooting a NixOS machine, which
 
 ## General notes
 
-AI says:
+### AI says:
 
-    - Set these on every connection attempt: BatchMode=yes, ConnectTimeout=15, ServerAliveInterval=5 and ControlPath=none
-        - ControlPath=none matters if your ssh config uses ControlMaster/ControlPersist: a post-reboot attempt can otherwise reuse the dead shared connection and hang.
-        - The keepalive matters because the initrd can drop the network without cleanly closing the connection.
-        - Give every wait loop an overall deadline
+- Set these on every connection attempt: `BatchMode=yes`, `ConnectTimeout=15`, `ServerAliveInterval=5` and `ControlPath=none`
+    - ControlPath=none matters if your ssh config uses ControlMaster/ControlPersist: a post-reboot attempt can otherwise reuse the dead shared connection and hang.
+    - The keepalive matters because the initrd can drop the network without cleanly closing the connection.
+    - Give every wait loop an overall deadline
 
-    - Use the ssh binary rather than a Rust SSH library, so our ssh config, agent and known_hosts all just work.
+- Use the ssh binary rather than a Rust SSH library, so our ssh config, agent and known_hosts all just work.
 
-Managing LUKS keys:
+### Managing LUKS keys:
 
-    printf reboop-luks-v1 | ssh-keygen -Y sign -n reboop-luks -f ~/.ssh/id_ed25519.pub
+```
+printf reboop-luks-v1 | ssh-keygen -Y sign -n reboop-luks -f ~/.ssh/id_ed25519.pub
+```
 
-    and hash the signature into a 256-bit master key;
+and hash the signature into a 256-bit master key;
 
-    use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing LUKS passwords in:
+use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing LUKS passwords in:
 
-    ~/.config/reboop/luks/HOSTNAME
+```
+~/.config/reboop/luks/HOSTNAME
+```
 
 ## Configuration file
 
-~/.config/reboop/defaults.json (use JSON5 or JSONC, whatever's better for Rust)
+`~/.config/reboop/defaults.json` (JSON5)
 
+```
 {
     "ssh_port": 904,
     "initrd_ssh_port": 23,
@@ -35,12 +40,15 @@ Managing LUKS keys:
     "luks_signing_key": "~/.ssh/id_ed25519.pub",
     "stop_services": ["postgresql"],
 }
+```
 
-~/.config/reboop/machines.jsonl
+`~/.config/reboop/machines.jsonl`
 
+```
 {"hostname": "one", "ipv4": "...", "ssh_port": 22, "initrd_ssh_port": 23, "stop_services": []}
 {"hostname": "two", "ipv4": "...", "scrub_mounts": ["/", "/small"]}
 {"hostname": "three", "ipv4": "...", "max_network_transfer_bytes_per_sec": 1000000, "max_load_average_1min": 2}
+```
 
 ## Preflight
 
@@ -61,8 +69,11 @@ Managing LUKS keys:
     - The NixOS configuration we're currently on
     - The Linux kernel we're currenty on
     - The NixOS configuration and kernel we expect to boot into by default
+    - What the boot loader will boot by default: systemd-boot's default entry (`bootctl list`, which includes one-shot entries), or GRUB's in each /boot with a grub/grub.cfg (mirroredBoots), including grub-reboot's next_entry
 
 2. Decide whether the machine is okay to reboot.
+
+    - If the boot loader's default doesn't boot the system profile, or its kernel or initrd is missing, or it has the initrd take a static address (ip=) other than the machine's ipv4, no.
 
     - If any btrfs scrub is running, we can't; Linux will hang on shutdown due to the scrub.
     - If any btrfs balance or drive replace is running, no.
@@ -86,21 +97,23 @@ Managing LUKS keys:
 
 2. After disconnection, keep trying to SSH in over port 23, with a 15 second timeout, once every 15 seconds:
 
-    - ssh root@[ipv4 address of machine] -p 23
+    `ssh root@[ipv4 address of machine] -p 23`
 
     until success.
 
     Or (AI says):
     
-        ssh -tt -o EscapeChar=none root@ip -p 23 systemd-tty-ask-password-agent
+    ```
+    ssh -tt -o EscapeChar=none root@ip -p 23 systemd-tty-ask-password-agent
+    ```
 
-        Wait for the passphrase prompt before sending anything, because echo is only off once it appears.
+    Wait for the passphrase prompt before sending anything, because echo is only off once it appears.
 
-    It will show e.g. "-bash-5.3# "
+    It will show e.g. `-bash-5.3# `
 
     Run:
 
-    - systemd-tty-ask-password-agent
+    `systemd-tty-ask-password-agent`
 
     And type in the LUKS password for that particular machine.
 
@@ -110,17 +123,17 @@ Managing LUKS keys:
 
 1. Keep trying to SSH in over port 904, with a 15 second timeout, once every 15 seconds:
 
-    ssh root@[ipv4 address of machine] -p 904
+    `ssh root@[ipv4 address of machine] -p 904`
 
 2. Wait for the system to finish booting:
 
-    systemctl is-system-running --wait
+    `systemctl is-system-running --wait`
 
 3. Collect this information and show it to the user of `reboop`:
 
-    dmesg -l err,crit,alert,emerg
+    `dmesg -l err,crit,alert,emerg`
 
-    systemctl --failed
+    `systemctl --failed`
 
     Whether we booted into the NixOS configuration we expected
 
@@ -128,12 +141,12 @@ Managing LUKS keys:
 
 4. Run:
 
-    btrfs scrub start /
+    `btrfs scrub start /`
 
 5. In one line, show the user the scrub progress, polled every 2 seconds.
 
-    btrfs scrub status /
+    `btrfs scrub status /`
 
-    scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found
+    `scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found`
 
     If any errors are found, print a very loud warning and return non-0 exit status.
