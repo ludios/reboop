@@ -48,7 +48,7 @@ enum ReboopCommand {
 /// Whether to style stdout, given the choice of --color.
 fn styles_stdout(color: ColorChoice) -> bool {
     match color {
-        ColorChoice::Auto   => human::color_stdout(),
+        ColorChoice::Auto   => human::should_color(&std::io::stdout()),
         ColorChoice::Always => true,
         ColorChoice::Never  => false,
     }
@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         .unwrap();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(human::should_color(&std::io::stderr()))
         .with_env_filter(env_filter)
         .init();
 
