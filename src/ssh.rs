@@ -89,16 +89,24 @@ const SESSION_READY: &[u8] = b"reboop-session-ready";
 /// The remote end of a [`Session`], run by /bin/sh.  It reads one command per
 /// line, base64-encoded, runs it with /bin/sh (stdin from /dev/null so it
 /// can't eat the commands that follow), and answers with a line of
-/// "STATUS BASE64_STDOUT BASE64_STDERR".
+/// "STATUS BASE64_STDOUT BASE64_STDERR".  Each command gets its own output
+/// files, since a background process it leaves behind may write to them
+/// later.
 const SESSION_SHELL: &str = r#"
 t=$(mktemp -d) || exit 1
 trap 'rm -rf "$t"' EXIT
+# Exit through the EXIT trap even when a signal ends us, e.g. SIGPIPE when a
+# command outlives the connection.
+trap 'exit 1' HUP PIPE TERM
 echo reboop-session-ready
+n=0
 while IFS= read -r c; do
-    printf %s "$c" | base64 -d >"$t/c" || exit 1
-    /bin/sh "$t/c" </dev/null >"$t/o" 2>"$t/e"
+    n=$((n + 1))
+    printf %s "$c" | base64 -d >"$t/$n.sh" || exit 1
+    /bin/sh "$t/$n.sh" </dev/null >"$t/$n.out" 2>"$t/$n.err"
     s=$?
-    printf '%s %s %s\n' "$s" "$(base64 -w0 <"$t/o")" "$(base64 -w0 <"$t/e")"
+    printf '%s %s %s\n' "$s" "$(base64 -w0 <"$t/$n.out")" "$(base64 -w0 <"$t/$n.err")"
+    rm -f "$t/$n.sh" "$t/$n.out" "$t/$n.err"
 done
 "#;
 
@@ -250,7 +258,15 @@ mod tests {
             .unwrap();
         use std::io::Write;
         let mut stdin = child.stdin.take().unwrap();
-        for script in ["printf 'a\\nb'; echo oops >&2; exit 7", "cat; echo done", ""] {
+        let scripts = [
+            "printf 'a\\nb'; echo oops >&2; exit 7",
+            "cat; echo done",
+            "",
+            // A background process that writes after its command is done
+            "(sleep 0.2; echo a late write, longer than the next output; echo late >&2) &",
+            "sleep 0.5; echo on time",
+        ];
+        for script in scripts {
             writeln!(stdin, "{}", BASE64.encode(script)).unwrap();
         }
         drop(stdin);
@@ -264,6 +280,8 @@ mod tests {
         assert_eq!((second.status, second.stdout_text().as_str()), (0, "done\n"));
         let third = parse_response(lines[3].as_bytes()).unwrap();
         assert_eq!((third.status, third.stdout.len()), (0, 0));
+        let fifth = parse_response(lines[5].as_bytes()).unwrap();
+        assert_eq!((fifth.stdout_text().as_str(), fifth.stderr.len()), ("on time\n", 0));
     }
 
     #[test]
