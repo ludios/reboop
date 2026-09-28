@@ -67,7 +67,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let list = |items: Vec<&str>| if items.is_empty() { Gray.cell("-") } else { Red.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
-    let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
+    let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string())).aligned(Right);
     let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
@@ -237,8 +237,8 @@ mod tests {
         assert_eq!(
             table(&outcomes, false),
             "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC     NET      LOAD   ROOT                  OTHER                   KERNEL\n\
-             one      no     -      balance   -    -       1     -      12.50 MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -       1.00 kB/s   0.50   45%  -                                       6.18.54\n\
+             one      no     -      balance     -       -     1      -  12.50 MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -      -           -       -     -      -   1.00 kB/s   0.50   45%  -                                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
