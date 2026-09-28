@@ -11,7 +11,6 @@ AI says:
 
     - Use the ssh binary rather than a Rust SSH library, so our ssh config, agent and known_hosts all just work.
 
-
 Managing LUKS keys:
 
     printf reboop-luks-v1 | ssh-keygen -Y sign -n reboop-luks -f ~/.ssh/id_ed25519.pub
