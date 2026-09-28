@@ -635,6 +635,7 @@ fn run(name: Name, test: Test) -> Result<(), Failed> {
 }
 
 fn main() {
+    harness::be_watchdog_if_started_as_one();
     let mut args = Arguments::from_args();
     // The tests share the VMs, and some reboot them.
     args.test_threads = Some(1);

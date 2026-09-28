@@ -10,14 +10,17 @@
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use reboop::deadline::{Deadline, Permanent};
+use reboop::human;
 use reboop::initrd::{self, UnlockError};
 use reboop::ssh::{Session, Ssh, Target};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, File, TryLockError};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
@@ -142,7 +145,7 @@ fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
     if !qemu_is_running(dir, pid) {
         return Ok(());
     }
-    eprintln!("stopping the old test VM in {}...", dir.display());
+    eprintln!("stopping the test VM in {}...", dir.display());
     let pid = libc::pid_t::try_from(pid)?;
     unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..100 {
@@ -162,47 +165,86 @@ fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
 /// How long a VM keeps running after the last test run that used it.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
-/// Runs for as long as the qemu with pid $1 and console log $2 does, and
-/// stops it once no test run has held the VM's lock $3 for $4 seconds.  The
-/// lock's mtime is when the VM was last seen in use: runs set it when they
-/// take the lock, and so does this whenever it finds the lock taken.
-///
-/// It goes by the lock file it opened, so that a VM whose directory has been
-/// deleted, and which nothing can find anymore, is stopped too.
-const WATCHDOG: &str = r#"
-pid=$1 console=$2 idle_secs=$4
-running() { grep -qF -- "$console" "/proc/$pid/cmdline" 2>/dev/null; }
-exec 9<"$3"
-while sleep 60 && running; do
-    if ! flock -n 9; then
-        touch /dev/fd/9
-    elif [ $(( $(date +%s) - $(stat -L -c %Y /dev/fd/9) )) -ge "$idle_secs" ]; then
-        # Holding the lock until qemu is gone, so that no run starts using it.
-        echo "$(date): stopping qemu (pid $pid), unused for $idle_secs seconds" >&2
-        kill "$pid"
-        for _ in $(seq 100); do running || exit 0; sleep 0.1; done
-        kill -KILL "$pid"
-        exit 0
-    fi
-    flock -u 9
-done
-"#;
+/// How often a watchdog checks on its VM.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Starts [`WATCHDOG`] for the VM's qemu, `pid`, in a session of its own, so
-/// that it outlives the test run and a Ctrl-C of it.
+/// The test program's first argument when it's a VM's watchdog; the VM's
+/// directory and its qemu's pid follow.
+const WATCHDOG_ARG: &str = "--reboop-vm-watchdog";
+
+/// Watches the VM in `dir`, whose qemu is `pid`, for as long as qemu runs,
+/// and stops it once no test run has held the VM's lock for
+/// [`IDLE_TIMEOUT`].  The lock's mtime is when the VM was last used: runs set
+/// it when they get the VM, and this sets it whenever a run it saw ends.
+fn watch(dir: &Path, pid: u32) -> Result<()> {
+    // Opened once, so that a VM whose directory has been deleted, and which
+    // no run can find anymore, is stopped too.
+    let lock = File::open(dir.join("lock"))?;
+    // Held for as long as this watches.  A new qemu's watchdog waits here for
+    // the old one's to notice that its qemu is gone.
+    let watching = File::create(dir.join("watchdog.lock"))?;
+    watching.lock()?;
+    while qemu_is_running(dir, pid) {
+        sleep(WATCHDOG_INTERVAL);
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                lock.lock()?;
+                lock.set_modified(SystemTime::now())?;
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let idle = lock.metadata()?.modified()?.elapsed().unwrap_or_default();
+        if idle >= IDLE_TIMEOUT {
+            eprintln!("no run has used qemu (pid {pid}) for {}", human::seconds(idle.as_secs()));
+            // Holding the lock until qemu is gone, so that no run starts using it.
+            return stop_qemu(dir, pid);
+        }
+        lock.unlock()?;
+    }
+    Ok(())
+}
+
+/// Whether a watchdog is watching the VM in `dir`.
+fn is_watched(dir: &Path) -> Result<bool> {
+    match File::create(dir.join("watchdog.lock"))?.try_lock() {
+        Ok(()) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+/// Starts a watchdog (see [`watch`]) for the VM in `dir`, whose qemu is
+/// `pid`: this program, in a session of its own so that it outlives the test
+/// run and a Ctrl-C of it.
 fn start_watchdog(dir: &Path, pid: u32) -> Result<()> {
+    let log = File::options().create(true).append(true).open(dir.join("watchdog.log"))?;
     Command::new("setsid")
-        .args(["sh", "-c", WATCHDOG, "sh"])
+        .arg(env::current_exe()?)
+        .arg(WATCHDOG_ARG)
+        .arg(dir)
         .arg(pid.to_string())
-        .arg(dir.join("console.log"))
-        .arg(dir.join("lock"))
-        .arg(IDLE_TIMEOUT.as_secs().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(File::create(dir.join("watchdog.log"))?)
+        .stderr(log)
         .spawn()
         .context("failed to start the VM's watchdog")?;
     Ok(())
+}
+
+/// If [`start_watchdog`] started this process, watches the VM and exits.
+pub fn be_watchdog_if_started_as_one() {
+    let args: Vec<OsString> = env::args_os().collect();
+    let [_, arg, dir, pid] = &args[..] else { return };
+    if arg != WATCHDOG_ARG {
+        return;
+    }
+    let pid = pid.to_string_lossy().parse().expect("the watchdog's pid isn't a number");
+    if let Err(error) = watch(Path::new(dir), pid) {
+        eprintln!("{error:#}");
+        process::exit(1);
+    }
+    process::exit(0);
 }
 
 /// Writes the client key, known_hosts and an ssh config that uses them (and
@@ -298,25 +340,31 @@ impl Vm {
         fs::create_dir_all(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         lock.lock().context("failed to lock the VM")?;
-        // For the watchdog: see WATCHDOG.
-        lock.set_modified(SystemTime::now())?;
 
         let bundle = build(&dir, name.as_str())?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
         let state_path = dir.join("state.json");
         let old_state: Option<State> = fs::read(&state_path).ok().and_then(|json| serde_json::from_slice(&json).ok());
         let state = match old_state {
-            Some(state) if state.bundle == bundle && qemu_is_running(&dir, state.pid) => state,
+            Some(state) if state.bundle == bundle && qemu_is_running(&dir, state.pid) => {
+                // In case its watchdog died.
+                if !is_watched(&dir)? {
+                    start_watchdog(&dir, state.pid)?;
+                }
+                state
+            }
             old_state => {
                 if let Some(old) = old_state {
                     stop_qemu(&dir, old.pid)?;
                 }
                 let state = start_qemu(&dir, &bundle, &manifest)?;
-                fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
                 start_watchdog(&dir, state.pid)?;
+                fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
                 state
             }
         };
+        // For the watchdog, which may not see a short run: see watch.
+        lock.set_modified(SystemTime::now())?;
 
         let vm = Vm {
             ssh: Ssh { extra_args: vec!["-F".into(), write_ssh_files(&dir, &manifest, &state)?.display().to_string()] },
