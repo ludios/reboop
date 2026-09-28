@@ -43,6 +43,9 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
     if facts.inhibitors.iter().any(Inhibitor::blocks_shutdown) {
         reasons.push("inhibitor".to_string());
     }
+    if !facts.lasting_jobs.is_empty() {
+        reasons.push("jobs".to_string());
+    }
     reasons
 }
 
@@ -183,6 +186,7 @@ pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facts::Job;
     use crate::preflight::{idle_facts, test_machine};
     use crate::processes::Process;
     use anyhow::anyhow;
@@ -204,6 +208,7 @@ mod tests {
         facts.root_used_percent = 98;
         let crawl = Inhibitor { what: "shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 42, user: "at".into() };
         facts.inhibitors.push(crawl);
+        facts.lasting_jobs.push(Job { id: 361, unit: "nixos-upgrade.service".into(), job_type: "start".into(), state: "running".into() });
         let blockers = preflight::blockers(&test_machine(), &facts);
         Ok((facts, blockers))
     }
@@ -218,9 +223,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  ROOT  OTHER                              KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  98%   cryptsetup,btrfs device,inhibitor  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  45%   -                                  6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  ROOT  OTHER                                   KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  98%   cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  45%   -                                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -228,6 +233,7 @@ mod tests {
              one: tmux: pid 1234 (at): tmux new -s work\n\
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
+             one: systemd job: start nixos-upgrade.service (running) for 5s or more\n\
              one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
              one: load average: 2.50 is over the limit of 2\n\
              one: root filesystem: 98% used, and it's full at 97%\n\
@@ -252,7 +258,8 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 8);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 9);
+        assert_eq!(report["facts"]["lasting_jobs"][0]["type"], "start");
         assert_eq!(report["facts"]["root_used_percent"], 98);
         assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);
         assert_eq!(report["facts"]["btrfs"][0]["devices"][0]["missing"], true);

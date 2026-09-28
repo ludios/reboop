@@ -187,6 +187,38 @@ pub fn root_used_percent(session: &mut Session) -> Result<u8> {
     parse_df_percent(&session.run_ok("df --output=pcent /", QUICK)?)
 }
 
+/// A job that systemd has queued or is running, like starting a unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Job {
+    pub id: u64,
+    pub unit: String,
+    /// e.g. "start", "stop" or "restart"
+    #[serde(rename = "type")]
+    pub job_type: String,
+    /// "waiting" or "running"
+    pub state: String,
+}
+
+/// Parses `systemctl list-jobs --no-legend`: a line of "ID UNIT TYPE STATE"
+/// per job.  (Unit names can't contain spaces.)
+fn parse_jobs(output: &str) -> Result<Vec<Job>> {
+    output
+        .lines()
+        .map(|line| {
+            let [id, unit, job_type, state] = line.split_whitespace().collect::<Vec<_>>()[..] else {
+                bail!("unexpected systemctl list-jobs line {line:?}");
+            };
+            let id = id.parse().with_context(|| format!("unexpected systemctl list-jobs line {line:?}"))?;
+            Ok(Job { id, unit: unit.into(), job_type: job_type.into(), state: state.into() })
+        })
+        .collect()
+}
+
+/// systemd's jobs.
+pub fn jobs(session: &mut Session) -> Result<Vec<Job>> {
+    parse_jobs(&session.run_ok("systemctl list-jobs --no-legend --no-pager", QUICK)?)
+}
+
 /// A lock that a program holds to delay or block shutdown, sleep, etc.: see
 /// systemd-inhibit(1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +259,15 @@ pub fn inhibitors(session: &mut Session) -> Result<Vec<Inhibitor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_jobs() {
+        let output = "361 reboop-test-job.service start running\n362 nginx.service   stop  waiting\n";
+        let job = |id, unit: &str, job_type: &str, state: &str| Job { id, unit: unit.into(), job_type: job_type.into(), state: state.into() };
+        assert_eq!(parse_jobs(output).unwrap(), [job(361, "reboop-test-job.service", "start", "running"), job(362, "nginx.service", "stop", "waiting")]);
+        assert_eq!(parse_jobs("").unwrap(), []);
+        assert!(parse_jobs("No jobs running.").is_err());
+    }
 
     #[test]
     fn parses_df() {

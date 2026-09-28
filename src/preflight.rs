@@ -4,7 +4,7 @@
 
 use crate::btrfs::{self, Device, Filesystem, ScrubState, ScrubStatus};
 use crate::config::Machine;
-use crate::facts::{self, Inhibitor, Systems};
+use crate::facts::{self, Inhibitor, Job, Systems};
 use crate::human;
 use crate::processes::{self, Activity, Process};
 use crate::ssh::Session;
@@ -48,6 +48,10 @@ pub struct Facts {
     pub busy_processes: BTreeMap<Activity, Vec<Process>>,
     /// All inhibitor locks, including those that don't block a reboot.
     pub inhibitors: Vec<Inhibitor>,
+    /// systemd's jobs that were there both before and after
+    /// [`NETWORK_SAMPLE`], like a unit that's slow to start or stop.
+    /// (Leaving out the rest, like those that logging in starts.)
+    pub lasting_jobs: Vec<Job>,
     /// Every mounted btrfs filesystem, not just those to scrub.
     pub btrfs: Vec<BtrfsFacts>,
 }
@@ -74,14 +78,19 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         let devices = btrfs::devices(session, &filesystem)?;
         btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub, devices });
     }
+    let jobs_before = facts::jobs(session)?;
+    let network_bytes_per_sec = facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec();
+    let mut lasting_jobs = facts::jobs(session)?;
+    lasting_jobs.retain(|job| jobs_before.iter().any(|before| before.id == job.id));
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
         systems: facts::systems(session)?,
         load_average_1min: facts::load_average_1min(session)?,
-        network_bytes_per_sec: facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec(),
+        network_bytes_per_sec,
         root_used_percent: facts::root_used_percent(session)?,
         busy_processes,
         inhibitors: facts::inhibitors(session)?,
+        lasting_jobs,
         btrfs,
     })
 }
@@ -152,6 +161,10 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
         let why = if inhibitor.why.is_empty() { String::new() } else { format!(" ({})", inhibitor.why) };
         blockers.push(format!("inhibitor: {}{why}, pid {} ({})", inhibitor.who, inhibitor.pid, inhibitor.user));
     }
+    for job in &facts.lasting_jobs {
+        let seconds = NETWORK_SAMPLE.as_secs();
+        blockers.push(format!("systemd job: {} {} ({}) for {seconds}s or more", job.job_type, job.unit, job.state));
+    }
     if network_over_limit(machine, facts) {
         let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(machine.max_network_transfer_bytes_per_sec as f64));
         blockers.push(format!("network: {rate} is over the limit of {limit}"));
@@ -192,6 +205,7 @@ pub(crate) fn idle_facts() -> Facts {
         root_used_percent: 45,
         busy_processes: BTreeMap::new(),
         inhibitors: vec![],
+        lasting_jobs: vec![],
         btrfs: vec![BtrfsFacts {
             filesystem: Filesystem { uuid: "4c8a".into(), mountpoint: "/".into() },
             exclusive_operation: "none".into(),
@@ -262,6 +276,8 @@ mod tests {
             user: "at".into(),
         };
         facts.inhibitors = vec![inhibitor("block", "archiving"), inhibitor("delay", "flushing"), inhibitor("block-weak", "")];
+        let job = Job { id: 361, unit: "nixos-upgrade.service".into(), job_type: "start".into(), state: "running".into() };
+        facts.lasting_jobs = vec![job];
         facts.load_average_1min = 2.01;
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.root_used_percent = 97;
@@ -275,6 +291,7 @@ mod tests {
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",
+                "systemd job: start nixos-upgrade.service (running) for 5s or more",
                 "network: 1.50MB/s is over the limit of 1.00MB/s",
                 "load average: 2.01 is over the limit of 2",
                 "root filesystem: 97% used, and it's full at 97%",

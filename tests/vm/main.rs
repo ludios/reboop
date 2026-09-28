@@ -287,6 +287,12 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let [blocker] = &blockers[..] else { bail!("{blockers:?}") };
     assert!(blocker.starts_with("inhibitor: reboop-test-inhibit (testing), pid ") && blocker.ends_with(" (root)"), "{blocker}");
     clean_up(&mut session)?;
+
+    // A unit that takes its time to start
+    sh(&mut session, "systemd-run --quiet --no-block --unit=reboop-test-job -p Type=oneshot sleep 600")?;
+    let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
+    assert_eq!(blockers, ["systemd job: start reboop-test-job.service (running) for 5s or more"]);
+    clean_up(&mut session)?;
     Ok(())
 }
 
