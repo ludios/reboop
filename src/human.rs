@@ -59,9 +59,9 @@ pub enum Style {
 }
 
 impl Style {
-    /// A table cell showing `text` in this style.
+    /// A table cell showing `text` in this style, flush left.
     pub fn cell(self, text: impl Into<String>) -> Cell {
-        Cell { text: text.into(), style: self }
+        Cell { text: text.into(), style: self, align: Align::Left }
     }
 
     /// `text` in this style, with ANSI escape sequences.
@@ -79,16 +79,31 @@ impl Style {
     }
 }
 
+/// Which side of its column a cell's text is flush with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Right,
+}
+
 /// Text in a table, and how it looks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub text: String,
     pub style: Style,
+    pub align: Align,
+}
+
+impl Cell {
+    /// This cell, flush right, the way numbers line up.
+    pub fn right_aligned(self) -> Cell {
+        Cell { align: Align::Right, ..self }
+    }
 }
 
 /// Lays out `rows` of cells in columns, two spaces apart, without trailing
-/// spaces, and in the cells' styles if `color`.  All rows must have the same
-/// number of cells.
+/// spaces, each cell aligned its own way, and in the cells' styles if
+/// `color`.  All rows must have the same number of cells.
 pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
     let columns = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == columns), "rows have different numbers of cells");
@@ -99,11 +114,15 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
             .iter()
             .zip(&widths)
             .map(|(cell, &width)| {
-                // Padding counts chars, like the widths, and goes after any
+                // Padding counts chars, like the widths, and goes outside any
                 // escape sequences (none around empty text) so that
-                // trim_end can remove it.
+                // trim_end can remove it from the end of a row.
                 let shown = if color && !cell.text.is_empty() { cell.style.paint(&cell.text) } else { cell.text.clone() };
-                shown + &" ".repeat(width - cell.text.chars().count())
+                let padding = " ".repeat(width - cell.text.chars().count());
+                match cell.align {
+                    Align::Left  => shown + &padding,
+                    Align::Right => padding + &shown,
+                }
             })
             .collect();
         text.push_str(cells.join("  ").trim_end());
@@ -138,6 +157,8 @@ mod tests {
         assert_eq!(table(&rows, false), "name   kernel             okay\none    6.18.54 → 6.18.55  no\nthree\n");
         assert_eq!(table(&rows, true), table(&rows, false));
         assert_eq!(table(&[], true), "");
+        let rows = [vec![Style::Plain.cell("load"), Style::Plain.cell("x")], vec![Style::Plain.cell("0.5").right_aligned(), Style::Plain.cell("").right_aligned()]];
+        assert_eq!(table(&rows, false), "load  x\n 0.5\n");
     }
 
     #[test]
@@ -146,5 +167,7 @@ mod tests {
         assert_eq!(table(&rows, true), "\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m\nthree  \x1b[31mno\x1b[0m\n");
         assert_eq!(table(&rows, false), "NAME   OKAY\nthree  no\n");
         assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
+        let rows = [vec![Style::Bold.cell("LOAD")], vec![Style::Red.cell("2.5").right_aligned()]];
+        assert_eq!(table(&rows, true), "\x1b[1mLOAD\x1b[0m\n \x1b[31m2.5\x1b[0m\n");
     }
 }

@@ -31,10 +31,13 @@ const ACTIVITY_COLUMNS: [Activity; 4] = [Activity::Nix, Activity::SwitchToConfig
 
 const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
 
-/// Short names for the reasons in `facts` not to reboot that have no column
-/// of their own.
-fn other_reasons(facts: &Facts) -> Vec<String> {
+/// Short names for the reasons in `facts` not to reboot `machine` that have
+/// no column of their own.
+fn other_reasons(machine: &Machine, facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
+    if !preflight::boot_problems(machine, facts).is_empty() {
+        reasons.push("boot".to_string());
+    }
     let activities = facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity));
     reasons.extend(activities.map(Activity::to_string));
     if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(Device::has_trouble) {
@@ -62,7 +65,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
-    let red_or_green = |red: bool, text: String| if red { Red.cell(text) } else { Green.cell(text) };
+    let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).right_aligned();
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
         systems.running_kernel.clone()
@@ -78,10 +81,10 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         count(Activity::SwitchToConfiguration),
         count(Activity::Tmux),
         count(Activity::Rsync),
-        red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
-        red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
-        red_or_green(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
-        list(other_reasons(facts).iter().map(String::as_str).collect()),
+        number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
+        number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
+        number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
+        list(other_reasons(machine, facts).iter().map(String::as_str).collect()),
         Plain.cell(kernel),
     ]
 }
@@ -202,8 +205,8 @@ mod tests {
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         let reencrypt = Process { pid: 1235, ppid: 1, user: "root".into(), args: "cryptsetup reencrypt /dev/sda2".into() };
         facts.busy_processes.insert(Activity::Cryptsetup, vec![reencrypt]);
-        facts.network_bytes_per_sec = 1_500_000.0;
-        facts.load_average_1min = 2.5;
+        facts.network_bytes_per_sec = 12_500_000.0;
+        facts.load_average_1min = 12.5;
         facts.root_used_percent = 98;
         let crawl = Inhibitor {
             what: "shutdown".into(),
@@ -230,9 +233,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  ROOT  OTHER                                   KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  98%   cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  45%   -                                       6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET        LOAD   ROOT  OTHER                                   KERNEL\n\
+             one      no     -      balance   -    -       1     -      12.50MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -       1.00kB/s   0.50   45%  -                                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -241,8 +244,8 @@ mod tests {
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: systemd job: start nixos-upgrade.service (running) for 5s or more\n\
-             one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
-             one: load average: 2.50 is over the limit of 2\n\
+             one: network: 12.50MB/s is over the limit of 1.00MB/s\n\
+             one: load average: 12.50 is over the limit of 2\n\
              one: root filesystem: 98% used, and it's full at 97%\n\
              \n\
              three: failed to open a session: no route to host\n    second line\n"
@@ -254,6 +257,14 @@ mod tests {
         assert_eq!(exit_status(&outcomes), 1);
         assert_eq!(exit_status(&outcomes[..2]), 2);
         assert_eq!(exit_status(&outcomes[1..2]), 0);
+    }
+
+    #[test]
+    fn names_boot_trouble() {
+        let mut facts = idle_facts();
+        assert_eq!(other_reasons(&test_machine(), &facts), Vec::<String>::new());
+        facts.boot[0].missing_files.push("/boot/EFI/nixos/initrd.efi".into());
+        assert_eq!(other_reasons(&test_machine(), &facts), ["boot"]);
     }
 
     #[test]
