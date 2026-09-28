@@ -6,7 +6,7 @@
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::Inhibitor;
-use crate::human::{self, Align::{Center, Left, Right}, Cell, Style::{Bold, Gray, Green, Plain, Red}};
+use crate::human::{self, Align::{Center, Left, Right}, Cell, Style::{Bold, Green, Plain, Red}};
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
@@ -71,11 +71,11 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         row.resize(HEADER.len(), Plain.cell(""));
         return row;
     };
-    let list = |items: Vec<&str>| if items.is_empty() { Gray.cell("-") } else { Red.cell(items.join(",")) };
+    let list = |items: Vec<&str>| if items.is_empty() { Plain.cell("") } else { Red.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let count = |activity| match facts.busy_processes.get(&activity) {
         Some(processes) => Red.cell(processes.len().to_string()).aligned(Right),
-        None            => Gray.cell("-"),
+        None            => Plain.cell(""),
     };
     let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
@@ -246,8 +246,8 @@ mod tests {
         assert_eq!(
             table(&outcomes, false),
             "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 KERNEL\n\
-             one      no     -      -       1  -      12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -      -    -     -       1.00 kB/s   0.50   45%  -                                                                    6.18.54\n\
+             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes                              1.00 kB/s   0.50   45%                                                                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -264,8 +264,8 @@ mod tests {
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Gray, Red, Gray, Red, Red, Red, Red, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Green, Green, Green, Gray, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");

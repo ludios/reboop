@@ -73,7 +73,6 @@ pub enum Style {
     Bold,
     Red,
     Green,
-    Gray,
 }
 
 impl Style {
@@ -89,9 +88,6 @@ impl Style {
             Style::Bold  => "1",
             Style::Red   => "31",
             Style::Green => "32",
-            // Not bright black (90), which some palettes, like Solarized
-            // Dark, make the background color.
-            Style::Gray  => "38;5;245",
         };
         format!("\x1b[{code}m{text}\x1b[0m")
     }
