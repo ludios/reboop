@@ -31,6 +31,7 @@ Managing LUKS keys:
     "scrub_mounts": ["/"],
     "max_network_transfer_bytes_per_sec": 1000000,
     "max_load_average_1min": 2,
+    "luks_signing_key": "~/.ssh/id_ed25519.pub",
 }
 
 ~/.config/reboop/machines.jsonl

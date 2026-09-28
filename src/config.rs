@@ -39,6 +39,9 @@ pub struct Machine {
     pub scrub_mounts: Vec<String>,
     pub max_network_transfer_bytes_per_sec: u64,
     pub max_load_average_1min: f64,
+    /// The SSH key whose signature protects the machine's LUKS password: see
+    /// [`crate::passwords::master_key`].
+    pub luks_signing_key: PathBuf,
 }
 
 impl Machine {
@@ -60,6 +63,7 @@ struct Defaults {
     scrub_mounts: Option<Vec<String>>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
+    luks_signing_key: Option<String>,
 }
 
 /// A line of machines.jsonl.  (serde can't combine `flatten` with
@@ -74,10 +78,26 @@ struct MachineLine {
     scrub_mounts: Option<Vec<String>>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
+    luks_signing_key: Option<String>,
 }
 
-/// Combines a line of machines.jsonl with the defaults, and checks the result.
-fn resolve(defaults: &Defaults, line: MachineLine) -> Result<Machine> {
+/// The luks_signing_key of machines that aren't configured with one.
+const DEFAULT_LUKS_SIGNING_KEY: &str = "~/.ssh/id_ed25519.pub";
+
+/// Expands `path`'s leading "~/" (if any) to `home`, and checks that the
+/// result is absolute.
+fn expand_home(path: &str, home: &Path) -> Result<PathBuf> {
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(path),
+    };
+    ensure!(expanded.is_absolute(), "{path:?} is neither an absolute path nor one starting with ~/");
+    Ok(expanded)
+}
+
+/// Combines a line of machines.jsonl with the defaults, and checks the
+/// result.  `home` is the user's home directory, for expanding "~/".
+fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machine> {
     check_hostname(&line.hostname)?;
     let missing = |name: &str| anyhow!("{} has no {name}, and defaults.json doesn't either", line.hostname);
     let machine = Machine {
@@ -92,6 +112,11 @@ fn resolve(defaults: &Defaults, line: MachineLine) -> Result<Machine> {
             .max_load_average_1min
             .or(defaults.max_load_average_1min)
             .ok_or_else(|| missing("max_load_average_1min"))?,
+        luks_signing_key: expand_home(
+            line.luks_signing_key.as_deref().or(defaults.luks_signing_key.as_deref()).unwrap_or(DEFAULT_LUKS_SIGNING_KEY),
+            home,
+        )
+        .with_context(|| format!("bad luks_signing_key for {}", line.hostname))?,
         hostname: line.hostname,
         ipv4: line.ipv4,
     };
@@ -107,8 +132,9 @@ fn resolve(defaults: &Defaults, line: MachineLine) -> Result<Machine> {
     Ok(machine)
 }
 
-/// Parses the contents of defaults.json (if any) and machines.jsonl.
-pub fn parse(defaults: Option<&str>, machines: &str) -> Result<Vec<Machine>> {
+/// Parses the contents of defaults.json (if any) and machines.jsonl.  `home`
+/// is the user's home directory, for expanding "~/".
+pub fn parse(defaults: Option<&str>, machines: &str, home: &Path) -> Result<Vec<Machine>> {
     let defaults: Defaults = match defaults {
         Some(text) => json5::from_str(text).context("in defaults.json")?,
         None => Defaults::default(),
@@ -121,11 +147,21 @@ pub fn parse(defaults: Option<&str>, machines: &str) -> Result<Vec<Machine>> {
         }
         let context = || format!("on line {} of machines.jsonl", index + 1);
         let line: MachineLine = serde_json::from_str(line).with_context(context)?;
-        let machine = resolve(&defaults, line).with_context(context)?;
+        let machine = resolve(&defaults, line, home).with_context(context)?;
         ensure!(hostnames.insert(machine.hostname.clone()), "{} is configured twice", machine.hostname);
         result.push(machine);
     }
     Ok(result)
+}
+
+/// The machine called `hostname` among `machines`.
+pub fn find<'a>(machines: &'a [Machine], hostname: &str) -> Result<&'a Machine> {
+    machines.iter().find(|machine| machine.hostname == hostname).ok_or_else(|| anyhow!("{hostname:?} isn't in machines.jsonl"))
+}
+
+/// The user's home directory, from $HOME.
+fn home_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?))
 }
 
 /// Reads the machines configured in `dir`.  defaults.json is optional.
@@ -138,16 +174,22 @@ pub fn load(dir: &Path) -> Result<Vec<Machine>> {
     };
     let machines_path = dir.join("machines.jsonl");
     let machines = fs::read_to_string(&machines_path).with_context(|| format!("failed to read {}", machines_path.display()))?;
-    parse(defaults.as_deref(), &machines).with_context(|| format!("bad configuration in {}", dir.display()))
+    parse(defaults.as_deref(), &machines, &home_dir()?).with_context(|| format!("bad configuration in {}", dir.display()))
 }
 
 /// ~/.config/reboop, or its equivalent under $XDG_CONFIG_HOME.
 pub fn config_dir() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?).join(".config"),
+        _ => home_dir()?.join(".config"),
     };
     Ok(base.join("reboop"))
+}
+
+/// The luks directory in [`config_dir`], where machines' LUKS passwords are
+/// kept: see [`crate::passwords`].
+pub fn passwords_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("luks"))
 }
 
 #[cfg(test)]
@@ -161,13 +203,16 @@ mod tests {
         "scrub_mounts": ["/"],
         "max_network_transfer_bytes_per_sec": 1000000,
         "max_load_average_1min": 2,
+        "luks_signing_key": "~/keys/all.pub",
     }"#;
+
+    const HOME: &str = "/home/user";
 
     #[test]
     fn machines_override_defaults() {
         let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 22}\n\n\
-                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"]}\n";
-        let machines = parse(Some(DEFAULTS), machines).unwrap();
+                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"luks_signing_key\": \"/keys/two.pub\"}\n";
+        let machines = parse(Some(DEFAULTS), machines, Path::new(HOME)).unwrap();
         assert_eq!(
             machines[0],
             Machine {
@@ -178,23 +223,35 @@ mod tests {
                 scrub_mounts: vec!["/".into()],
                 max_network_transfer_bytes_per_sec: 1_000_000,
                 max_load_average_1min: 2.0,
+                luks_signing_key: "/home/user/keys/all.pub".into(),
             }
         );
         assert_eq!(machines[1].ssh_port, 904);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
+        assert_eq!(machines[1].luks_signing_key, Path::new("/keys/two.pub"));
         assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 904 });
+        assert_eq!(find(&machines, "two").unwrap(), &machines[1]);
+        assert!(find(&machines, "three").is_err());
+    }
+
+    #[test]
+    fn signs_with_id_ed25519_by_default() {
+        let line = r#"{"hostname": "one", "ipv4": "10.0.0.1", "ssh_port": 22, "initrd_ssh_port": 23, "scrub_mounts": [], "max_network_transfer_bytes_per_sec": 1, "max_load_average_1min": 1}"#;
+        let machines = parse(None, line, Path::new(HOME)).unwrap();
+        assert_eq!(machines[0].luks_signing_key, Path::new("/home/user/.ssh/id_ed25519.pub"));
     }
 
     #[test]
     fn rejects_mistakes() {
-        let line = |json: &str| parse(Some(DEFAULTS), json);
+        let line = |json: &str| parse(Some(DEFAULTS), json, Path::new(HOME));
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "ssh_prot": 22}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.256"}"#).is_err());
         assert!(line(r#"{"hostname": "../one", "ipv4": "10.0.0.1"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_mounts": ["small"]}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
         assert!(line("{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\"}\n{\"hostname\": \"one\", \"ipv4\": \"10.0.0.2\"}").is_err());
-        assert!(parse(Some(r#"{"ssh_port": 904, "extra": 1}"#), "").is_err());
-        let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#).unwrap_err();
+        assert!(parse(Some(r#"{"ssh_port": 904, "extra": 1}"#), "", Path::new(HOME)).is_err());
+        let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#, Path::new(HOME)).unwrap_err();
         assert!(format!("{error:#}").contains("no ssh_port"), "{error:#}");
     }
 }

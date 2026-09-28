@@ -24,6 +24,12 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A remote command that has /bin/sh run `script`.  Base64 keeps the script
+/// intact through root's login shell, whatever that is.
+pub fn sh_c(script: &str) -> String {
+    format!(r#"exec /bin/sh -c "$(printf %s '{}' | base64 -d)""#, BASE64.encode(script))
+}
+
 /// Whether ssh's `stderr` shows a failure that trying again won't fix: the
 /// server's host key isn't the known one.  (Not "Permission denied", which
 /// can also mean the user missed touching their key.)
@@ -182,10 +188,7 @@ impl Session {
     /// Failures that trying again won't fix are [`Permanent`].
     pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
         let deadline = Deadline::after(timeout);
-        // Base64 keeps the script intact through root's login shell, whatever
-        // that is.
-        let remote_command = format!(r#"exec /bin/sh -c "$(printf %s '{}' | base64 -d)""#, BASE64.encode(SESSION_SHELL));
-        let child = ChildProcess::spawn(ssh.command(target, &["-T"], &remote_command))?;
+        let child = ChildProcess::spawn(ssh.command(target, &["-T"], &sh_c(SESSION_SHELL)))?;
         let mut session = Session { ssh: child, target: target.clone(), pending: Vec::new(), scanned: 0, broken: false };
         loop {
             // Skip anything that root's shell startup files print.

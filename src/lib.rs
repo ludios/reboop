@@ -10,6 +10,7 @@ pub mod deadline;
 pub mod facts;
 pub mod human;
 pub mod initrd;
+pub mod luks_password;
 pub mod passwords;
 pub mod preflight;
 pub mod processes;

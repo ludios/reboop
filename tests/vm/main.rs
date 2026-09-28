@@ -237,6 +237,7 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
         max_network_transfer_bytes_per_sec: 1_000_000,
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
+        luks_signing_key: "/nonexistent".into(),
     };
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     assert_eq!(facts.systems, facts::systems(&mut session)?);
@@ -377,6 +378,13 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
+fn root_password_is_tested(vm: &Vm) -> Result<()> {
+    let test = |password| initrd::test_root_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
+    assert_eq!(test(&vm.manifest.luks_password)?, ("/dev/vda2".into(), true));
+    assert_eq!(test("not the password")?, ("/dev/vda2".into(), false));
+    Ok(())
+}
+
 /// Reboots the VM and brings it back up, first answering the initrd with
 /// `first_password` (if any) and then the real password.  Returns a session
 /// to the rebooted machine.
@@ -451,6 +459,7 @@ fn main() {
         ("scrub_finds_corruption", scrub_finds_corruption),
         ("stop_unit", stop_unit),
         ("postflight_facts", postflight_facts),
+        ("root_password_is_tested", root_password_is_tested),
         ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
         ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
     ];

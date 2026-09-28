@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use mimalloc::MiMalloc;
-use reboop::check;
+use reboop::{check, luks_password};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +22,17 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
+    },
+    /// Ask for a machine's LUKS password, check over SSH that it opens the
+    /// LUKS device beneath /, and store it encrypted with the machine's
+    /// luks_signing_key for unlocking the machine after a reboot
+    #[clap(name = "set-luks-password")]
+    SetLuksPassword {
+        /// A machine from machines.jsonl
+        hostname: String,
+        /// Don't check the password on the machine; ask for it twice instead
+        #[clap(long)]
+        no_test_passphrase: bool,
     },
 }
 
@@ -44,6 +55,7 @@ fn main() -> ExitCode {
     };
     let result = match command {
         ReboopCommand::Check { hostnames, json } => check::run(&hostnames, json),
+        ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
     };
     match result {
         Ok(status) => ExitCode::from(status),

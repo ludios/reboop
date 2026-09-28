@@ -9,7 +9,7 @@ use crate::human;
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::thread;
@@ -127,8 +127,7 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
     }
     let mut selected: Vec<&Machine> = Vec::new();
     for hostname in hostnames {
-        let machine = machines.iter().find(|machine| &machine.hostname == hostname);
-        let machine = machine.ok_or_else(|| anyhow!("{hostname:?} isn't in machines.jsonl"))?;
+        let machine = config::find(machines, hostname)?;
         if !selected.iter().any(|&chosen| std::ptr::eq(chosen, machine)) {
             selected.push(machine);
         }
@@ -164,6 +163,7 @@ mod tests {
     use super::*;
     use crate::preflight::{idle_facts, test_machine};
     use crate::processes::Process;
+    use anyhow::anyhow;
     use serde_json::{Value, json};
 
     fn blocked_facts() -> Facts {
