@@ -50,7 +50,6 @@ Managing LUKS keys:
     - Is an rsync process running?
     - Network bytes in / out over 5 seconds
     - Load average over the last minute
-    - The IPv4 IP address (WAN) of the machine
     - The NixOS configuration we're currently on
     - The Linux kernel we're currenty on
     - The NixOS configuration and kernel we expect to boot into by default
