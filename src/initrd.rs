@@ -60,17 +60,19 @@ pub fn check_password(password: &str) -> Result<()> {
 }
 
 /// Finds the one LUKS device beneath /, prints "reboop-luks-device DEVICE",
-/// and tests whether the password on stdin opens it.
+/// and tests whether the password on stdin opens it.  (lsblk lists a device
+/// once per path to it, and cryptsetup would try PIN-less tokens, like a
+/// TPM2's, before the password.)
 const TEST_LUKS_PASSWORD: &str = r#"
 set -euf
 root=$(findmnt -nvo SOURCE /)
-set -- $(lsblk -rsnpo PATH,FSTYPE "$root" | awk '$2 == "crypto_LUKS" { print $1 }')
+set -- $(lsblk -rsnpo PATH,FSTYPE "$root" | awk '$2 == "crypto_LUKS" && !seen[$1]++ { print $1 }')
 if [ $# -ne 1 ]; then
     echo "expected one LUKS device beneath / ($root), found $#: $*" >&2
     exit 1
 fi
 echo "reboop-luks-device $1"
-exec cryptsetup luksOpen --test-passphrase --key-file=- "$1"
+exec cryptsetup luksOpen --test-passphrase --disable-external-tokens --key-file=- "$1"
 "#;
 
 /// Tests whether `password` opens the LUKS device beneath / on the booted

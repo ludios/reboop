@@ -6,7 +6,7 @@
 //! The key is a hash of `ssh-keygen -Y sign` over a fixed message, so it's
 //! available wherever the user's SSH key is (e.g. through their agent).  That
 //! only works with keys whose signatures are deterministic, like Ed25519 and
-//! RSA keys but unlike ECDSA and FIDO keys; [`save`] checks.
+//! RSA keys but unlike ECDSA and FIDO keys; [`stable_master_key`] checks.
 
 use crate::child;
 use crate::config::check_hostname;
@@ -71,6 +71,18 @@ pub fn master_key(signing_key: &Path) -> Result<MasterKey> {
     Ok(MasterKey(hash.into()))
 }
 
+/// Like [`master_key`], but refuses keys that can't reliably decrypt what
+/// they encrypt: signs twice and requires the same signature.
+pub fn stable_master_key(signing_key: &Path) -> Result<MasterKey> {
+    let key = master_key(signing_key)?;
+    ensure!(
+        master_key(signing_key)? == key,
+        "{} makes a different signature every time (is it an ECDSA or FIDO key?), so it can't protect passwords",
+        signing_key.display()
+    );
+    Ok(key)
+}
+
 /// Where the password for machine `hostname` is kept in `dir`.
 pub fn password_file(dir: &Path, hostname: &str) -> Result<PathBuf> {
     check_hostname(hostname)?;
@@ -128,33 +140,27 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Encrypts `password` for machine `hostname` into a file in `dir`,
-/// replacing any previous one.  Refuses keys that can't reliably decrypt it
-/// again: signs twice and requires the same signature.
-pub fn save(dir: &Path, hostname: &str, password: &str, signing_key: &Path) -> Result<()> {
+/// Encrypts `password` for machine `hostname` with `key`, which should come
+/// from [`stable_master_key`], into a file in `dir`, replacing any previous
+/// one.
+pub fn save(dir: &Path, hostname: &str, password: &str, key: &MasterKey) -> Result<()> {
     check_password(password)?;
     let path = password_file(dir, hostname)?;
-    let key = master_key(signing_key)?;
-    ensure!(
-        master_key(signing_key)? == key,
-        "{} makes a different signature every time (is it an ECDSA or FIDO key?), so it can't protect passwords",
-        signing_key.display()
-    );
-
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     // The temporary file can't be another machine's, as hostnames don't
     // start with a dot.
-    write_atomically(&path, &encrypt(&key, hostname, password)?)?;
-    let saved = decrypt(&key, hostname, &fs::read(&path)?)?;
+    write_atomically(&path, &encrypt(key, hostname, password)?)?;
+    let saved = decrypt(key, hostname, &fs::read(&path)?)?;
     ensure!(saved == password, "{} doesn't hold the password after writing it", path.display());
     Ok(())
 }
 
-/// Decrypts the password for machine `hostname` from its file in `dir`.
-pub fn load(dir: &Path, hostname: &str, signing_key: &Path) -> Result<String> {
+/// Decrypts the password for machine `hostname` from its file in `dir` with
+/// `key`.
+pub fn load(dir: &Path, hostname: &str, key: &MasterKey) -> Result<String> {
     let path = password_file(dir, hostname)?;
     let contents = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    decrypt(&master_key(signing_key)?, hostname, &contents)
+    decrypt(key, hostname, &contents)
 }
 
 #[cfg(test)]
@@ -171,7 +177,7 @@ mod tests {
     #[test]
     fn saves_and_loads() {
         let temp = tempfile::tempdir().unwrap();
-        let key = keygen(temp.path(), "id_ed25519", "ed25519");
+        let key = stable_master_key(&keygen(temp.path(), "id_ed25519", "ed25519")).unwrap();
         let dir = temp.path().join("luks");
         save(&dir, "one", "correct horse battery staple", &key).unwrap();
         assert_eq!(load(&dir, "one", &key).unwrap(), "correct horse battery staple");
@@ -181,7 +187,7 @@ mod tests {
         // Another machine's file, or another key, doesn't decrypt.
         fs::copy(dir.join("one"), dir.join("two")).unwrap();
         assert!(load(&dir, "two", &key).is_err());
-        let other_key = keygen(temp.path(), "other", "ed25519");
+        let other_key = master_key(&keygen(temp.path(), "other", "ed25519")).unwrap();
         assert!(load(&dir, "one", &other_key).is_err());
 
         // Saving doesn't disturb the file of a machine with a similar name.
@@ -199,15 +205,16 @@ mod tests {
     #[test]
     fn refuses_nondeterministic_keys() {
         let temp = tempfile::tempdir().unwrap();
-        let key = keygen(temp.path(), "id_ecdsa", "ecdsa");
-        let error = save(&temp.path().join("luks"), "one", "password", &key).unwrap_err();
+        let Err(error) = stable_master_key(&keygen(temp.path(), "id_ecdsa", "ecdsa")) else {
+            panic!("accepted an ECDSA key");
+        };
         assert!(error.to_string().contains("different signature"), "{error:#}");
     }
 
     #[test]
     fn refuses_bad_hostnames_and_passwords() {
         let temp = tempfile::tempdir().unwrap();
-        let key = keygen(temp.path(), "id_ed25519", "ed25519");
+        let key = master_key(&keygen(temp.path(), "id_ed25519", "ed25519")).unwrap();
         assert!(save(temp.path(), "../evil", "password", &key).is_err());
         assert!(save(temp.path(), "one", "pass\nword", &key).is_err());
     }

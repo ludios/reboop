@@ -161,7 +161,9 @@ pub fn find<'a>(machines: &'a [Machine], hostname: &str) -> Result<&'a Machine> 
 
 /// The user's home directory, from $HOME.
 fn home_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?))
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME isn't set"))?);
+    ensure!(home.is_absolute(), "$HOME ({:?}) isn't an absolute path", home);
+    Ok(home)
 }
 
 /// Reads the machines configured in `dir`.  defaults.json is optional.

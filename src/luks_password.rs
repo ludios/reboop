@@ -38,12 +38,16 @@ fn ask(prompt: &str) -> Result<String> {
 pub fn set(hostname: &str, test: bool) -> Result<()> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
+    // First, so that a key that can't protect the password fails before the
+    // user types it.
+    let key = passwords::stable_master_key(&machine.luks_signing_key)?;
 
     let password = ask(&format!("LUKS password for {hostname}:"))?;
     check_password(&password)?;
     if test {
         let deadline = Deadline::after(OPEN_TIMEOUT + QUICK);
-        let (device, opens) = initrd::test_luks_password(&Ssh::default(), &machine.target(), &password, deadline)?;
+        let (device, opens) = initrd::test_luks_password(&Ssh::default(), &machine.target(), &password, deadline)
+            .context("couldn't test the password (--no-test-passphrase skips that)")?;
         ensure!(opens, "the password doesn't open {device} beneath / on {hostname}");
         println!("The password opens {device} beneath / on {hostname}");
     } else {
@@ -51,8 +55,12 @@ pub fn set(hostname: &str, test: bool) -> Result<()> {
     }
 
     let dir = config::passwords_dir()?;
-    passwords::save(&dir, hostname, &password, &machine.luks_signing_key)?;
-    println!("Saved the LUKS password for {hostname} in {}", passwords::password_file(&dir, hostname)?.display());
+    passwords::save(&dir, hostname, &password, &key)?;
+    println!(
+        "Saved the LUKS password for {hostname} in {}, encrypted with {}",
+        passwords::password_file(&dir, hostname)?.display(),
+        machine.luks_signing_key.display()
+    );
     Ok(())
 }
 
@@ -61,6 +69,7 @@ pub fn set(hostname: &str, test: bool) -> Result<()> {
 pub fn get(hostname: &str) -> Result<()> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
-    println!("{}", passwords::load(&config::passwords_dir()?, hostname, &machine.luks_signing_key)?);
+    let key = passwords::master_key(&machine.luks_signing_key)?;
+    println!("{}", passwords::load(&config::passwords_dir()?, hostname, &key)?);
     Ok(())
 }

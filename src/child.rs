@@ -159,7 +159,13 @@ impl Drop for ChildProcess {
 /// hasn't finished by `deadline`.
 pub fn run(command: Command, stdin: &[u8], deadline: Deadline) -> Result<Output> {
     let mut child = ChildProcess::spawn(command)?;
-    child.write_stdin(stdin, deadline)?;
+    // A process may exit without reading its input, e.g. over a bad
+    // argument; its status and stderr tell why.
+    if let Err(error) = child.write_stdin(stdin, deadline) {
+        if !error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == ErrorKind::BrokenPipe) {
+            return Err(error);
+        }
+    }
     child.close_stdin();
     let mut stdout = Vec::new();
     while let Some(chunk) = child.read_stdout(deadline)? {
@@ -184,6 +190,13 @@ mod tests {
         let output = run(sh("cat; echo err >&2; exit 3"), b"hello", Deadline::after(Duration::from_secs(10))).unwrap();
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.status.code(), Some(3));
+    }
+
+    #[test]
+    fn run_tolerates_a_child_that_exits_without_reading() {
+        let output = run(sh("echo bad argument >&2; exit 3"), &vec![0; 1 << 20], Deadline::after(Duration::from_secs(5))).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr, b"bad argument");
     }
 
     #[test]

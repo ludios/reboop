@@ -281,6 +281,15 @@ mod tests {
     }
 
     #[test]
+    fn sh_c_survives_sh() {
+        let tricky = r#"it's a "test" with $HOME, `backticks`, \ and newline
+"#;
+        let script = format!("printf %s {}", shell_quote(tricky));
+        let output = std::process::Command::new("sh").arg("-c").arg(sh_c(&script)).output().unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), tricky);
+    }
+
+    #[test]
     fn command_dials_the_address_under_the_name() {
         let target = Target { name: "one".into(), address: "10.0.0.1".into(), port: 904 };
         let command = Ssh { extra_args: vec!["-F".into(), "config".into()] }.command(&target, &["-T"], "true");
