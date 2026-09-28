@@ -14,7 +14,7 @@ use anyhow::{Result, bail, ensure};
 use harness::{Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::bounce::{self, Outcome, Printer};
-use reboop::btrfs::{self, ScrubState};
+use reboop::btrfs::{self, Device, ScrubState};
 use reboop::config::Machine;
 use reboop::deadline::{Deadline, Permanent};
 use reboop::facts;
@@ -23,7 +23,7 @@ use reboop::preflight;
 use reboop::processes::{self, Activity};
 use reboop::reboot::{self, Stopped};
 use reboop::ssh::{Session, wait_for_session};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::process::Stdio;
@@ -278,6 +278,35 @@ fn btrfs_root_is_idle(vm: &Vm) -> Result<()> {
     assert_eq!(filesystems[0].mountpoint, "/");
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystems[0])?, "none");
     assert_ne!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Running);
+    assert_eq!(btrfs::devices(&mut session, &filesystems[0])?, [Device { devid: 1, missing: false, errors: BTreeMap::new() }]);
+    Ok(())
+}
+
+fn btrfs_missing_device_is_detected(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    // A two-device RAID1, mounted without its second device
+    sh(
+        &mut session,
+        "set -e
+        for i in 1 2; do truncate -s 1G /var/tmp/reboop-test-raid-$i.img; done
+        a=$(losetup -f --show /var/tmp/reboop-test-raid-1.img)
+        b=$(losetup -f --show /var/tmp/reboop-test-raid-2.img)
+        mkfs.btrfs -q -d raid1 -m raid1 $a $b
+        # Detaching waits for whoever has it open, like udev probing it.
+        udevadm settle
+        losetup -d $b
+        while losetup $b >/dev/null 2>&1; do sleep 0.1; done
+        btrfs device scan --forget
+        mkdir -p /mnt/reboop-test-raid
+        mount -o degraded $a /mnt/reboop-test-raid",
+    )?;
+    let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == "/mnt/reboop-test-raid").unwrap();
+    let devices = btrfs::devices(&mut session, &filesystem)?;
+    assert_eq!(devices.iter().map(|device| (device.devid, device.missing)).collect::<Vec<_>>(), [(1, false), (2, true)]);
+
+    let machine = vm_machine(vm);
+    let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
+    assert_eq!(blockers, ["btrfs on /mnt/reboop-test-raid: device 2 is missing"]);
     Ok(())
 }
 
@@ -367,6 +396,11 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
     assert_eq!(status.state, ScrubState::Finished);
     assert!(status.errors.get("csum_errors").is_some_and(|&n| n > 0), "{status:?}");
     assert!(status.summary().contains("ERRORS FOUND"), "{}", status.summary());
+
+    // The device remembers the corruption.
+    let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
+    let devices = btrfs::devices(&mut session, &filesystem)?;
+    assert!(devices[0].errors.get("corruption_errs").is_some_and(|&n| n > 0), "{devices:?}");
     Ok(())
 }
 
@@ -501,6 +535,7 @@ fn main() {
         ("activities_are_detected", activities_are_detected),
         ("preflight_finds_blockers", preflight_finds_blockers),
         ("btrfs_root_is_idle", btrfs_root_is_idle),
+        ("btrfs_missing_device_is_detected", btrfs_missing_device_is_detected),
         ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
         ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
         ("scrub_finds_corruption", scrub_finds_corruption),

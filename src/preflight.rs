@@ -2,7 +2,7 @@
 
 //! Finding out whether a machine is okay to reboot.
 
-use crate::btrfs::{self, Filesystem, ScrubState, ScrubStatus};
+use crate::btrfs::{self, Device, Filesystem, ScrubState, ScrubStatus};
 use crate::config::Machine;
 use crate::facts::{self, Inhibitor, Systems};
 use crate::human;
@@ -30,6 +30,7 @@ pub struct BtrfsFacts {
     /// As from [`btrfs::exclusive_operation`]: "none" if there's none.
     pub exclusive_operation: String,
     pub scrub: ScrubStatus,
+    pub devices: Vec<Device>,
 }
 
 /// What a machine is doing that a reboot would interrupt, and what a reboot
@@ -68,7 +69,8 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     for filesystem in btrfs::filesystems(session)? {
         let exclusive_operation = btrfs::exclusive_operation(session, &filesystem)?;
         let scrub = btrfs::scrub_status(session, &filesystem.mountpoint)?;
-        btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub });
+        let devices = btrfs::devices(session, &filesystem)?;
+        btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub, devices });
     }
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
@@ -106,6 +108,20 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
         // mount (unless mounted with skip_balance).
         if fs.exclusive_operation != "none" {
             blockers.push(format!("btrfs on {}: {}", fs.filesystem.mountpoint, fs.exclusive_operation));
+        }
+        // A filesystem missing a device won't mount at boot without the
+        // degraded option.  One with errors may have a failing device.
+        for device in fs.devices.iter().filter(|device| device.missing) {
+            blockers.push(format!("btrfs on {}: device {} is missing", fs.filesystem.mountpoint, device.devid));
+        }
+        for device in fs.devices.iter().filter(|device| !device.errors.is_empty()) {
+            let counts: Vec<_> = device.errors.iter().map(|(name, count)| format!("{name}={count}")).collect();
+            let mountpoint = &fs.filesystem.mountpoint;
+            blockers.push(format!(
+                "btrfs on {mountpoint}: device {} has had errors: {} (once dealt with, `btrfs device stats -z {mountpoint}` resets them)",
+                device.devid,
+                counts.join(" ")
+            ));
         }
     }
     for (activity, processes) in &facts.busy_processes {
@@ -167,6 +183,7 @@ pub(crate) fn idle_facts() -> Facts {
             filesystem: Filesystem { uuid: "4c8a".into(), mountpoint: "/".into() },
             exclusive_operation: "none".into(),
             scrub,
+            devices: vec![Device { devid: 1, missing: false, errors: BTreeMap::new() }],
         }],
     }
 }
@@ -215,6 +232,10 @@ mod tests {
             filesystem: Filesystem { uuid: "bbb".into(), mountpoint: "/small".into() },
             exclusive_operation: "balance paused".into(),
             scrub: idle_facts().btrfs[0].scrub.clone(),
+            devices: vec![
+                Device { devid: 1, missing: false, errors: BTreeMap::from([("corruption_errs".into(), 3), ("read_errs".into(), 1)]) },
+                Device { devid: 2, missing: true, errors: BTreeMap::new() },
+            ],
         });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
         let inhibitor = |mode: &str, why: &str| Inhibitor {
@@ -233,6 +254,8 @@ mod tests {
             [
                 "btrfs on /: scrub has 3m 30s left, 500.00kB of 1.00MB (50.00%) scrubbed at 100.00kB/s, no errors found",
                 "btrfs on /small: balance paused",
+                "btrfs on /small: device 2 is missing",
+                "btrfs on /small: device 1 has had errors: corruption_errs=3 read_errs=1 (once dealt with, `btrfs device stats -z /small` resets them)",
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",

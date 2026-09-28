@@ -61,6 +61,71 @@ pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Re
     Ok(session.run_ok(&format!("cat {}", shell_quote(&path)), QUICK)?.trim_end().to_string())
 }
 
+/// A device of a mounted btrfs filesystem, and its troubles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Device {
+    pub devid: u64,
+    /// Whether the filesystem is running without it.
+    pub missing: bool,
+    /// Its error counters (e.g. "read_errs") that aren't zero.  They count
+    /// since the filesystem was made or they were reset (`btrfs device stats
+    /// -z`).
+    pub errors: BTreeMap<String, u64>,
+}
+
+/// The counters in sysfs' error_stats, all of which we require to be present
+/// so that a change in the kernel can't hide errors.
+const DEVICE_ERROR_COUNTERS: &[&str] = &["write_errs", "read_errs", "flush_errs", "corruption_errs", "generation_errs"];
+
+/// Parses lines of "DEVID missing 0|1" and "DEVID COUNTER VALUE" into
+/// devices, in order of devid.
+fn parse_devices(text: &str) -> Result<Vec<Device>> {
+    let context = || format!("unexpected btrfs device info:\n{text}");
+    let mut fields: BTreeMap<u64, BTreeMap<&str, u64>> = BTreeMap::new();
+    for line in text.lines() {
+        let [devid, name, value] = line.split(' ').collect::<Vec<_>>()[..] else { bail!(context()) };
+        let value = value.parse().with_context(context)?;
+        fields.entry(devid.parse().with_context(context)?).or_default().insert(name, value);
+    }
+    ensure!(!fields.is_empty(), "no devices\n{}", context());
+    fields
+        .into_iter()
+        .map(|(devid, fields)| {
+            let field = |name| fields.get(name).copied().ok_or_else(|| anyhow!("no {name} for device {devid}\n{}", context()));
+            let mut errors = BTreeMap::new();
+            for &name in DEVICE_ERROR_COUNTERS {
+                let count = field(name)?;
+                if count > 0 {
+                    errors.insert(name.to_string(), count);
+                }
+            }
+            let missing = match field("missing")? {
+                0 => false,
+                1 => true,
+                other => bail!("device {devid} has missing={other}\n{}", context()),
+            };
+            Ok(Device { devid, missing, errors })
+        })
+        .collect()
+}
+
+/// The devices of `filesystem`, from sysfs.
+pub fn devices(session: &mut Session, filesystem: &Filesystem) -> Result<Vec<Device>> {
+    let dir = format!("/sys/fs/btrfs/{}/devinfo", filesystem.uuid);
+    let script = format!(
+        r#"set -eu
+        cd {}
+        for d in *; do
+            missing=$(cat "$d/missing")
+            echo "$d missing $missing"
+            stats=$(cat "$d/error_stats")
+            printf '%s\n' "$stats" | sed "s|^|$d |"
+        done"#,
+        shell_quote(&dir)
+    );
+    parse_devices(&session.run_ok(&script, QUICK)?)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrubState {
@@ -324,6 +389,25 @@ mod tests {
         let status = parse_scrub_status(summary, &raw("x", "finished", &counters)).unwrap();
         assert_eq!(status.state, ScrubState::Finished);
         assert_eq!(status.errors, BTreeMap::from([("csum_errors".into(), 1)]));
+    }
+
+    #[test]
+    fn parses_devices() {
+        let counters = |devid: u64, corruption: u64| {
+            format!("{devid} write_errs 0\n{devid} read_errs 0\n{devid} flush_errs 0\n{devid} corruption_errs {corruption}\n{devid} generation_errs 0\n")
+        };
+        let text = format!("1 missing 0\n{}2 missing 1\n{}", counters(1, 3), counters(2, 0));
+        assert_eq!(
+            parse_devices(&text).unwrap(),
+            [
+                Device { devid: 1, missing: false, errors: BTreeMap::from([("corruption_errs".into(), 3)]) },
+                Device { devid: 2, missing: true, errors: BTreeMap::new() },
+            ]
+        );
+        assert!(parse_devices("").is_err());
+        assert!(parse_devices(&format!("1 missing 0\n{}", counters(1, 0).replace("1 read_errs 0\n", ""))).is_err());
+        assert!(parse_devices(&format!("1 missing 2\n{}", counters(1, 0))).is_err());
+        assert!(parse_devices(&counters(1, 0)).is_err());
     }
 
     #[test]

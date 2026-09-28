@@ -32,6 +32,9 @@ const HEADER: [&str; 12] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWIT
 /// of their own.
 fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
+    if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(|device| device.missing || !device.errors.is_empty()) {
+        reasons.push("btrfs device".to_string());
+    }
     if facts.inhibitors.iter().any(Inhibitor::blocks_shutdown) {
         reasons.push("inhibitor".to_string());
     }
@@ -184,6 +187,7 @@ mod tests {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
         facts.btrfs[0].exclusive_operation = "balance".into();
+        facts.btrfs[0].devices[0].missing = true;
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         facts.network_bytes_per_sec = 1_500_000.0;
@@ -204,12 +208,13 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER      KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  inhibitor  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -          6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER                   KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  btrfs device,inhibitor  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
+             one: btrfs on /: device 1 is missing\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
@@ -235,7 +240,8 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 5);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 6);
+        assert_eq!(report["facts"]["btrfs"][0]["devices"][0]["missing"], true);
         assert_eq!(report["facts"]["inhibitors"][0]["who"], "crawl");
         assert_eq!(report["facts"]["busy_processes"]["tmux"][0]["pid"], 1234);
         assert_eq!(report["facts"]["btrfs"][0]["mountpoint"], "/");
