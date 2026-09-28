@@ -57,7 +57,7 @@
   };
 
   fileSystems = {
-    "/"     = { device = "/dev/mapper/root";              fsType = "btrfs"; options = [ "noatime" "compress=zstd" ]; };
+    "/"     = { device = "/dev/mapper/root";           fsType = "btrfs"; options = [ "noatime" "compress=zstd" ]; };
     "/boot" = { device = "/dev/disk/by-partlabel/ESP"; fsType = "vfat";  options = [ "umask=0077" ]; };
   };
 
