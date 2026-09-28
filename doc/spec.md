@@ -32,11 +32,12 @@ Managing LUKS keys:
     "max_network_transfer_bytes_per_sec": 1000000,
     "max_load_average_1min": 2,
     "luks_signing_key": "~/.ssh/id_ed25519.pub",
+    "stop_services": ["postgresql"],
 }
 
 ~/.config/reboop/machines.jsonl
 
-{"hostname": "one", "ipv4": "...", "ssh_port": 22, "initrd_ssh_port": 23}
+{"hostname": "one", "ipv4": "...", "ssh_port": 22, "initrd_ssh_port": 23, "stop_services": []}
 {"hostname": "two", "ipv4": "...", "scrub_mounts": ["/", "/small"]}
 {"hostname": "three", "ipv4": "...", "max_network_transfer_bytes_per_sec": 1000000, "max_load_average_1min": 2}
 
@@ -69,7 +70,7 @@ Managing LUKS keys:
 
 1. SSH in and:
 
-    - systemctl stop postgresql
+    - systemctl stop each of stop_services, in order, skipping any the machine doesn't have
     - shutdown -r now
 
 2. After disconnection, keep trying to SSH in over port 23, with a 15 second timeout, once every 15 seconds:

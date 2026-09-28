@@ -42,6 +42,9 @@ pub struct Machine {
     /// The SSH key whose signature protects the machine's LUKS password: see
     /// [`crate::passwords::master_key`].
     pub luks_signing_key: PathBuf,
+    /// systemd units to stop, in order, before rebooting, e.g. "postgresql";
+    /// those the machine doesn't have are skipped.
+    pub stop_services: Vec<String>,
 }
 
 impl Machine {
@@ -64,6 +67,7 @@ struct Defaults {
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
     luks_signing_key: Option<String>,
+    stop_services: Option<Vec<String>>,
 }
 
 /// A line of machines.jsonl.  (serde can't combine `flatten` with
@@ -79,6 +83,7 @@ struct MachineLine {
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
     luks_signing_key: Option<String>,
+    stop_services: Option<Vec<String>>,
 }
 
 /// The luks_signing_key of machines that aren't configured with one.
@@ -117,12 +122,20 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
             home,
         )
         .with_context(|| format!("bad luks_signing_key for {}", line.hostname))?,
+        stop_services: line.stop_services.or(defaults.stop_services.clone()).unwrap_or_default(),
         hostname: line.hostname,
         ipv4: line.ipv4,
     };
     ensure!(machine.ssh_port != 0 && machine.initrd_ssh_port != 0, "port 0 for {}", machine.hostname);
     for mount in &machine.scrub_mounts {
         ensure!(mount.starts_with('/'), "scrub mount {mount:?} of {} isn't an absolute path", machine.hostname);
+    }
+    for service in &machine.stop_services {
+        ensure!(
+            !service.is_empty() && !service.contains(char::is_whitespace),
+            "{service:?} in stop_services of {} isn't a unit name",
+            machine.hostname
+        );
     }
     ensure!(
         machine.max_load_average_1min.is_finite() && machine.max_load_average_1min >= 0.0,
@@ -206,6 +219,7 @@ mod tests {
         "max_network_transfer_bytes_per_sec": 1000000,
         "max_load_average_1min": 2,
         "luks_signing_key": "~/keys/all.pub",
+        "stop_services": ["postgresql"],
     }"#;
 
     const HOME: &str = "/home/user";
@@ -213,7 +227,7 @@ mod tests {
     #[test]
     fn machines_override_defaults() {
         let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 22}\n\n\
-                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"luks_signing_key\": \"/keys/two.pub\"}\n";
+                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": []}\n";
         let machines = parse(Some(DEFAULTS), machines, Path::new(HOME)).unwrap();
         assert_eq!(
             machines[0],
@@ -226,21 +240,24 @@ mod tests {
                 max_network_transfer_bytes_per_sec: 1_000_000,
                 max_load_average_1min: 2.0,
                 luks_signing_key: "/home/user/keys/all.pub".into(),
+                stop_services: vec!["postgresql".into()],
             }
         );
         assert_eq!(machines[1].ssh_port, 904);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
         assert_eq!(machines[1].luks_signing_key, Path::new("/keys/two.pub"));
+        assert_eq!(machines[1].stop_services, Vec::<String>::new());
         assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 904 });
         assert_eq!(find(&machines, "two").unwrap(), &machines[1]);
         assert!(find(&machines, "three").is_err());
     }
 
     #[test]
-    fn signs_with_id_ed25519_by_default() {
+    fn optional_settings_have_defaults() {
         let line = r#"{"hostname": "one", "ipv4": "10.0.0.1", "ssh_port": 22, "initrd_ssh_port": 23, "scrub_mounts": [], "max_network_transfer_bytes_per_sec": 1, "max_load_average_1min": 1}"#;
         let machines = parse(None, line, Path::new(HOME)).unwrap();
         assert_eq!(machines[0].luks_signing_key, Path::new("/home/user/.ssh/id_ed25519.pub"));
+        assert_eq!(machines[0].stop_services, Vec::<String>::new());
     }
 
     #[test]
@@ -251,6 +268,8 @@ mod tests {
         assert!(line(r#"{"hostname": "../one", "ipv4": "10.0.0.1"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_mounts": ["small"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": [""]}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql nginx"]}"#).is_err());
         assert!(line("{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\"}\n{\"hostname\": \"one\", \"ipv4\": \"10.0.0.2\"}").is_err());
         assert!(parse(Some(r#"{"ssh_port": 904, "extra": 1}"#), "", Path::new(HOME)).is_err());
         let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#, Path::new(HOME)).unwrap_err();

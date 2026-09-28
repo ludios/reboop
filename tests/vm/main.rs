@@ -235,6 +235,7 @@ fn vm_machine(vm: &Vm) -> Machine {
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
         luks_signing_key: "/nonexistent".into(),
+        stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-nonexistent.service".into()],
     }
 }
 
@@ -415,18 +416,27 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let machine = vm_machine(vm);
     let password = || Ok(vm.manifest.luks_password.clone());
-    let mut stdout = std::io::stdout();
-    let mut printer = Printer::new(&mut stdout, false, false);
+    // Bounces the VM, printing what it says, and returns that too.
+    let bounce_vm = || -> Result<(Outcome, String)> {
+        let mut printed = Vec::new();
+        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, false));
+        let printed = String::from_utf8(printed)?;
+        print!("{printed}");
+        Ok((outcome?, printed))
+    };
 
-    // Not while someone has a tmux
+    // Not while someone has a tmux, and without stopping anything
+    let is_active = "systemctl is-active --quiet reboop-test-sleep.service";
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     sh(&mut session, START_TMUX)?;
     wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
     let boot_id = facts::boot_id(&mut session)?;
-    let Outcome::NotOkay(blockers) = bounce::bounce(&vm.ssh, &machine, password, &mut printer)? else {
+    let (Outcome::NotOkay(blockers), _) = bounce_vm()? else {
         bail!("bounced despite the tmux");
     };
     assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: ")), "{blockers:?}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    sh(&mut session, is_active)?;
     clean_up(&mut session)?;
 
     let before = facts::systems(&mut session)?;
@@ -438,8 +448,11 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let expected = facts::systems(&mut session)?;
     assert_eq!((&expected.current, &expected.default), (&before.current, next));
 
-    let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut printer)?;
+    // One of the stop_services is running, and one doesn't exist.
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    let (outcome, printed) = bounce_vm()?;
     assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
+    assert!(printed.contains("\nStopped reboop-test-sleep.service\nThere's no reboop-test-nonexistent.service to stop\n"));
     let mut session = vm.session()?;
     assert_ne!(facts::boot_id(&mut session)?, boot_id);
     assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Finished);

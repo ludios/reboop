@@ -18,11 +18,7 @@ use anyhow::{Context, Result, ensure};
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
-/// A unit to stop before rebooting, so that if it can't stop cleanly, the
-/// bounce ends while the machine is still up.
-const STOP_FIRST: &str = "postgresql.service";
-
-/// How long [`STOP_FIRST`] gets to stop.
+/// How long each of a machine's stop_services gets to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How often to try reaching a machine that's rebooting.
@@ -127,10 +123,13 @@ pub enum Outcome {
     Bounced(Vec<String>),
 }
 
-/// Makes sure that `machine`'s initrd can be unlocked, and stops
-/// [`STOP_FIRST`], over `session`.  If `machine` has a LUKS device beneath
-/// /, gets its password from `password` and tests it there.  Returns the
+/// Makes sure that `machine`'s initrd can be unlocked, and stops its
+/// stop_services, over `session`.  If `machine` has a LUKS device beneath /,
+/// gets its password from `password` and tests it there.  Returns the
 /// password, if the initrd will ask for it.
+///
+/// Stopping the services here means that one that can't stop cleanly ends
+/// the bounce while the machine is still up.
 fn prepare(
     ssh: &Ssh,
     machine: &Machine,
@@ -151,8 +150,11 @@ fn prepare(
         Some(password)
     };
 
-    if reboot::stop_unit(session, STOP_FIRST, STOP_TIMEOUT)? == Stopped::Stopped {
-        printer.line(&format!("Stopped {STOP_FIRST}"));
+    for service in &machine.stop_services {
+        match reboot::stop_unit(session, service, STOP_TIMEOUT)? {
+            Stopped::Stopped => printer.line(&format!("Stopped {service}")),
+            Stopped::NotLoaded => printer.line(&format!("There's no {service} to stop")),
+        }
     }
     Ok(password)
 }
@@ -265,7 +267,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
 
 /// Bounces `machine`, telling the user about it with `printer`: checks that
 /// it's okay to reboot; if it has a LUKS device beneath /, gets the password
-/// from `password` and tests it; stops [`STOP_FIRST`]; reboots it; answers
+/// from `password` and tests it; stops its stop_services; reboots it; answers
 /// its initrd's password prompt; waits for it to come back; shows how it
 /// did; and scrubs its scrub_mounts.
 ///

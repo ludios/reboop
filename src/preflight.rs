@@ -176,6 +176,7 @@ pub(crate) fn test_machine() -> Machine {
         max_network_transfer_bytes_per_sec: 1_000_000,
         max_load_average_1min: 2.0,
         luks_signing_key: "/home/user/.ssh/id_ed25519.pub".into(),
+        stop_services: vec![],
     }
 }
 
