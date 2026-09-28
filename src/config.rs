@@ -39,6 +39,9 @@ pub struct Machine {
     pub scrub_mounts: Vec<String>,
     pub max_network_transfer_bytes_per_sec: u64,
     pub max_load_average_1min: f64,
+    /// The percentage of / that's used (as df(1) shows it) at which / counts
+    /// as too full to reboot.
+    pub root_full_percent: u8,
     /// The SSH key whose signature protects the machine's LUKS password: see
     /// [`crate::passwords::master_key`].
     pub luks_signing_key: PathBuf,
@@ -66,6 +69,7 @@ struct Defaults {
     scrub_mounts: Option<Vec<String>>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
+    root_full_percent: Option<u8>,
     luks_signing_key: Option<String>,
     stop_services: Option<Vec<String>>,
 }
@@ -82,9 +86,13 @@ struct MachineLine {
     scrub_mounts: Option<Vec<String>>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
+    root_full_percent: Option<u8>,
     luks_signing_key: Option<String>,
     stop_services: Option<Vec<String>>,
 }
+
+/// The root_full_percent of machines that aren't configured with one.
+const DEFAULT_ROOT_FULL_PERCENT: u8 = 97;
 
 /// The luks_signing_key of machines that aren't configured with one.
 const DEFAULT_LUKS_SIGNING_KEY: &str = "~/.ssh/id_ed25519.pub";
@@ -117,6 +125,7 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
             .max_load_average_1min
             .or(defaults.max_load_average_1min)
             .ok_or_else(|| missing("max_load_average_1min"))?,
+        root_full_percent: line.root_full_percent.or(defaults.root_full_percent).unwrap_or(DEFAULT_ROOT_FULL_PERCENT),
         luks_signing_key: expand_home(
             line.luks_signing_key.as_deref().or(defaults.luks_signing_key.as_deref()).unwrap_or(DEFAULT_LUKS_SIGNING_KEY),
             home,
@@ -140,6 +149,7 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
         "bad max_load_average_1min for {}",
         machine.hostname
     );
+    ensure!((1..=100).contains(&machine.root_full_percent), "root_full_percent of {} isn't from 1 to 100", machine.hostname);
     Ok(machine)
 }
 
@@ -216,6 +226,7 @@ mod tests {
         "scrub_mounts": ["/"],
         "max_network_transfer_bytes_per_sec": 1000000,
         "max_load_average_1min": 2,
+        "root_full_percent": 95,
         "luks_signing_key": "~/keys/all.pub",
         "stop_services": ["postgresql"],
     }"#;
@@ -237,6 +248,7 @@ mod tests {
                 scrub_mounts: vec!["/".into()],
                 max_network_transfer_bytes_per_sec: 1_000_000,
                 max_load_average_1min: 2.0,
+                root_full_percent: 95,
                 luks_signing_key: "/home/user/keys/all.pub".into(),
                 stop_services: vec!["postgresql".into()],
             }
@@ -256,6 +268,7 @@ mod tests {
         let machines = parse(None, line, Path::new(HOME)).unwrap();
         assert_eq!(machines[0].luks_signing_key, Path::new("/home/user/.ssh/id_ed25519.pub"));
         assert_eq!(machines[0].stop_services, Vec::<String>::new());
+        assert_eq!(machines[0].root_full_percent, 97);
     }
 
     #[test]
@@ -266,6 +279,8 @@ mod tests {
         assert!(line(r#"{"hostname": "../one", "ipv4": "10.0.0.1"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_mounts": ["small"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "root_full_percent": 0}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "root_full_percent": 101}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": [""]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql nginx"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgres*"]}"#).is_err());

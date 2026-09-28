@@ -247,6 +247,7 @@ fn vm_machine(vm: &Vm) -> Machine {
         max_network_transfer_bytes_per_sec: 1_000_000,
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
+        root_full_percent: 97,
         luks_signing_key: "/nonexistent".into(),
         stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-nonexistent.service".into()],
     }
@@ -264,6 +265,11 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     assert_eq!(facts.systems, facts::systems(&mut session)?);
     assert!(facts.btrfs.iter().any(|fs| fs.filesystem.mountpoint == "/"), "{facts:#?}");
     assert_eq!(preflight::blockers(&machine, &facts), Vec::<String>::new(), "{facts:#?}");
+    // The VM's root is far from full, but not empty.
+    let used = facts.root_used_percent;
+    assert!((1..90).contains(&used), "{used}");
+    let easily_full = Machine { root_full_percent: used, ..machine.clone() };
+    assert_eq!(preflight::blockers(&easily_full, &facts), [format!("root filesystem: {used}% used, and it's full at {used}%")]);
 
     sh(&mut session, START_TMUX)?;
     wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;

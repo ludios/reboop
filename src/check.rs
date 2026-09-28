@@ -29,7 +29,7 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 /// The activities that have columns of their own.
 const ACTIVITY_COLUMNS: [Activity; 4] = [Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync];
 
-const HEADER: [&str; 12] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "OTHER", "KERNEL"];
+const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
 
 /// Short names for the reasons in `facts` not to reboot that have no column
 /// of their own.
@@ -78,6 +78,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         rsync,
         red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
+        red_or_green(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         list(other_reasons(facts).iter().map(String::as_str).collect()),
         Plain.cell(kernel),
     ]
@@ -200,6 +201,7 @@ mod tests {
         facts.busy_processes.insert(Activity::Cryptsetup, vec![reencrypt]);
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.load_average_1min = 2.5;
+        facts.root_used_percent = 98;
         let crawl = Inhibitor { what: "shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 42, user: "at".into() };
         facts.inhibitors.push(crawl);
         let blockers = preflight::blockers(&test_machine(), &facts);
@@ -216,9 +218,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER                              KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  cryptsetup,btrfs device,inhibitor  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -                                  6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  ROOT  OTHER                              KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  98%   cryptsetup,btrfs device,inhibitor  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  45%   -                                  6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -228,12 +230,13 @@ mod tests {
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
              one: load average: 2.50 is over the limit of 2\n\
+             one: root filesystem: 98% used, and it's full at 97%\n\
              \n\
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Red, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Gray, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Red, Red, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Green, Gray, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert_eq!(exit_status(&outcomes[..2]), 2);
@@ -249,7 +252,8 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 7);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 8);
+        assert_eq!(report["facts"]["root_used_percent"], 98);
         assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);
         assert_eq!(report["facts"]["btrfs"][0]["devices"][0]["missing"], true);
         assert_eq!(report["facts"]["inhibitors"][0]["who"], "crawl");

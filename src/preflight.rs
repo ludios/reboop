@@ -42,6 +42,8 @@ pub struct Facts {
     pub load_average_1min: f64,
     /// Bytes received plus sent per second over [`NETWORK_SAMPLE`].
     pub network_bytes_per_sec: f64,
+    /// As from [`facts::root_used_percent`]
+    pub root_used_percent: u8,
     /// Processes that a reboot would interrupt, by what they're doing.
     pub busy_processes: BTreeMap<Activity, Vec<Process>>,
     /// All inhibitor locks, including those that don't block a reboot.
@@ -77,6 +79,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         systems: facts::systems(session)?,
         load_average_1min: facts::load_average_1min(session)?,
         network_bytes_per_sec: facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec(),
+        root_used_percent: facts::root_used_percent(session)?,
         busy_processes,
         inhibitors: facts::inhibitors(session)?,
         btrfs,
@@ -93,6 +96,12 @@ pub fn network_over_limit(machine: &Machine, facts: &Facts) -> bool {
 /// reboot.
 pub fn load_over_limit(machine: &Machine, facts: &Facts) -> bool {
     facts.load_average_1min > machine.max_load_average_1min
+}
+
+/// Whether `facts` show that `machine`'s / is too full to reboot: it might
+/// not boot properly.
+pub fn root_full(machine: &Machine, facts: &Facts) -> bool {
+    facts.root_used_percent >= machine.root_full_percent
 }
 
 /// The reasons not to reboot `machine`, given `facts` about it, one line
@@ -150,6 +159,9 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
     if load_over_limit(machine, facts) {
         blockers.push(format!("load average: {:.2} is over the limit of {}", facts.load_average_1min, machine.max_load_average_1min));
     }
+    if root_full(machine, facts) {
+        blockers.push(format!("root filesystem: {}% used, and it's full at {}%", facts.root_used_percent, machine.root_full_percent));
+    }
     blockers
 }
 
@@ -177,6 +189,7 @@ pub(crate) fn idle_facts() -> Facts {
         },
         load_average_1min: 0.5,
         network_bytes_per_sec: 1_000.0,
+        root_used_percent: 45,
         busy_processes: BTreeMap::new(),
         inhibitors: vec![],
         btrfs: vec![BtrfsFacts {
@@ -188,8 +201,8 @@ pub(crate) fn idle_facts() -> Facts {
     }
 }
 
-/// A machine with a load average limit of 2 and a network limit of 1MB/s,
-/// for tests.
+/// A machine with a load average limit of 2, a network limit of 1MB/s, and a
+/// root that's full at 97%, for tests.
 #[cfg(test)]
 pub(crate) fn test_machine() -> Machine {
     Machine {
@@ -200,6 +213,7 @@ pub(crate) fn test_machine() -> Machine {
         scrub_mounts: vec!["/".into()],
         max_network_transfer_bytes_per_sec: 1_000_000,
         max_load_average_1min: 2.0,
+        root_full_percent: 97,
         luks_signing_key: "/home/user/.ssh/id_ed25519.pub".into(),
         stop_services: vec![],
     }
@@ -219,6 +233,7 @@ mod tests {
         assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
         facts.load_average_1min = 2.0;
         facts.network_bytes_per_sec = 1_000_000.0;
+        facts.root_used_percent = 96;
         assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
     }
 
@@ -249,6 +264,7 @@ mod tests {
         facts.inhibitors = vec![inhibitor("block", "archiving"), inhibitor("delay", "flushing"), inhibitor("block-weak", "")];
         facts.load_average_1min = 2.01;
         facts.network_bytes_per_sec = 1_500_000.0;
+        facts.root_used_percent = 97;
         assert_eq!(
             blockers(&test_machine(), &facts),
             [
@@ -261,6 +277,7 @@ mod tests {
                 "inhibitor: crawl, pid 42 (at)",
                 "network: 1.50MB/s is over the limit of 1.00MB/s",
                 "load average: 2.01 is over the limit of 2",
+                "root filesystem: 97% used, and it's full at 97%",
             ]
         );
     }

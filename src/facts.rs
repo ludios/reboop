@@ -171,6 +171,22 @@ pub fn kernel_errors(session: &mut Session) -> Result<String> {
     session.run_ok("dmesg --level=err,crit,alert,emerg", QUICK)
 }
 
+/// Parses `df --output=pcent`: a header, then e.g. " 45%".
+fn parse_df_percent(output: &str) -> Result<u8> {
+    let context = || format!("unexpected df output {output:?}");
+    let [_, line] = output.lines().collect::<Vec<_>>()[..] else { bail!(context()) };
+    let percent = line.trim().strip_suffix('%').ok_or_else(|| anyhow!(context()))?;
+    let percent = percent.parse().with_context(context)?;
+    ensure!(percent <= 100, context());
+    Ok(percent)
+}
+
+/// How much of the filesystem at / is used, as a percentage rounded up, the
+/// way df(1) shows it.
+pub fn root_used_percent(session: &mut Session) -> Result<u8> {
+    parse_df_percent(&session.run_ok("df --output=pcent /", QUICK)?)
+}
+
 /// A lock that a program holds to delay or block shutdown, sleep, etc.: see
 /// systemd-inhibit(1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +227,15 @@ pub fn inhibitors(session: &mut Session) -> Result<Vec<Inhibitor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_df() {
+        assert_eq!(parse_df_percent("Use%\n 45%\n").unwrap(), 45);
+        assert_eq!(parse_df_percent("Use%\n100%\n").unwrap(), 100);
+        assert!(parse_df_percent("Use%\n  -\n").is_err());
+        assert!(parse_df_percent("Use%\n 45%\n 46%\n").is_err());
+        assert!(parse_df_percent("Use%\n101%\n").is_err());
+    }
 
     #[test]
     fn parses_inhibitors() {
