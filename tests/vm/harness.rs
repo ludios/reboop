@@ -1,10 +1,10 @@
 // Model-output: Claude Opus 5.5
 
-//! Builds the test VM (see default.nix), starts it if it isn't already
+//! Builds a test VM (see default.nix), starts it if it isn't already
 //! running, and brings it up to where it accepts SSH connections.
 //!
-//! The VM outlives the test run, so that the next run doesn't have to boot
-//! it; everything about it lives in target/tmp/reboop-vm.  It's replaced
+//! A VM outlives the test run, so that the next run doesn't have to boot it;
+//! everything about it lives in target/tmp/reboop-vm-NAME.  It's replaced
 //! whenever the Nix build produces something different.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -20,23 +20,32 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
-/// The VM's hostname, which is also what ssh calls it.
-pub const HOSTNAME: &str = "reboop-test";
-
 /// manifest.json from the Nix build
 #[derive(Clone, Debug, Deserialize)]
 pub struct Manifest {
-    pub disk_image: PathBuf,
-    pub ovmf_code: PathBuf,
-    pub ovmf_vars: PathBuf,
+    /// The machine's hostname, which is also what ssh calls it
+    pub hostname: String,
+    /// Its disks, which it sees as vda, vdb, and so on
+    pub disk_images: Vec<PathBuf>,
+    /// UEFI firmware, or none to boot from BIOS
+    pub ovmf: Option<Ovmf>,
     pub qemu: PathBuf,
     pub client_key: PathBuf,
     pub host_key_pub: String,
-    pub initrd_key_pub: String,
-    pub luks_password: String,
+    /// The host key of the initrd's sshd, if it has one
+    pub initrd_key_pub: Option<String>,
+    /// The password of its LUKS root, if it has one
+    pub luks_password: Option<String>,
     /// The two NixOS configurations; /etc/reboop-test-variant says which is
     /// which.
     pub systems: TestSystems,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Ovmf {
+    pub code: PathBuf,
+    /// A template for the VM's own copy of the EFI variables
+    pub vars: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -54,12 +63,13 @@ struct State {
     initrd_ssh_port: u16,
 }
 
-/// Builds tests/vm with Nix, returning the result.
-fn build(dir: &Path) -> Result<PathBuf> {
+/// Builds the VM called `name` in tests/vm with Nix, returning the result.
+fn build(dir: &Path, name: &str) -> Result<PathBuf> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vm");
-    eprintln!("building the test VM with nix-build...");
+    eprintln!("building the {name} test VM with nix-build...");
     let output = Command::new("nix-build")
         .arg(&source)
+        .args(["-A", name])
         .arg("--out-link")
         .arg(dir.join("bundle"))
         .stdin(Stdio::null())
@@ -71,11 +81,24 @@ fn build(dir: &Path) -> Result<PathBuf> {
 }
 
 fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
-    eprintln!("starting the test VM...");
-    let vars = dir.join("OVMF_VARS.fd");
-    let _ = fs::remove_file(&vars);
-    fs::copy(&manifest.ovmf_vars, &vars)?;
-    fs::set_permissions(&vars, fs::Permissions::from_mode(0o644))?;
+    eprintln!("starting the {} test VM...", manifest.hostname);
+    let arg = |prefix: &str, path: &Path| format!("{prefix}{}", path.display());
+    let mut command = Command::new(&manifest.qemu);
+    command.args(["-name", &manifest.hostname, "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048"]);
+    if let Some(ovmf) = &manifest.ovmf {
+        let vars = dir.join("OVMF_VARS.fd");
+        let _ = fs::remove_file(&vars);
+        fs::copy(&ovmf.vars, &vars)?;
+        fs::set_permissions(&vars, fs::Permissions::from_mode(0o644))?;
+        command
+            .args(["-drive", &arg("if=pflash,format=raw,unit=0,readonly=on,file=", &ovmf.code)])
+            .args(["-drive", &arg("if=pflash,format=raw,unit=1,file=", &vars)]);
+    }
+    for disk in &manifest.disk_images {
+        // snapshot=on: writes go to a temporary file that's gone when qemu
+        // exits, so each VM starts from the pristine image.
+        command.args(["-drive", &arg("if=virtio,format=qcow2,cache=unsafe,snapshot=on,file=", disk)]);
+    }
 
     // Bind two free ports at once, so they differ, then free them for qemu.
     let listeners = [TcpListener::bind("127.0.0.1:0")?, TcpListener::bind("127.0.0.1:0")?];
@@ -83,14 +106,7 @@ fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
 
     let pidfile = dir.join("qemu.pid");
     let _ = fs::remove_file(&pidfile);
-    let arg = |prefix: &str, path: &Path| format!("{prefix}{}", path.display());
-    let output = Command::new(&manifest.qemu)
-        .args(["-name", "reboop-test", "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048"])
-        .args(["-drive", &arg("if=pflash,format=raw,unit=0,readonly=on,file=", &manifest.ovmf_code)])
-        .args(["-drive", &arg("if=pflash,format=raw,unit=1,file=", &vars)])
-        // snapshot=on: writes go to a temporary file that's gone when qemu
-        // exits, so each VM starts from the pristine image.
-        .args(["-drive", &arg("if=virtio,format=qcow2,cache=unsafe,snapshot=on,file=", &manifest.disk_image)])
+    let output = command
         .args(["-device", "virtio-rng-pci"])
         .args(["-nic", &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:904,hostfwd=tcp:127.0.0.1:{initrd_ssh_port}-:23")])
         .args(["-display", "none", "-monitor", "none"])
@@ -105,10 +121,11 @@ fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
     Ok(State { bundle: bundle.to_path_buf(), pid, ssh_port, initrd_ssh_port })
 }
 
-/// Whether `pid` is our qemu (and not some process that reused its pid).
+/// Whether `pid` is our qemu (and not some process that reused its pid),
+/// going by the console log in `dir` that it writes to.
 fn qemu_is_running(dir: &Path, pid: u32) -> bool {
-    let vars = dir.join("OVMF_VARS.fd").display().to_string();
-    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(&vars))
+    let console = dir.join("console.log").display().to_string();
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(&console))
 }
 
 fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
@@ -142,13 +159,11 @@ fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<Pat
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
 
     let known_hosts = dir.join("known_hosts");
-    fs::write(
-        &known_hosts,
-        format!(
-            "[127.0.0.1]:{} {}\n[127.0.0.1]:{} {}\n",
-            state.ssh_port, manifest.host_key_pub, state.initrd_ssh_port, manifest.initrd_key_pub
-        ),
-    )?;
+    let mut lines = format!("[127.0.0.1]:{} {}\n", state.ssh_port, manifest.host_key_pub);
+    if let Some(initrd_key_pub) = &manifest.initrd_key_pub {
+        lines.push_str(&format!("[127.0.0.1]:{} {initrd_key_pub}\n", state.initrd_ssh_port));
+    }
+    fs::write(&known_hosts, lines)?;
 
     let config = dir.join("ssh_config");
     fs::write(
@@ -183,7 +198,25 @@ btrfs scrub cancel / >/dev/null 2>&1
 exit 0
 "#;
 
-/// The running test VM.
+/// The test VMs, as default.nix calls them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Name {
+    /// systemd-boot from UEFI, and a LUKS root unlocked from the initrd
+    SystemdBoot,
+    /// GRUB from BIOS, mirrored onto two disks, and no LUKS
+    Grub,
+}
+
+impl Name {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Name::SystemdBoot => "systemd-boot",
+            Name::Grub => "grub",
+        }
+    }
+}
+
+/// A running test VM.
 pub struct Vm {
     pub ssh: Ssh,
     /// sshd on the booted system
@@ -197,14 +230,14 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Builds, starts or reuses, and brings up the VM.
-    pub fn get() -> Result<Vm> {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reboop-vm");
+    /// Builds, starts or reuses, and brings up the VM called `name`.
+    pub fn get(name: Name) -> Result<Vm> {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("reboop-vm-{}", name.as_str()));
         fs::create_dir_all(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         lock.lock().context("failed to lock the VM")?;
 
-        let bundle = build(&dir)?;
+        let bundle = build(&dir, name.as_str())?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
         let state_path = dir.join("state.json");
         let old_state: Option<State> = fs::read(&state_path).ok().and_then(|json| serde_json::from_slice(&json).ok());
@@ -222,8 +255,8 @@ impl Vm {
 
         let vm = Vm {
             ssh: Ssh { extra_args: vec!["-F".into(), write_ssh_files(&dir, &manifest, &state)?.display().to_string()] },
-            target: Target { name: HOSTNAME.into(), address: "127.0.0.1".into(), port: state.ssh_port },
-            initrd_target: Target { name: HOSTNAME.into(), address: "127.0.0.1".into(), port: state.initrd_ssh_port },
+            target: Target { name: manifest.hostname.clone(), address: "127.0.0.1".into(), port: state.ssh_port },
+            initrd_target: Target { name: manifest.hostname.clone(), address: "127.0.0.1".into(), port: state.initrd_ssh_port },
             manifest,
             dir,
             _lock: lock,
@@ -240,6 +273,11 @@ impl Vm {
         Session::open(&self.ssh, &self.target, Duration::from_secs(30))
     }
 
+    /// The password of the VM's LUKS root, for tests of VMs that have one.
+    pub fn luks_password(&self) -> Result<&str> {
+        self.manifest.luks_password.as_deref().ok_or_else(|| anyhow!("{} has no LUKS", self.manifest.hostname))
+    }
+
     /// Waits for the VM to accept SSH connections, unlocking its disk if
     /// it's waiting for that.
     fn bring_up(&self) -> Result<()> {
@@ -248,10 +286,12 @@ impl Vm {
             if Session::open(&self.ssh, &self.target, Duration::from_secs(10)).is_ok() {
                 return Ok(());
             }
-            match initrd::unlock(&self.ssh, &self.initrd_target, &self.manifest.luks_password, deadline.at_most(Duration::from_secs(60))) {
-                Ok(_) | Err(UnlockError::Unreachable(_)) => {}
-                Err(UnlockError::Other(error)) if error.downcast_ref::<Permanent>().is_some() => return Err(error),
-                Err(error) => eprintln!("while bringing up the VM: {error}"),
+            if let Some(password) = &self.manifest.luks_password {
+                match initrd::unlock(&self.ssh, &self.initrd_target, password, deadline.at_most(Duration::from_secs(60))) {
+                    Ok(_) | Err(UnlockError::Unreachable(_)) => {}
+                    Err(UnlockError::Other(error)) if error.downcast_ref::<Permanent>().is_some() => return Err(error),
+                    Err(error) => eprintln!("while bringing up the VM: {error}"),
+                }
             }
             ensure!(!deadline.has_passed(), "timed out");
             sleep(Duration::from_secs(1));

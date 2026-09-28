@@ -1,17 +1,17 @@
 // Model-output: Claude Opus 5.5
 
-//! Tests of reboop's primitives against a NixOS VM (configuration.nix) with
-//! a LUKS-encrypted btrfs root.
+//! Tests of reboop against NixOS VMs: systemd-boot.nix, with a LUKS-encrypted
+//! btrfs root, and grub.nix, which boots from BIOS and has no LUKS.
 //!
-//! The VM keeps running after the tests so that later runs start quickly.
-//! To stop it:
+//! The VMs keep running after the tests so that later runs start quickly.
+//! To stop them:
 //!
-//!     kill $(cat target/tmp/reboop-vm/qemu.pid)
+//!     kill $(cat target/tmp/reboop-vm-*/qemu.pid)
 
 mod harness;
 
 use anyhow::{Result, bail, ensure};
-use harness::{Vm, clean_up};
+use harness::{Name, Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::bounce::{self, Outcome, Printer};
 use reboop::btrfs::{self, Device, ScrubState};
@@ -127,7 +127,7 @@ fn unreachable_ports_fail_fast(vm: &Vm) -> Result<()> {
 
 fn identity_and_systems(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    assert_eq!(facts::hostname(&mut session)?, harness::HOSTNAME);
+    assert_eq!(facts::hostname(&mut session)?, vm.manifest.hostname);
     let boot_id = facts::boot_id(&mut session)?;
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
 
@@ -239,7 +239,7 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
 /// really on load.
 fn vm_machine(vm: &Vm) -> Machine {
     Machine {
-        hostname: harness::HOSTNAME.into(),
+        hostname: vm.manifest.hostname.clone(),
         ipv4: Ipv4Addr::LOCALHOST,
         ssh_port: vm.target.port,
         initrd_ssh_port: vm.initrd_target.port,
@@ -258,7 +258,7 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let error = preflight::gather(&mut session, "someone-else").unwrap_err();
     assert!(format!("{error:#}").contains(r#"calls itself "reboop-test", not "someone-else""#), "{error:#}");
     // A fully qualified name for the machine will do.
-    preflight::gather(&mut session, &format!("{}.example.com", harness::HOSTNAME))?;
+    preflight::gather(&mut session, &format!("{}.example.com", vm.manifest.hostname))?;
 
     let machine = vm_machine(vm);
     let facts = preflight::gather(&mut session, &machine.hostname)?;
@@ -470,7 +470,7 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
 fn luks_password_is_tested(vm: &Vm) -> Result<()> {
     assert_eq!(initrd::luks_devices(&mut vm.session()?)?, ["/dev/vda2"]);
     let test = |password| initrd::test_luks_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
-    assert_eq!(test(&vm.manifest.luks_password)?, ("/dev/vda2".into(), true));
+    assert_eq!(test(vm.luks_password()?)?, ("/dev/vda2".into(), true));
     assert_eq!(test("not the password")?, ("/dev/vda2".into(), false));
     Ok(())
 }
@@ -484,7 +484,7 @@ fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
     let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, "not the password", interval, deadline).unwrap_err();
     let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
     ensure!(wrong, "expected the password to be rejected, got: {error:#}");
-    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, &vm.manifest.luks_password, interval, deadline)?;
+    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, vm.luks_password()?, interval, deadline)?;
     eprintln!("answered {prompts:?}");
 
     let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
@@ -496,7 +496,7 @@ fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
 fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let machine = vm_machine(vm);
-    let password = || Ok(vm.manifest.luks_password.clone());
+    let password = || vm.luks_password().map(str::to_string);
     // Bounces the VM, printing what it says, and returns that too.
     let bounce_vm = || -> Result<(Outcome, String)> {
         let mut printed = Vec::new();
@@ -534,6 +534,9 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let (outcome, printed) = bounce_vm()?;
     assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
     assert!(printed.contains("\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n"));
+    if vm.manifest.luks_password.is_none() {
+        assert!(printed.contains("\nThere's no LUKS device beneath /, so there'll be nothing to unlock\n"));
+    }
     let mut session = vm.session()?;
     assert_ne!(facts::boot_id(&mut session)?, boot_id);
     assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Finished);
@@ -544,36 +547,44 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-/// Runs `test` against the VM, which is set up by the first test to run.
-fn run(test: Test) -> Result<(), Failed> {
-    static VM: OnceLock<Result<Vm, String>> = OnceLock::new();
-    let vm = VM.get_or_init(|| Vm::get().map_err(|error| format!("{error:?}"))).as_ref()?;
+/// Runs `test` against the VM called `name`, which is set up by the first
+/// test to run on it.
+fn run(name: Name, test: Test) -> Result<(), Failed> {
+    static SYSTEMD_BOOT: OnceLock<Result<Vm, String>> = OnceLock::new();
+    static GRUB: OnceLock<Result<Vm, String>> = OnceLock::new();
+    let vm = match name {
+        Name::SystemdBoot => &SYSTEMD_BOOT,
+        Name::Grub => &GRUB,
+    };
+    let vm = vm.get_or_init(|| Vm::get(name).map_err(|error| format!("{error:?}"))).as_ref()?;
     test(vm).map_err(|error| format!("{error:?}").into())
 }
 
 fn main() {
     let mut args = Arguments::from_args();
-    // The tests share the VM, and some reboot it.
+    // The tests share the VMs, and some reboot them.
     args.test_threads = Some(1);
-    let tests: &[(&str, Test)] = &[
-        ("session_runs_commands", session_runs_commands),
-        ("session_breaks_on_timeout", session_breaks_on_timeout),
-        ("unreachable_ports_fail_fast", unreachable_ports_fail_fast),
-        ("identity_and_systems", identity_and_systems),
-        ("network_sample_sees_traffic", network_sample_sees_traffic),
-        ("activities_are_detected", activities_are_detected),
-        ("preflight_finds_blockers", preflight_finds_blockers),
-        ("btrfs_root_is_idle", btrfs_root_is_idle),
-        ("btrfs_missing_device_is_detected", btrfs_missing_device_is_detected),
-        ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
-        ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
-        ("scrub_finds_corruption", scrub_finds_corruption),
-        ("stop_unit", stop_unit),
-        ("postflight_facts", postflight_facts),
-        ("luks_password_is_tested", luks_password_is_tested),
-        ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
-        ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
+    use Name::{Grub, SystemdBoot};
+    let tests: &[(&str, Name, Test)] = &[
+        ("session_runs_commands", SystemdBoot, session_runs_commands),
+        ("session_breaks_on_timeout", SystemdBoot, session_breaks_on_timeout),
+        ("unreachable_ports_fail_fast", SystemdBoot, unreachable_ports_fail_fast),
+        ("identity_and_systems", SystemdBoot, identity_and_systems),
+        ("network_sample_sees_traffic", SystemdBoot, network_sample_sees_traffic),
+        ("activities_are_detected", SystemdBoot, activities_are_detected),
+        ("preflight_finds_blockers", SystemdBoot, preflight_finds_blockers),
+        ("btrfs_root_is_idle", SystemdBoot, btrfs_root_is_idle),
+        ("btrfs_missing_device_is_detected", SystemdBoot, btrfs_missing_device_is_detected),
+        ("btrfs_running_scrub_and_balance_are_detected", SystemdBoot, btrfs_running_scrub_and_balance_are_detected),
+        ("scrub_of_root_finishes_clean", SystemdBoot, scrub_of_root_finishes_clean),
+        ("scrub_finds_corruption", SystemdBoot, scrub_finds_corruption),
+        ("stop_unit", SystemdBoot, stop_unit),
+        ("postflight_facts", SystemdBoot, postflight_facts),
+        ("luks_password_is_tested", SystemdBoot, luks_password_is_tested),
+        ("reboot_with_wrong_password_first", SystemdBoot, reboot_with_wrong_password_first),
+        ("bounce_into_new_default_configuration", SystemdBoot, bounce_into_new_default_configuration),
+        ("grub_bounce_into_new_default_configuration", Grub, bounce_into_new_default_configuration),
     ];
-    let trials = tests.iter().map(|&(name, test)| Trial::test(name, move || run(test))).collect();
+    let trials = tests.iter().map(|&(name, vm, test)| Trial::test(name, move || run(vm, test))).collect();
     libtest_mimic::run(&args, trials).exit();
 }

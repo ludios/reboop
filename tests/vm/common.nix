@@ -1,14 +1,16 @@
 # Model-output: Claude Opus 5.5
 #
-# The NixOS machine that reboop's VM tests run against.  It resembles the real
-# machines where that matters (a LUKS-encrypted btrfs root unlocked over SSH
-# from a systemd initrd on port 23, sshd on port 904, zsh as root's shell) and
-# is otherwise stripped down to boot quickly.
+# What the NixOS machines that reboop's VM tests run against have in common
+# (see systemd-boot.nix and grub.nix for the machines themselves).  They
+# resemble the real machines where that matters (a btrfs root, a systemd
+# initrd, sshd on port 904, zsh as root's shell) and are otherwise stripped
+# down to boot quickly.
 #
 # `variant` is "base" or "alt", two configurations for tests to switch
 # between.  They'd ideally differ in their kernel too, but any second kernel
 # means compiling one (and linux 6.12 doesn't build with this GCC anyway).
-{ lib, pkgs, modulesPath, variant, sshKeys, ... }:
+# `hostname` is the machine's, which default.nix also tells the tests.
+{ lib, pkgs, modulesPath, variant, hostname, sshKeys, ... }:
 
 {
   imports = [
@@ -18,48 +20,18 @@
 
   system.stateVersion = "26.05";
 
-  networking.hostName = "reboop-test";
+  networking.hostName = hostname;
 
   environment.etc."reboop-test-variant".text = variant;
 
   # The kernel the real machines run, so it's already built.
   boot.kernelPackages = pkgs.linuxPackages_6_18;
 
-  boot.loader = {
-    systemd-boot.enable = true;
-    systemd-boot.configurationLimit = 4;
-    # The image builder has no EFI variables to write to; OVMF boots the
-    # removable-media path \EFI\BOOT\BOOTX64.EFI that bootctl installs.
-    efi.canTouchEfiVariables = false;
-    timeout = 0;
-  };
+  boot.loader.timeout = 0;
 
   boot.kernelParams = [ "console=ttyS0" ];
 
-  boot.initrd = {
-    systemd.enable = true;
-
-    luks.devices.root = {
-      device = "/dev/disk/by-partlabel/root";
-      allowDiscards = true;
-    };
-
-    network = {
-      enable = true;
-      ssh = {
-        enable = true;
-        port = 23;
-        # The initrd and stage 2 deliberately have different host keys.
-        hostKeys = [ sshKeys.snakeOilPrivateKey ];
-        authorizedKeys = [ sshKeys.snakeOilEd25519PublicKey ];
-      };
-    };
-  };
-
-  fileSystems = {
-    "/"     = { device = "/dev/mapper/root";           fsType = "btrfs"; options = [ "noatime" "compress=zstd" ]; };
-    "/boot" = { device = "/dev/disk/by-partlabel/ESP"; fsType = "vfat";  options = [ "umask=0077" ]; };
-  };
+  boot.initrd.systemd.enable = true;
 
   networking = {
     useNetworkd = true;
