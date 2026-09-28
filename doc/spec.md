@@ -52,6 +52,9 @@ Managing LUKS keys:
     - Network bytes in / out over 5 seconds
     - Load average over the last minute
     - The IPv4 IP address (WAN) of the machine
+    - The NixOS configuration we're currently on
+    - The Linux kernel we're currenty on
+    - The NixOS configuration and kernel we expect to boot into by default
 
 2. Decide whether the machine is okay to reboot.
 
@@ -107,6 +110,10 @@ Managing LUKS keys:
     dmesg -l err,crit,alert,emerg
 
     systemctl --failed
+
+    Whether we booted into the NixOS configuration we expected
+
+    Whether we booted into the Linux kernel we expected
 
 4. Run:
 
