@@ -109,18 +109,20 @@ pub fn scrub_status(session: &mut Session, mountpoint: &str) -> Result<ScrubStat
     parse_scrub_status(&summary, &raw)
 }
 
-/// Parses the output of `btrfs scrub status --raw` (`summary`, which has
-/// sizes in bytes) and `btrfs scrub status -R` (`raw`, which has counters).
+/// Parses the output of `btrfs scrub status --raw` (`summary`, with sizes in
+/// bytes) and `btrfs scrub status -R` (`raw`, with counters).  The state and
+/// counters come from `raw`, so they agree even if the scrub moved on between
+/// the two commands; `summary` only provides progress estimates.
 fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     let context = || format!("unexpected btrfs scrub status output:\n{summary}\n{raw}");
-    let fields = colon_fields(summary);
-    let counters = colon_fields(raw);
+    let estimates = colon_fields(summary);
+    let fields = colon_fields(raw);
     let counter = |name: &str| -> Result<u64> {
-        let value = counters.get(name).ok_or_else(|| anyhow!("no {name}"))?;
+        let value = fields.get(name).ok_or_else(|| anyhow!("no {name}"))?;
         Ok(value.parse()?)
     };
-    let number = |name: &str, suffix: &str| -> Result<Option<u64>> {
-        let Some(value) = fields.get(name) else { return Ok(None) };
+    let estimate = |name: &str, suffix: &str| -> Result<Option<u64>> {
+        let Some(value) = estimates.get(name) else { return Ok(None) };
         let digits = value.split(suffix).next().unwrap_or_default();
         Ok(Some(digits.parse().with_context(|| format!("{name}: {value:?}"))?))
     };
@@ -130,7 +132,7 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
         Some("finished") => ScrubState::Finished,
         Some("aborted") => ScrubState::Aborted,
         Some("interrupted") => ScrubState::Interrupted,
-        None if summary.contains("no stats available") => ScrubState::NeverRan,
+        None if raw.contains("no stats available") => ScrubState::NeverRan,
         other => bail!("unknown scrub state {other:?}\n{}", context()),
     };
     let mut errors = BTreeMap::new();
@@ -140,9 +142,7 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
             errors.insert(name.to_string(), count);
         }
     }
-    let error_summary = fields.get("Error summary").ok_or_else(|| anyhow!("no error summary")).with_context(context)?;
-    ensure!(errors.is_empty() == (error_summary == "no errors found"), "error counters disagree with the summary\n{}", context());
-    let seconds_left = match fields.get("Time left") {
+    let seconds_left = match estimates.get("Time left") {
         Some(time) => Some(parse_hms(time).with_context(context)?),
         None => None,
     };
@@ -150,9 +150,9 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     Ok(ScrubStatus {
         state,
         started: fields.get("Scrub started").or(fields.get("Scrub resumed")).cloned(),
-        total_bytes: number("Total to scrub", " ").with_context(context)?,
-        scrubbed_bytes: (counter("data_bytes_scrubbed")? + counter("tree_bytes_scrubbed")?),
-        bytes_per_sec: number("Rate", "/s").with_context(context)?,
+        total_bytes: estimate("Total to scrub", " ").with_context(context)?,
+        scrubbed_bytes: counter("data_bytes_scrubbed").with_context(context)? + counter("tree_bytes_scrubbed").with_context(context)?,
+        bytes_per_sec: estimate("Rate", "/s").with_context(context)?,
         seconds_left,
         errors,
     })
@@ -180,15 +180,22 @@ pub fn start_scrub(session: &mut Session, mountpoint: &str, timeout: Duration) -
     let before = scrub_status(session, mountpoint)?;
     ensure!(before.state != ScrubState::Running, "a scrub is already running on {mountpoint}");
     session.run_ok(&format!("btrfs scrub start -- {}", shell_quote(mountpoint)), QUICK)?;
-    while scrub_status(session, mountpoint)?.started == before.started {
+    // For a moment, the new scrub has "no stats available".  (Start times
+    // are to the second, so a scrub that started and ended within the same
+    // second as this one would fool us, but that's no real filesystem.)
+    loop {
+        let started = scrub_status(session, mountpoint)?.started;
+        if started.is_some() && started != before.started {
+            return Ok(());
+        }
         ensure!(!deadline.has_passed(), "the scrub of {mountpoint} didn't start");
         sleep(Duration::from_millis(200));
     }
-    Ok(())
 }
 
-/// Checks the scrub of `mountpoint` every `interval`, passing each status to
-/// `progress`, until it's no longer running, then returns its final status.
+/// Checks the scrub of `mountpoint` that [`start_scrub`] started every
+/// `interval`, passing each status to `progress`, until it has ended, then
+/// returns its final status.
 pub fn wait_for_scrub(
     session: &mut Session,
     mountpoint: &str,
@@ -199,7 +206,8 @@ pub fn wait_for_scrub(
     loop {
         let status = scrub_status(session, mountpoint)?;
         progress(&status);
-        if status.state != ScrubState::Running {
+        // NeverRan can briefly show up while a scrub is starting.
+        if !matches!(status.state, ScrubState::Running | ScrubState::NeverRan) {
             return Ok(status);
         }
         ensure!(!deadline.has_passed(), "the scrub of {mountpoint} is still running at the deadline");
@@ -320,13 +328,21 @@ mod tests {
     }
 
     #[test]
-    fn refuses_missing_counters_and_disagreements() {
-        let summary = "Status:           finished\nTotal to scrub:   1000\nRate:             10/s\nError summary:    no errors found\n";
+    fn refuses_missing_counters_and_unknown_states() {
+        let summary = "Total to scrub:   1000\nRate:             10/s\nError summary:    no errors found\n";
         let without_csum = RAW_COUNTERS.replace("\tcsum_errors: 0\n", "");
         assert!(parse_scrub_status(summary, &raw("x", "finished", &without_csum)).is_err());
-        let with_errors = RAW_COUNTERS.replace("read_errors: 0", "read_errors: 1");
-        assert!(parse_scrub_status(summary, &raw("x", "finished", &with_errors)).is_err());
-        assert!(parse_scrub_status(&summary.replace("finished", "exploded"), &raw("x", "finished", RAW_COUNTERS)).is_err());
+        assert!(parse_scrub_status(summary, &raw("x", "exploded", RAW_COUNTERS)).is_err());
+    }
+
+    #[test]
+    fn takes_state_and_errors_from_the_same_output() {
+        // The scrub found an error between the two commands.
+        let summary = "Status:           running\nTotal to scrub:   1000\nRate:             10/s\nError summary:    no errors found\n";
+        let counters = RAW_COUNTERS.replace("csum_errors: 0", "csum_errors: 1");
+        let status = parse_scrub_status(summary, &raw("x", "finished", &counters)).unwrap();
+        assert_eq!(status.state, ScrubState::Finished);
+        assert_eq!(status.errors, BTreeMap::from([("csum_errors".into(), 1)]));
     }
 
     #[test]
