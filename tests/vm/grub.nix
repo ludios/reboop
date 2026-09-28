@@ -8,11 +8,9 @@
 {
   imports = [ ./common.nix ];
 
+  # With a separate /boot, NixOS copies the kernels there.
   boot.loader.grub = {
     enable = true;
-    # Each /boot has its own copy of the kernels, so GRUB needn't read the
-    # store off the btrfs RAID1.
-    copyKernels = true;
     mirroredBoots = [
       { devices = [ "/dev/vda" ]; path = "/boot"; }
       { devices = [ "/dev/vdb" ]; path = "/boot-fallback"; }

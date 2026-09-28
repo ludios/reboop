@@ -32,10 +32,8 @@ pub struct Manifest {
     pub qemu: PathBuf,
     pub client_key: PathBuf,
     pub host_key_pub: String,
-    /// The host key of the initrd's sshd, if it has one
-    pub initrd_key_pub: Option<String>,
-    /// The password of its LUKS root, if it has one
-    pub luks_password: Option<String>,
+    /// The initrd's sshd, if the machine's root is on LUKS
+    pub initrd: Option<Initrd>,
     /// The two NixOS configurations; /etc/reboop-test-variant says which is
     /// which.
     pub systems: TestSystems,
@@ -46,6 +44,13 @@ pub struct Ovmf {
     pub code: PathBuf,
     /// A template for the VM's own copy of the EFI variables
     pub vars: PathBuf,
+}
+
+/// The sshd in a machine's initrd, for unlocking its LUKS root.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Initrd {
+    pub host_key_pub: String,
+    pub luks_password: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,11 +81,15 @@ fn build(dir: &Path, name: &str) -> Result<PathBuf> {
         .stderr(Stdio::inherit())
         .output()
         .context("failed to run nix-build")?;
-    ensure!(output.status.success(), "nix-build {} failed", source.display());
+    ensure!(output.status.success(), "nix-build {} -A {name} failed", source.display());
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
 }
 
+/// Starts qemu in the background with what `manifest` (from the Nix build
+/// `bundle`) describes, logging its console to `dir`.  Returns what to
+/// remember about it: see [`State`].
 fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
+    ensure!(!manifest.disk_images.is_empty(), "{} has no disks to boot", manifest.hostname);
     eprintln!("starting the {} test VM...", manifest.hostname);
     let arg = |prefix: &str, path: &Path| format!("{prefix}{}", path.display());
     let mut command = Command::new(&manifest.qemu);
@@ -132,7 +141,7 @@ fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
     if !qemu_is_running(dir, pid) {
         return Ok(());
     }
-    eprintln!("stopping the old test VM...");
+    eprintln!("stopping the old test VM in {}...", dir.display());
     let pid = libc::pid_t::try_from(pid)?;
     unsafe { libc::kill(pid, libc::SIGTERM) };
     for _ in 0..100 {
@@ -160,8 +169,8 @@ fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<Pat
 
     let known_hosts = dir.join("known_hosts");
     let mut lines = format!("[127.0.0.1]:{} {}\n", state.ssh_port, manifest.host_key_pub);
-    if let Some(initrd_key_pub) = &manifest.initrd_key_pub {
-        lines.push_str(&format!("[127.0.0.1]:{} {initrd_key_pub}\n", state.initrd_ssh_port));
+    if let Some(initrd) = &manifest.initrd {
+        lines.push_str(&format!("[127.0.0.1]:{} {}\n", state.initrd_ssh_port, initrd.host_key_pub));
     }
     fs::write(&known_hosts, lines)?;
 
@@ -268,7 +277,8 @@ impl Vm {
         if let Err(error) = vm.bring_up() {
             // Don't leave a broken VM for the next run.
             let _ = stop_qemu(&vm.dir, state.pid);
-            return Err(error.context(format!("the VM didn't come up; see {}", vm.dir.join("console.log").display())));
+            let console = vm.dir.join("console.log");
+            return Err(error.context(format!("{} didn't come up; see {}", vm.manifest.hostname, console.display())));
         }
         Ok(vm)
     }
@@ -279,7 +289,8 @@ impl Vm {
 
     /// The password of the VM's LUKS root, for tests of VMs that have one.
     pub fn luks_password(&self) -> Result<&str> {
-        self.manifest.luks_password.as_deref().ok_or_else(|| anyhow!("{} has no LUKS", self.manifest.hostname))
+        let initrd = self.manifest.initrd.as_ref().ok_or_else(|| anyhow!("{} has no LUKS", self.manifest.hostname))?;
+        Ok(&initrd.luks_password)
     }
 
     /// Waits for the VM to accept SSH connections, unlocking its disk if
@@ -290,8 +301,8 @@ impl Vm {
             if Session::open(&self.ssh, &self.target, Duration::from_secs(10)).is_ok() {
                 return Ok(());
             }
-            if let Some(password) = &self.manifest.luks_password {
-                match initrd::unlock(&self.ssh, &self.initrd_target, password, deadline.at_most(Duration::from_secs(60))) {
+            if let Some(initrd) = &self.manifest.initrd {
+                match initrd::unlock(&self.ssh, &self.initrd_target, &initrd.luks_password, deadline.at_most(Duration::from_secs(60))) {
                     Ok(_) | Err(UnlockError::Unreachable(_)) => {}
                     Err(UnlockError::Other(error)) if error.downcast_ref::<Permanent>().is_some() => return Err(error),
                     Err(error) => eprintln!("while bringing up the VM: {error}"),

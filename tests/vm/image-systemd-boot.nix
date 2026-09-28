@@ -1,15 +1,10 @@
 # Model-output: Claude Opus 5.5
 #
-# A qcow2 disk image with a GPT, an ESP with systemd-boot, and a LUKS2
-# partition holding a btrfs root.  `base` is installed as the system profile
-# (and so is the default boot entry); `alt` is only copied into the store, for
-# tests to switch to.
-{ pkgs, qemuBinary, base, alt, lukspassword }:
+# A qcow2 disk image for systemd-boot.nix with a GPT, an ESP with
+# systemd-boot, and a LUKS2 partition holding a btrfs root.  `install` (from
+# default.nix) installs the systems onto it.
+{ pkgs, vmTools, install, lukspassword }:
 
-let
-  closure = pkgs.closureInfo { rootPaths = [ base alt ]; };
-  vmTools = pkgs.vmTools.override { customQemu = qemuBinary; };
-in
 vmTools.runInLinuxVM (
   pkgs.runCommand "reboop-test-image"
     {
@@ -57,21 +52,11 @@ vmTools.runInLinuxVM (
       mkdir /mnt/boot
       mount /dev/vda1 /mnt/boot
 
-      export HOME=$TMPDIR
-      export NIX_STATE_DIR=$TMPDIR/state
-      nix-store --load-db < ${closure}/registration
-
-      nixos-install --root /mnt --no-bootloader --no-root-passwd --no-channel-copy \
-        --system ${base} --substituters ""
-      nix --extra-experimental-features nix-command copy --no-check-sigs --to /mnt ${alt}
-      ln -s ${alt} /mnt/nix/var/nix/gcroots/reboop-test-alt
-
       # bootctl finds the ESP's partition through /dev/block/MAJOR:MINOR.
       mkdir -p /dev/block
       ln -s /dev/vda1 /dev/block/$(cat /sys/class/block/vda1/dev)
-      # Without the build's NIX_STATE_DIR and HOME, which would leave files in /tmp.
-      env -u NIX_STATE_DIR HOME=/root NIXOS_INSTALL_BOOTLOADER=1 nixos-enter --root /mnt -- \
-        /nix/var/nix/profiles/system/bin/switch-to-configuration boot
+
+      ${install}
 
       umount -R /mnt
       cryptsetup close root

@@ -2,15 +2,10 @@
 #
 # Two qcow2 disk images for grub.nix, each with a GPT, a BIOS boot partition
 # for GRUB, an ext4 /boot of its own (boot-1 for /boot, boot-2 for
-# /boot-fallback), and half of a btrfs RAID1 root.  `base` is installed as
-# the system profile (and so is GRUB's default entry); `alt` is only copied
-# into the store, for tests to switch to.
-{ pkgs, qemuBinary, base, alt }:
+# /boot-fallback), and half of a btrfs RAID1 root.  `install` (from
+# default.nix) installs the systems onto them.
+{ pkgs, vmTools, install }:
 
-let
-  closure = pkgs.closureInfo { rootPaths = [ base alt ]; };
-  vmTools = pkgs.vmTools.override { customQemu = qemuBinary; };
-in
 vmTools.runInLinuxVM (
   pkgs.runCommand "reboop-test-grub-image"
     {
@@ -25,13 +20,13 @@ vmTools.runInLinuxVM (
       preVM = ''
         mkdir $out
         diskImage=$(pwd)/disk-1.raw
-        truncate -s 8G $diskImage disk-2.raw
-        QEMU_OPTS+=" -drive file=$(pwd)/disk-2.raw,if=virtio,cache=unsafe,werror=report"
+        diskImage2=$(pwd)/disk-2.raw
+        truncate -s 8G $diskImage $diskImage2
+        QEMU_OPTS+=" -drive file=$diskImage2,if=virtio,cache=unsafe,werror=report"
       '';
       postVM = ''
-        for i in 1 2; do
-          ${pkgs.qemu_test}/bin/qemu-img convert -f raw -O qcow2 disk-$i.raw $out/disk-$i.qcow2
-        done
+        ${pkgs.qemu_test}/bin/qemu-img convert -f raw -O qcow2 $diskImage $out/disk-1.qcow2
+        ${pkgs.qemu_test}/bin/qemu-img convert -f raw -O qcow2 $diskImage2 $out/disk-2.qcow2
       '';
     }
     ''
@@ -56,18 +51,7 @@ vmTools.runInLinuxVM (
       mount /dev/vda2 /mnt/boot
       mount /dev/vdb2 /mnt/boot-fallback
 
-      export HOME=$TMPDIR
-      export NIX_STATE_DIR=$TMPDIR/state
-      nix-store --load-db < ${closure}/registration
-
-      nixos-install --root /mnt --no-bootloader --no-root-passwd --no-channel-copy \
-        --system ${base} --substituters ""
-      nix --extra-experimental-features nix-command copy --no-check-sigs --to /mnt ${alt}
-      ln -s ${alt} /mnt/nix/var/nix/gcroots/reboop-test-alt
-
-      # Without the build's NIX_STATE_DIR and HOME, which would leave files in /tmp.
-      env -u NIX_STATE_DIR HOME=/root NIXOS_INSTALL_BOOTLOADER=1 nixos-enter --root /mnt -- \
-        /nix/var/nix/profiles/system/bin/switch-to-configuration boot
+      ${install}
 
       umount -R /mnt
     ''
