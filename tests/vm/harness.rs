@@ -5,7 +5,8 @@
 //!
 //! A VM outlives the test run, so that the next run doesn't have to boot it;
 //! everything about it lives in target/tmp/reboop-vm-NAME.  It's replaced
-//! whenever the Nix build produces something different.
+//! whenever the Nix build produces something different, and stopped once no
+//! run has used it for three hours.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use reboop::deadline::{Deadline, Permanent};
@@ -18,7 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// manifest.json from the Nix build
 #[derive(Clone, Debug, Deserialize)]
@@ -158,6 +159,52 @@ fn stop_qemu(dir: &Path, pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// How long a VM keeps running after the last test run that used it.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// Runs for as long as the qemu with pid $1 and console log $2 does, and
+/// stops it once no test run has held the VM's lock $3 for $4 seconds.  The
+/// lock's mtime is when the VM was last seen in use: runs set it when they
+/// take the lock, and so does this whenever it finds the lock taken.
+///
+/// It goes by the lock file it opened, so that a VM whose directory has been
+/// deleted, and which nothing can find anymore, is stopped too.
+const WATCHDOG: &str = r#"
+pid=$1 console=$2 idle_secs=$4
+running() { grep -qF -- "$console" "/proc/$pid/cmdline" 2>/dev/null; }
+exec 9<"$3"
+while sleep 60 && running; do
+    if ! flock -n 9; then
+        touch /dev/fd/9
+    elif [ $(( $(date +%s) - $(stat -L -c %Y /dev/fd/9) )) -ge "$idle_secs" ]; then
+        # Holding the lock until qemu is gone, so that no run starts using it.
+        echo "$(date): stopping qemu (pid $pid), unused for $idle_secs seconds" >&2
+        kill "$pid"
+        for _ in $(seq 100); do running || exit 0; sleep 0.1; done
+        kill -KILL "$pid"
+        exit 0
+    fi
+    flock -u 9
+done
+"#;
+
+/// Starts [`WATCHDOG`] for the VM's qemu, `pid`, in a session of its own, so
+/// that it outlives the test run and a Ctrl-C of it.
+fn start_watchdog(dir: &Path, pid: u32) -> Result<()> {
+    Command::new("setsid")
+        .args(["sh", "-c", WATCHDOG, "sh"])
+        .arg(pid.to_string())
+        .arg(dir.join("console.log"))
+        .arg(dir.join("lock"))
+        .arg(IDLE_TIMEOUT.as_secs().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(dir.join("watchdog.log"))?)
+        .spawn()
+        .context("failed to start the VM's watchdog")?;
+    Ok(())
+}
+
 /// Writes the client key, known_hosts and an ssh config that uses them (and
 /// nothing from the user's own ssh setup), returning the config's path.
 fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<PathBuf> {
@@ -251,6 +298,8 @@ impl Vm {
         fs::create_dir_all(&dir)?;
         let lock = File::create(dir.join("lock"))?;
         lock.lock().context("failed to lock the VM")?;
+        // For the watchdog: see WATCHDOG.
+        lock.set_modified(SystemTime::now())?;
 
         let bundle = build(&dir, name.as_str())?;
         let manifest: Manifest = serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
@@ -264,6 +313,7 @@ impl Vm {
                 }
                 let state = start_qemu(&dir, &bundle, &manifest)?;
                 fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+                start_watchdog(&dir, state.pid)?;
                 state
             }
         };
