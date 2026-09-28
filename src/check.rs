@@ -5,7 +5,7 @@
 
 use crate::btrfs::ScrubState;
 use crate::config::{self, Machine};
-use crate::human;
+use crate::human::{self, Cell, Style::{Bold, Gray, Green, Plain, Red}};
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
@@ -25,20 +25,22 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     Ok((facts, blockers))
 }
 
-const HEADER: [&str; 11] = ["machine", "okay", "scrub", "btrfs op", "nix", "switch", "tmux", "rsync", "net", "load", "kernel"];
+const HEADER: [&str; 11] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "KERNEL"];
 
 /// The table row about `machine`: the facts that decide whether to reboot
-/// it, and the kernel it runs (and the one it would boot, if different).
-fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<String> {
+/// it, red where they block a reboot, and the kernel it runs (and the one it
+/// would boot, if different).
+fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let Ok((facts, blockers)) = outcome else {
-        let mut row = vec![machine.hostname.clone(), "ERROR".into()];
-        row.resize(HEADER.len(), String::new());
+        let mut row = vec![Plain.cell(machine.hostname.clone()), Red.cell("error")];
+        row.resize(HEADER.len(), Plain.cell(""));
         return row;
     };
-    let list = |items: Vec<&str>| if items.is_empty() { "-".to_string() } else { items.join(",") };
+    let list = |items: Vec<&str>| if items.is_empty() { Gray.cell("-") } else { Red.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
-    let count = |activity| facts.busy_processes.get(&activity).map_or("-".to_string(), |processes| processes.len().to_string());
+    let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
+    let red_or_green = |red: bool, text: String| if red { Red.cell(text) } else { Green.cell(text) };
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
         systems.running_kernel.clone()
@@ -46,27 +48,28 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<String> {
         format!("{} → {}", systems.running_kernel, systems.default_kernel)
     };
     vec![
-        machine.hostname.clone(),
-        if blockers.is_empty() { "yes" } else { "NO" }.into(),
+        Plain.cell(machine.hostname.clone()),
+        if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
         list(scrubbing.collect()),
         list(operations.into_iter().collect()),
         count(Activity::Nix),
         count(Activity::SwitchToConfiguration),
         count(Activity::Tmux),
         count(Activity::Rsync),
-        human::rate(facts.network_bytes_per_sec),
-        format!("{:.2}", facts.load_average_1min),
-        kernel,
+        red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
+        red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
+        Plain.cell(kernel),
     ]
 }
 
 /// A table with a row per machine, followed by a line per reason not to
 /// reboot a machine and per machine that couldn't be checked (with any
 /// further lines of the error indented), a blank line before each machine's.
-fn table(outcomes: &[(&Machine, Outcome)]) -> String {
-    let mut rows = vec![HEADER.map(String::from).to_vec()];
+/// The table is styled if `color`.
+fn table(outcomes: &[(&Machine, Outcome)], color: bool) -> String {
+    let mut rows = vec![HEADER.map(|title| Bold.cell(title)).to_vec()];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
-    let mut text = human::table(&rows);
+    let mut text = human::table(&rows, color);
 
     for (machine, outcome) in outcomes {
         let details: Vec<String> = match outcome {
@@ -149,7 +152,7 @@ pub fn run(hostnames: &[String], json: bool) -> Result<u8> {
         let reports: Vec<_> = outcomes.iter().map(|(machine, outcome)| json_report(machine, outcome)).collect();
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
-        print!("{}", table(&outcomes));
+        print!("{}", table(&outcomes, human::color_stdout()));
     }
     Ok(exit_status(&outcomes))
 }
@@ -162,12 +165,16 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::{Value, json};
 
+    /// Facts about [`test_machine`] with a balance, a tmux, and too much
+    /// network traffic and load.
     fn blocked_facts() -> Facts {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
         facts.btrfs[0].exclusive_operation = "balance".into();
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
+        facts.network_bytes_per_sec = 1_500_000.0;
+        facts.load_average_1min = 2.5;
         facts
     }
 
@@ -175,22 +182,28 @@ mod tests {
     fn tables() {
         let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }, Machine { hostname: "three".into(), ..test_machine() }];
         let outcomes = [
-            (&machines[0], Ok((blocked_facts(), vec!["btrfs on /: balance".into(), "tmux: pid 1234 (at): tmux new -s work".into()]))),
+            (&machines[0], Ok((blocked_facts(), preflight::blockers(&machines[0], &blocked_facts())))),
             (&machines[1], Ok((idle_facts(), vec![]))),
             (&machines[2], Err(anyhow!("no route to host\nsecond line").context("failed to open a session"))),
         ];
         assert_eq!(
-            table(&outcomes),
-            "machine  okay   scrub  btrfs op  nix  switch  tmux  rsync  net       load  kernel\n\
-             one      NO     -      balance   -    -       1     -      1.00kB/s  0.50  6.18.54 → 6.18.55\n\
+            table(&outcomes, false),
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  6.18.54 → 6.18.55\n\
              two      yes    -      -         -    -       -     -      1.00kB/s  0.50  6.18.54\n\
-             three    ERROR\n\
+             three    error\n\
              \n\
              one: btrfs on /: balance\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
+             one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
+             one: load average: 2.50 is over the limit of 2\n\
              \n\
              three: failed to open a session: no route to host\n    second line\n"
         );
+        let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Gray, Red, Gray, Gray, Red, Gray, Red, Red, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Gray, Gray, Gray, Gray, Gray, Gray, Green, Green, Plain]);
+        assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert_eq!(exit_status(&outcomes[..2]), 2);
         assert_eq!(exit_status(&outcomes[1..2]), 0);

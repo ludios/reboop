@@ -78,6 +78,18 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     })
 }
 
+/// Whether `facts` show more network traffic than `machine` allows for a
+/// reboot.
+pub fn network_over_limit(machine: &Machine, facts: &Facts) -> bool {
+    facts.network_bytes_per_sec > machine.max_network_transfer_bytes_per_sec as f64
+}
+
+/// Whether `facts` show a higher load average than `machine` allows for a
+/// reboot.
+pub fn load_over_limit(machine: &Machine, facts: &Facts) -> bool {
+    facts.load_average_1min > machine.max_load_average_1min
+}
+
 /// The reasons not to reboot `machine`, given `facts` about it, one line
 /// each for people.  Empty if it's okay to reboot.
 pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
@@ -108,12 +120,11 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
             more => blockers.push(format!("{activity}: {more} more processes")),
         }
     }
-    let max_network = machine.max_network_transfer_bytes_per_sec as f64;
-    if facts.network_bytes_per_sec > max_network {
-        let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(max_network));
+    if network_over_limit(machine, facts) {
+        let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(machine.max_network_transfer_bytes_per_sec as f64));
         blockers.push(format!("network: {rate} is over the limit of {limit}"));
     }
-    if facts.load_average_1min > machine.max_load_average_1min {
+    if load_over_limit(machine, facts) {
         blockers.push(format!("load average: {:.2} is over the limit of {}", facts.load_average_1min, machine.max_load_average_1min));
     }
     blockers
