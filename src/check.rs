@@ -233,9 +233,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET        LOAD   ROOT  OTHER                                   KERNEL\n\
-             one      no     -      balance   -    -       1     -      12.50MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -       1.00kB/s   0.50   45%  -                                       6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET         LOAD   ROOT  OTHER                                   KERNEL\n\
+             one      no     -      balance   -    -       1     -      12.50 MB/s  12.50   98%  cryptsetup,btrfs device,inhibitor,jobs  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -       1.00 kB/s   0.50   45%  -                                       6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -244,7 +244,7 @@ mod tests {
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: systemd job: start nixos-upgrade.service (running) for 5s or more\n\
-             one: network: 12.50MB/s is over the limit of 1.00MB/s\n\
+             one: network: 12.50 MB/s is over the limit of 1.00 MB/s\n\
              one: load average: 12.50 is over the limit of 2\n\
              one: root filesystem: 98% used, and it's full at 97%\n\
              \n\

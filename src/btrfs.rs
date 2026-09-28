@@ -313,8 +313,8 @@ pub fn wait_for_scrub(
 }
 
 impl ScrubStatus {
-    /// One line for people, e.g. "scrub has 3m 30s left, 130.50GB of
-    /// 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found".
+    /// One line for people, e.g. "scrub has 3m 30s left, 130.50 GB of
+    /// 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found".
     pub fn summary(&self) -> String {
         let scrubbed = human::bytes(self.scrubbed_bytes);
         let errors = if self.errors.is_empty() {
@@ -371,7 +371,7 @@ mod tests {
                 errors: BTreeMap::new(),
             }
         );
-        assert_eq!(status.summary(), "scrub has 3m 30s left, 130.50GB of 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found");
+        assert_eq!(status.summary(), "scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found");
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(status.state, ScrubState::Finished);
         assert_eq!(status.seconds_left, None);
         assert_eq!(status.errors, BTreeMap::from([("csum_errors".into(), 3), ("uncorrectable_errors".into(), 3)]));
-        assert_eq!(status.summary(), "scrub finished, 130.50GB scrubbed, ERRORS FOUND: csum_errors=3 uncorrectable_errors=3");
+        assert_eq!(status.summary(), "scrub finished, 130.50 GB scrubbed, ERRORS FOUND: csum_errors=3 uncorrectable_errors=3");
     }
 
     #[test]

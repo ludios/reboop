@@ -2,11 +2,11 @@
 
 //! Formatting quantities and tables for people.
 
-/// Formats a byte count with SI units, e.g. "130.50GB".
+/// Formats a byte count with SI units, e.g. "130.50 GB".
 pub fn bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
     if bytes < 1000 {
-        return format!("{bytes}B");
+        return format!("{bytes} B");
     }
     let mut value = bytes as f64;
     let mut unit = "B";
@@ -18,10 +18,10 @@ pub fn bytes(bytes: u64) -> String {
         value /= 1000.0;
         unit = next;
     }
-    format!("{value:.2}{unit}")
+    format!("{value:.2} {unit}")
 }
 
-/// Formats a rate in bytes per second, e.g. "1.39GB/s".
+/// Formats a rate in bytes per second, e.g. "1.39 GB/s".
 pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", bytes(bytes_per_sec.round() as u64))
 }
@@ -137,12 +137,12 @@ mod tests {
 
     #[test]
     fn formats() {
-        assert_eq!(bytes(999), "999B");
-        assert_eq!(bytes(1_000), "1.00kB");
-        assert_eq!(bytes(391_560_000_000), "391.56GB");
-        assert_eq!(bytes(999_994), "999.99kB");
-        assert_eq!(bytes(999_999), "1.00MB");
-        assert_eq!(rate(1_389_999.6), "1.39MB/s");
+        assert_eq!(bytes(999), "999 B");
+        assert_eq!(bytes(1_000), "1.00 kB");
+        assert_eq!(bytes(391_560_000_000), "391.56 GB");
+        assert_eq!(bytes(999_994), "999.99 kB");
+        assert_eq!(bytes(999_999), "1.00 MB");
+        assert_eq!(rate(1_389_999.6), "1.39 MB/s");
         assert_eq!(seconds(5), "5s");
         assert_eq!(seconds(210), "3m 30s");
         assert_eq!(seconds(3723), "1h 2m 3s");

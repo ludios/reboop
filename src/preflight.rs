@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(
             blockers(&test_machine(), &facts),
             [
-                "btrfs on /: scrub has 3m 30s left, 500.00kB of 1.00MB (50.00%) scrubbed at 100.00kB/s, no errors found",
+                "btrfs on /: scrub has 3m 30s left, 500.00 kB of 1.00 MB (50.00%) scrubbed at 100.00 kB/s, no errors found",
                 "btrfs on /small: balance paused",
                 "btrfs on /small: device 1 has had errors: corruption_errs=3 read_errs=1 (once dealt with, `btrfs device stats -z /small` resets them)",
                 "btrfs on /small: device 2 is missing",
@@ -292,7 +292,7 @@ mod tests {
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",
                 "systemd job: start nixos-upgrade.service (running) for 5s or more",
-                "network: 1.50MB/s is over the limit of 1.00MB/s",
+                "network: 1.50 MB/s is over the limit of 1.00 MB/s",
                 "load average: 2.01 is over the limit of 2",
                 "root filesystem: 97% used, and it's full at 97%",
             ]

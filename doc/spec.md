@@ -134,6 +134,6 @@ Managing LUKS keys:
 
     btrfs scrub status /
 
-    scrub has 3m 30s left, 130.50GB of 391.56GB (33.33%) scrubbed at 1.39GB/s, no errors found
+    scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found
 
     If any errors are found, print a very loud warning and return non-0 exit status.
