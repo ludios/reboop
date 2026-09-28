@@ -8,7 +8,7 @@
 //! whenever the Nix build produces something different.
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use reboop::deadline::Deadline;
+use reboop::deadline::{Deadline, Permanent};
 use reboop::initrd::{self, UnlockError};
 use reboop::ssh::{Session, Ssh, Target};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
+
+/// The VM's hostname, which is also what ssh calls it.
+pub const HOSTNAME: &str = "reboop-test";
 
 /// manifest.json from the Nix build
 #[derive(Clone, Debug, Deserialize)]
@@ -219,8 +222,8 @@ impl Vm {
 
         let vm = Vm {
             ssh: Ssh { extra_args: vec!["-F".into(), write_ssh_files(&dir, &manifest, &state)?.display().to_string()] },
-            target: Target { host: "127.0.0.1".into(), port: state.ssh_port },
-            initrd_target: Target { host: "127.0.0.1".into(), port: state.initrd_ssh_port },
+            target: Target { name: HOSTNAME.into(), address: "127.0.0.1".into(), port: state.ssh_port },
+            initrd_target: Target { name: HOSTNAME.into(), address: "127.0.0.1".into(), port: state.initrd_ssh_port },
             manifest,
             dir,
             _lock: lock,
@@ -247,6 +250,7 @@ impl Vm {
             }
             match initrd::unlock(&self.ssh, &self.initrd_target, &self.manifest.luks_password, deadline.at_most(Duration::from_secs(60))) {
                 Ok(_) | Err(UnlockError::Unreachable(_)) => {}
+                Err(UnlockError::Other(error)) if error.downcast_ref::<Permanent>().is_some() => return Err(error),
                 Err(error) => eprintln!("while bringing up the VM: {error}"),
             }
             ensure!(!deadline.has_passed(), "timed out");

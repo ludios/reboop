@@ -43,11 +43,11 @@ pub struct Machine {
 
 impl Machine {
     pub fn target(&self) -> Target {
-        Target { host: self.ipv4.to_string(), port: self.ssh_port }
+        Target { name: self.hostname.clone(), address: self.ipv4.to_string(), port: self.ssh_port }
     }
 
     pub fn initrd_target(&self) -> Target {
-        Target { host: self.ipv4.to_string(), port: self.initrd_ssh_port }
+        Target { name: self.hostname.clone(), address: self.ipv4.to_string(), port: self.initrd_ssh_port }
     }
 }
 
@@ -182,7 +182,7 @@ mod tests {
         );
         assert_eq!(machines[1].ssh_port, 904);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
-        assert_eq!(machines[1].target(), Target { host: "10.0.0.2".into(), port: 904 });
+        assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 904 });
     }
 
     #[test]

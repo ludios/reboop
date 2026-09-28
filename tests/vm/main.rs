@@ -123,7 +123,7 @@ fn unreachable_ports_fail_fast(vm: &Vm) -> Result<()> {
 
 fn identity_and_systems(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    assert_eq!(facts::hostname(&mut session)?, "reboop-test");
+    assert_eq!(facts::hostname(&mut session)?, harness::HOSTNAME);
     let boot_id = facts::boot_id(&mut session)?;
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
 

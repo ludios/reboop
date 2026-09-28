@@ -36,13 +36,18 @@ pub fn is_permanent_failure(stderr: &str) -> bool {
 /// An SSH server to log in to as root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
-    pub host: String,
+    /// What ssh calls the machine, which picks the `Host` stanzas of the
+    /// user's ssh config that apply.
+    pub name: String,
+    /// Where to connect, whatever the ssh config says.  known_hosts entries
+    /// are looked up by this, as when a `Host` stanza sets HostName.
+    pub address: String,
     pub port: u16,
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "root@{} port {}", self.host, self.port)
+        write!(f, "root@{} ({}) port {}", self.name, self.address, self.port)
     }
 }
 
@@ -71,9 +76,9 @@ impl Ssh {
         command
             .args(options)
             .args(&self.extra_args)
-            .arg("-p")
-            .arg(target.port.to_string())
-            .arg(format!("root@{}", target.host))
+            .args(["-o", &format!("HostName={}", target.address)])
+            .args(["-p", &target.port.to_string()])
+            .arg(format!("root@{}", target.name))
             .arg("--")
             .arg(remote_command);
         command
@@ -270,6 +275,15 @@ mod tests {
 "#;
         let output = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", shell_quote(tricky))).output().unwrap();
         assert_eq!(String::from_utf8(output.stdout).unwrap(), tricky);
+    }
+
+    #[test]
+    fn command_dials_the_address_under_the_name() {
+        let target = Target { name: "one".into(), address: "10.0.0.1".into(), port: 904 };
+        let command = Ssh { extra_args: vec!["-F".into(), "config".into()] }.command(&target, &["-T"], "true");
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        let tail = ["-T", "-F", "config", "-o", "HostName=10.0.0.1", "-p", "904", "root@one", "--", "true"];
+        assert_eq!(args[args.len() - tail.len()..], tail);
     }
 
     #[test]
