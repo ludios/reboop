@@ -5,7 +5,7 @@ This is a special-purpose utility for carefully rebooting a NixOS machine, which
 ### AI says:
 
 - Set these on every connection attempt: `BatchMode=yes`, `ConnectTimeout=15`, `ServerAliveInterval=5` and `ControlPath=none`
-    - ControlPath=none matters if your ssh config uses ControlMaster/ControlPersist: a post-reboot attempt can otherwise reuse the dead shared connection and hang.
+    - `ControlPath=none` matters if your ssh config uses `ControlMaster`/`ControlPersist`: a post-reboot attempt can otherwise reuse the dead shared connection and hang.
     - The keepalive matters because the initrd can drop the network without cleanly closing the connection.
     - Give every wait loop an overall deadline
 
@@ -74,7 +74,6 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 2. Decide whether the machine is okay to reboot.
 
     - If the boot loader's default doesn't boot the system profile, or its kernel or initrd is missing, or it has the initrd take a static address (ip=) other than the machine's ipv4, no.
-
     - If any btrfs scrub is running, we can't; Linux will hang on shutdown due to the scrub.
     - If any btrfs balance or drive replace is running, no.
     - If switch-to-configuration or a nix build running, no.
@@ -92,8 +91,9 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
 1. SSH in and:
 
-    - systemctl stop each of stop_services, in order, skipping any the machine doesn't have
-    - shutdown -r now
+    `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have.
+
+    `shutdown -r now`
 
 2. After disconnection, keep trying to SSH in over port 23, with a 15 second timeout, once every 15 seconds:
 
