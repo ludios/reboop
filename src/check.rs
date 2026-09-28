@@ -67,7 +67,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
 /// further lines of the error indented), a blank line before each machine's.
 /// The table is styled if `color`.
 fn table(outcomes: &[(&Machine, Outcome)], color: bool) -> String {
-    let mut rows = vec![HEADER.map(|title| Bold.cell(title)).to_vec()];
+    let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title)))];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
     let mut text = human::table(&rows, color);
 
@@ -165,9 +165,9 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::{Value, json};
 
-    /// Facts about [`test_machine`] with a balance, a tmux, and too much
-    /// network traffic and load.
-    fn blocked_facts() -> Facts {
+    /// The outcome of checking [`test_machine`] while it has a balance, a
+    /// tmux, and too much network traffic and load.
+    fn blocked_outcome() -> Outcome {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
         facts.btrfs[0].exclusive_operation = "balance".into();
@@ -175,14 +175,15 @@ mod tests {
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.load_average_1min = 2.5;
-        facts
+        let blockers = preflight::blockers(&test_machine(), &facts);
+        Ok((facts, blockers))
     }
 
     #[test]
     fn tables() {
         let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }, Machine { hostname: "three".into(), ..test_machine() }];
         let outcomes = [
-            (&machines[0], Ok((blocked_facts(), preflight::blockers(&machines[0], &blocked_facts())))),
+            (&machines[0], blocked_outcome()),
             (&machines[1], Ok((idle_facts(), vec![]))),
             (&machines[2], Err(anyhow!("no route to host\nsecond line").context("failed to open a session"))),
         ];
@@ -213,11 +214,12 @@ mod tests {
     fn json_reports() {
         let machine = test_machine();
         let json = |outcome: &Outcome| -> Value { serde_json::to_value(json_report(&machine, outcome)).unwrap() };
-        let report = json(&Ok((blocked_facts(), vec!["btrfs on /: balance".into()])));
+        let report = json(&blocked_outcome());
         let text = serde_json::to_string(&json_report(&machine, &Ok((idle_facts(), vec![])))).unwrap();
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
-        assert_eq!(report["blockers"], json!(["btrfs on /: balance"]));
+        assert_eq!(report["blockers"][0], "btrfs on /: balance");
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 4);
         assert_eq!(report["facts"]["busy_processes"]["tmux"][0]["pid"], 1234);
         assert_eq!(report["facts"]["btrfs"][0]["mountpoint"], "/");
         assert_eq!(report["facts"]["btrfs"][0]["scrub"]["state"], "finished");

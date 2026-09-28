@@ -74,7 +74,9 @@ impl Style {
             Style::Bold  => "1",
             Style::Red   => "31",
             Style::Green => "32",
-            Style::Gray  => "90",
+            // Not bright black (90), which some palettes, like Solarized
+            // Dark, make the background color.
+            Style::Gray  => "38;5;245",
         };
         format!("\x1b[{code}m{text}\x1b[0m")
     }
@@ -87,10 +89,13 @@ pub struct Cell {
     pub style: Style,
 }
 
-/// Whether to style what's printed to stdout: only if it's a terminal and
-/// NO_COLOR isn't set (<https://no-color.org>).
+/// Whether to style what's printed to stdout: only if it's a terminal, TERM
+/// is set and isn't "dumb" (like git), and NO_COLOR isn't set
+/// (<https://no-color.org>).
 pub fn color_stdout() -> bool {
-    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+    io::stdout().is_terminal()
+        && env::var_os("TERM").is_some_and(|term| term != "dumb")
+        && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// Lays out `rows` of cells in columns, two spaces apart, without trailing
@@ -107,8 +112,9 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
             .zip(&widths)
             .map(|(cell, &width)| {
                 // Padding counts chars, like the widths, and goes after any
-                // escape sequences so that trim_end can remove it.
-                let shown = if color { cell.style.paint(&cell.text) } else { cell.text.clone() };
+                // escape sequences (none around empty text) so that
+                // trim_end can remove it.
+                let shown = if color && !cell.text.is_empty() { cell.style.paint(&cell.text) } else { cell.text.clone() };
                 shown + &" ".repeat(width - cell.text.chars().count())
             })
             .collect();
@@ -151,5 +157,6 @@ mod tests {
         let rows = [vec![Style::Bold.cell("NAME"), Style::Bold.cell("OKAY")], vec![Style::Plain.cell("three"), Style::Red.cell("no")]];
         assert_eq!(table(&rows, true), "\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m\nthree  \x1b[31mno\x1b[0m\n");
         assert_eq!(table(&rows, false), "NAME   OKAY\nthree  no\n");
+        assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
     }
 }
