@@ -1,8 +1,10 @@
 // Model-output: Claude Opus 5.5
 
+use anstream::AutoStream;
+use anstream::stream::RawStream;
 use clap::{ColorChoice, Parser};
 use mimalloc::MiMalloc;
-use reboop::{check, human, luks_password};
+use reboop::{check, luks_password};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
@@ -22,7 +24,8 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
-        /// When to color the table (auto: on a terminal)
+        /// When to color the table (auto: on a terminal, subject to NO_COLOR,
+        /// CLICOLOR, and CLICOLOR_FORCE)
         #[clap(long, value_enum, value_name = "WHEN", default_value_t = ColorChoice::Auto, overrides_with = "color")]
         color: ColorChoice,
     },
@@ -45,10 +48,12 @@ enum ReboopCommand {
     },
 }
 
-/// Whether to style stdout, given the choice of --color.
-fn styles_stdout(color: ColorChoice) -> bool {
+/// Whether to style what's written to `stream`, given a choice like --color's.
+/// Auto means only on a terminal, and by the environment variables that
+/// clap's own messages follow: NO_COLOR, CLICOLOR, CLICOLOR_FORCE, and TERM.
+fn styles(stream: &impl RawStream, color: ColorChoice) -> bool {
     match color {
-        ColorChoice::Auto   => human::should_color(&std::io::stdout()),
+        ColorChoice::Auto   => AutoStream::choice(stream) != anstream::ColorChoice::Never,
         ColorChoice::Always => true,
         ColorChoice::Never  => false,
     }
@@ -60,7 +65,7 @@ fn main() -> ExitCode {
         .unwrap();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(human::should_color(&std::io::stderr()))
+        .with_ansi(styles(&std::io::stderr(), ColorChoice::Auto))
         .with_env_filter(env_filter)
         .init();
 
@@ -73,7 +78,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        ReboopCommand::Check { hostnames, json, color } => check::run(&hostnames, json, styles_stdout(color)),
+        ReboopCommand::Check { hostnames, json, color } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };

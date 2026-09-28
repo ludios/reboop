@@ -2,9 +2,6 @@
 
 //! Formatting quantities and tables for people.
 
-use std::env;
-use std::io::IsTerminal;
-
 /// Formats a byte count with SI units, e.g. "130.50GB".
 pub fn bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
@@ -87,15 +84,6 @@ impl Style {
 pub struct Cell {
     pub text: String,
     pub style: Style,
-}
-
-/// Whether to style what's written to `stream` (stdout or stderr): only if
-/// it's a terminal, TERM is set and isn't "dumb" (like git), and NO_COLOR
-/// isn't set (<https://no-color.org>).
-pub fn should_color(stream: &impl IsTerminal) -> bool {
-    stream.is_terminal()
-        && env::var_os("TERM").is_some_and(|term| term != "dumb")
-        && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// Lays out `rows` of cells in columns, two spaces apart, without trailing
