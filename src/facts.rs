@@ -1,0 +1,200 @@
+// Model-output: Claude Opus 5.5
+
+//! Facts about a remote NixOS machine, from before and after rebooting it.
+
+use crate::ssh::{Session, shell_quote, store_path};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::thread::sleep;
+use std::time::Duration;
+
+const QUICK: Duration = Duration::from_secs(30);
+
+pub fn hostname(session: &mut Session) -> Result<String> {
+    Ok(session.run_ok("cat /proc/sys/kernel/hostname", QUICK)?.trim_end().to_string())
+}
+
+/// A random ID the kernel picks at every boot, so if it changed, the machine
+/// rebooted.
+pub fn boot_id(session: &mut Session) -> Result<String> {
+    let id = session.run_ok("cat /proc/sys/kernel/random/boot_id", QUICK)?.trim_end().to_string();
+    ensure!(id.len() == 36, "unexpected boot_id {id:?}");
+    Ok(id)
+}
+
+pub fn load_average_1min(session: &mut Session) -> Result<f64> {
+    let loadavg = session.run_ok("cat /proc/loadavg", QUICK)?;
+    let first = loadavg.split_whitespace().next().unwrap_or_default();
+    first.parse().with_context(|| format!("unexpected /proc/loadavg {loadavg:?}"))
+}
+
+/// The NixOS configurations and kernels involved in a reboot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Systems {
+    /// The configuration that's active now (it changes on switch).
+    pub current: String,
+    /// The configuration the machine booted into.
+    pub booted: String,
+    /// The release of the running kernel, as in `uname -r`.
+    pub running_kernel: String,
+    /// The configuration of the system profile, which is what
+    /// `nixos-rebuild boot` or `switch` makes the default boot entry.
+    pub default: String,
+    /// The release of the default configuration's kernel.
+    pub default_kernel: String,
+}
+
+pub fn systems(session: &mut Session) -> Result<Systems> {
+    let current = store_path(&session.run_ok("readlink /run/current-system", QUICK)?)?;
+    let booted = store_path(&session.run_ok("readlink /run/booted-system", QUICK)?)?;
+    let running_kernel = session.run_ok("uname -r", QUICK)?.trim_end().to_string();
+    let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
+    let default_kernel = kernel_release(session, &default)?;
+    Ok(Systems { current, booted, running_kernel, default, default_kernel })
+}
+
+/// The release of `system`'s kernel, as `uname -r` would show it once
+/// booted: the name of its modules directory.
+pub fn kernel_release(session: &mut Session, system: &str) -> Result<String> {
+    let script = format!("ls -1 {}/kernel-modules/lib/modules", shell_quote(system));
+    let listing = session.run_ok(&script, QUICK)?;
+    let releases: Vec<_> = listing.lines().collect();
+    let [release] = releases[..] else {
+        bail!("expected one kernel release for {system}, found {releases:?}");
+    };
+    Ok(release.to_string())
+}
+
+/// Traffic through each network interface during a sampling period.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkSample {
+    pub seconds: f64,
+    /// Bytes (received, sent) by each interface, except loopback.
+    pub interfaces: BTreeMap<String, (u64, u64)>,
+}
+
+impl NetworkSample {
+    /// Bytes received plus sent per second, over all interfaces.  (Traffic
+    /// through both a VPN and the interface under it counts twice.)
+    pub fn bytes_per_sec(&self) -> f64 {
+        let total: u64 = self.interfaces.values().map(|(received, sent)| received + sent).sum();
+        total as f64 / self.seconds
+    }
+}
+
+/// Measures network traffic on the remote machine over `duration`.
+pub fn sample_network(session: &mut Session, duration: Duration) -> Result<NetworkSample> {
+    let script = "cat /proc/uptime /proc/net/dev";
+    let before = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
+    sleep(duration);
+    let after = parse_net_snapshot(&session.run_ok(script, QUICK)?)?;
+    network_sample(&before, &after)
+}
+
+/// Seconds since boot and each interface's (received, sent) byte counters.
+type NetSnapshot = (f64, BTreeMap<String, (u64, u64)>);
+
+/// Parses /proc/uptime followed by /proc/net/dev.
+fn parse_net_snapshot(output: &str) -> Result<NetSnapshot> {
+    let context = || anyhow!("unexpected /proc/uptime and /proc/net/dev: {output:?}");
+    let mut lines = output.lines();
+    let uptime = lines.next().and_then(|line| line.split_whitespace().next()).ok_or_else(context)?;
+    let uptime = uptime.parse().with_context(context)?;
+    let mut counters = BTreeMap::new();
+    // Lines after the two header lines look like "  eth0: RX_BYTES ... TX_BYTES ...",
+    // with 8 receive fields then 8 transmit fields.
+    for line in lines.skip(2) {
+        let (name, fields) = line.split_once(':').ok_or_else(context)?;
+        let fields: Vec<u64> = fields.split_whitespace().map(str::parse).collect::<Result<_, _>>().with_context(context)?;
+        ensure!(fields.len() == 16, context());
+        counters.insert(name.trim().to_string(), (fields[0], fields[8]));
+    }
+    Ok((uptime, counters))
+}
+
+fn network_sample(before: &NetSnapshot, after: &NetSnapshot) -> Result<NetworkSample> {
+    let seconds = after.0 - before.0;
+    ensure!(seconds > 0.0, "uptime didn't advance while sampling the network");
+    let mut interfaces = BTreeMap::new();
+    for (name, (received, sent)) in &after.1 {
+        // Interfaces that came or went during the sample are ignored.
+        let Some((received_before, sent_before)) = before.1.get(name) else { continue };
+        if name == "lo" {
+            continue;
+        }
+        let deltas = received.checked_sub(*received_before).zip(sent.checked_sub(*sent_before));
+        let deltas = deltas.ok_or_else(|| anyhow!("byte counters of {name} went backwards while sampling"))?;
+        interfaces.insert(name.clone(), deltas);
+    }
+    Ok(NetworkSample { seconds, interfaces })
+}
+
+/// Waits for the machine to finish booting (or `timeout`) and returns
+/// systemd's view of the system: "running" if all is well, "degraded" if
+/// some unit failed, or something else from systemctl(1)'s
+/// is-system-running.
+pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<String> {
+    let output = session.run("systemctl is-system-running --wait", timeout)?;
+    let state = output.stdout_text().trim().to_string();
+    ensure!(
+        !state.is_empty() && !state.contains(char::is_whitespace),
+        "unexpected output from systemctl is-system-running: {:?} {:?}",
+        state,
+        output.stderr_text()
+    );
+    Ok(state)
+}
+
+/// The names of units that have failed.
+pub fn failed_units(session: &mut Session) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Unit {
+        unit: String,
+    }
+    let json = session.run_ok("systemctl list-units --failed --no-pager --output=json", QUICK)?;
+    let units: Vec<Unit> = serde_json::from_str(&json).with_context(|| format!("unexpected systemctl output {json:?}"))?;
+    Ok(units.into_iter().map(|unit| unit.unit).collect())
+}
+
+/// Kernel log messages at the error level and above.
+pub fn kernel_errors(session: &mut Session) -> Result<String> {
+    session.run_ok("dmesg --level=err,crit,alert,emerg", QUICK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NET_DEV_HEADER: &str = "Inter-|   Receive                                                |  Transmit\n \
+         face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
+
+    fn snapshot(uptime: &str, eth0: (u64, u64)) -> String {
+        format!(
+            "{uptime} 1234.00\n{NET_DEV_HEADER}    lo: 9999 10 0 0 0 0 0 0 9999 10 0 0 0 0 0 0\n  eth0: {} 5 0 0 0 0 0 0 {} 7 0 0 0 0 0 0\n",
+            eth0.0, eth0.1
+        )
+    }
+
+    #[test]
+    fn samples_network() {
+        let before = parse_net_snapshot(&snapshot("100.50", (1_000, 2_000))).unwrap();
+        let after = parse_net_snapshot(&snapshot("102.50", (5_001_000, 1_002_000))).unwrap();
+        let sample = network_sample(&before, &after).unwrap();
+        assert_eq!(sample.interfaces, BTreeMap::from([("eth0".to_string(), (5_000_000, 1_000_000))]));
+        assert_eq!(sample.bytes_per_sec(), 3_000_000.0);
+    }
+
+    #[test]
+    fn rejects_counters_going_backwards() {
+        let before = parse_net_snapshot(&snapshot("100", (1_000, 2_000))).unwrap();
+        let after = parse_net_snapshot(&snapshot("101", (500, 2_000))).unwrap();
+        assert!(network_sample(&before, &after).is_err());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_net_snapshot("").is_err());
+        assert!(parse_net_snapshot(&format!("1.0 2.0\n{NET_DEV_HEADER}eth0 1 2 3\n")).is_err());
+    }
+}
