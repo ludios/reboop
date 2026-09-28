@@ -1,11 +1,11 @@
 // Model-output: Claude Opus 5.5
 
-//! Unlocking a machine's LUKS devices over SSH to its systemd initrd, and
-//! testing the password beforehand.
+//! Finding the LUKS devices a machine's initrd will ask to unlock, testing
+//! the password beforehand, and unlocking them over SSH to the systemd initrd.
 
 use crate::child::{self, ChildProcess};
 use crate::deadline::{Deadline, Permanent, retry};
-use crate::ssh::{Ssh, Target, is_permanent_failure, sh_c};
+use crate::ssh::{QUICK, Session, Ssh, Target, is_permanent_failure, sh_c};
 use anyhow::{Result, anyhow, bail};
 use std::fmt;
 use std::time::Duration;
@@ -59,14 +59,30 @@ pub fn check_password(password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Finds the one LUKS device beneath /, prints "reboop-luks-device DEVICE",
-/// and tests whether the password on stdin opens it.  (lsblk lists a device
-/// once per path to it, and cryptsetup would try PIN-less tokens, like a
-/// TPM2's, before the password.)
-const TEST_LUKS_PASSWORD: &str = r#"
+/// Sets $root to the device mounted at /, and the positional parameters to
+/// the LUKS devices beneath it, each once (lsblk lists a device once per
+/// path to it).  Every step is its own command so that under `set -e`, a
+/// failure can't pass for a lack of LUKS devices.
+const FIND_LUKS_DEVICES: &str = r#"
 set -euf
 root=$(findmnt -nvo SOURCE /)
-set -- $(lsblk -rsnpo PATH,FSTYPE "$root" | awk '$2 == "crypto_LUKS" && !seen[$1]++ { print $1 }')
+tree=$(lsblk -rsnpo PATH,FSTYPE "$root")
+devices=$(printf '%s\n' "$tree" | awk '$2 == "crypto_LUKS" && !seen[$1]++ { print $1 }')
+set -- $devices
+"#;
+
+/// The LUKS devices beneath / on the machine at the other end of `session`,
+/// which are what its initrd will ask to unlock.
+pub fn luks_devices(session: &mut Session) -> Result<Vec<String>> {
+    let script = format!(r#"{FIND_LUKS_DEVICES} for device; do echo "$device"; done"#);
+    Ok(session.run_ok(&script, QUICK)?.lines().map(str::to_string).collect())
+}
+
+/// After [`FIND_LUKS_DEVICES`], checks that there's one LUKS device, prints
+/// "reboop-luks-device DEVICE", and tests whether the password on stdin
+/// opens it.  (cryptsetup would try PIN-less tokens, like a TPM2's, before
+/// the password.)
+const TEST_LUKS_PASSWORD: &str = r#"
 if [ $# -ne 1 ]; then
     echo "expected one LUKS device beneath / ($root), found $#: $*" >&2
     exit 1
@@ -83,7 +99,8 @@ exec cryptsetup luksOpen --test-passphrase --disable-external-tokens --key-file=
 /// user's ssh config says, since we're sending a secret.
 pub fn test_luks_password(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<(String, bool)> {
     check_password(password)?;
-    let command = ssh.command(target, &["-T", "-o", "StrictHostKeyChecking=yes"], &sh_c(TEST_LUKS_PASSWORD));
+    let script = format!("{FIND_LUKS_DEVICES}{TEST_LUKS_PASSWORD}");
+    let command = ssh.command(target, &["-T", "-o", "StrictHostKeyChecking=yes"], &sh_c(&script));
     let output = child::run(command, password.as_bytes(), deadline)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let device = stdout.lines().find_map(|line| line.strip_prefix("reboop-luks-device "));

@@ -65,7 +65,7 @@ impl Style {
     }
 
     /// `text` in this style, with ANSI escape sequences.
-    fn paint(self, text: &str) -> String {
+    pub fn paint(self, text: &str) -> String {
         let code = match self {
             Style::Plain => return text.to_string(),
             Style::Bold  => "1",

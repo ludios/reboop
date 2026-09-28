@@ -4,12 +4,21 @@ use anstream::AutoStream;
 use anstream::stream::RawStream;
 use clap::{ColorChoice, Parser};
 use mimalloc::MiMalloc;
-use reboop::{check, luks_password};
+use reboop::{bounce, check, luks_password};
 use std::process::ExitCode;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// --color, for commands whose output has colors.
+#[derive(clap::Args, Debug)]
+struct ColorOption {
+    /// When to color the output (auto: on a terminal, subject to NO_COLOR,
+    /// CLICOLOR, and CLICOLOR_FORCE)
+    #[clap(long, value_enum, value_name = "WHEN", default_value_t = ColorChoice::Auto, overrides_with = "color")]
+    color: ColorChoice,
+}
 
 #[derive(Parser, Debug)]
 #[clap(name = "reboop", version)]
@@ -24,10 +33,20 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
-        /// When to color the table (auto: on a terminal, subject to NO_COLOR,
-        /// CLICOLOR, and CLICOLOR_FORCE)
-        #[clap(long, value_enum, value_name = "WHEN", default_value_t = ColorChoice::Auto, overrides_with = "color")]
-        color: ColorChoice,
+        #[clap(flatten)]
+        color: ColorOption,
+    },
+    /// Reboot a machine if it's okay to (see check), unlock its LUKS device
+    /// from the initrd if it has one, show how it came back, and scrub its
+    /// btrfs filesystems.
+    /// Exits 0 if it came back fine, 2 if it wasn't okay to reboot, or 1 if
+    /// it came back with problems or something failed.
+    #[clap(name = "bounce")]
+    Bounce {
+        /// A machine from machines.jsonl
+        hostname: String,
+        #[clap(flatten)]
+        color: ColorOption,
     },
     /// Ask for a machine's LUKS password, check over SSH that it opens the
     /// LUKS device beneath /, and store it encrypted with the machine's
@@ -77,7 +96,8 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        ReboopCommand::Check { hostnames, json, color } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
+        ReboopCommand::Check { hostnames, json, color: ColorOption { color } } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
+        ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };
@@ -99,12 +119,18 @@ mod tests {
     fn parses_arguments() {
         ReboopCommand::command().debug_assert();
         let color = |args: &[&str]| match ReboopCommand::try_parse_from([&["reboop", "check"], args].concat()).unwrap() {
-            ReboopCommand::Check { color, .. } => color,
+            ReboopCommand::Check { color: ColorOption { color }, .. } => color,
             command => panic!("parsed as {command:?}"),
         };
         assert_eq!(color(&["one"]), ColorChoice::Auto);
         assert_eq!(color(&["--color", "never", "one"]), ColorChoice::Never);
         assert_eq!(color(&["--color=always", "--color=never"]), ColorChoice::Never);
         assert!(ReboopCommand::try_parse_from(["reboop", "check", "--color", "one"]).is_err());
+
+        match ReboopCommand::try_parse_from(["reboop", "bounce", "--color=never", "one"]).unwrap() {
+            ReboopCommand::Bounce { hostname, color: ColorOption { color } } => assert_eq!((hostname.as_str(), color), ("one", ColorChoice::Never)),
+            command => panic!("parsed as {command:?}"),
+        }
+        assert!(ReboopCommand::try_parse_from(["reboop", "bounce", "one", "two"]).is_err());
     }
 }

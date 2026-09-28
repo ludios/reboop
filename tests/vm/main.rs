@@ -13,6 +13,7 @@ mod harness;
 use anyhow::{Result, bail, ensure};
 use harness::{Vm, clean_up};
 use libtest_mimic::{Arguments, Failed, Trial};
+use reboop::bounce::{self, Outcome, Printer};
 use reboop::btrfs::{self, ScrubState};
 use reboop::config::Machine;
 use reboop::deadline::{Deadline, Permanent};
@@ -221,14 +222,10 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
-    let mut session = clean_session(vm)?;
-    let error = preflight::gather(&mut session, "someone-else").unwrap_err();
-    assert!(format!("{error:#}").contains(r#"calls itself "reboop-test", not "someone-else""#), "{error:#}");
-    // A fully qualified name for the machine will do.
-    preflight::gather(&mut session, &format!("{}.example.com", harness::HOSTNAME))?;
-
-    let machine = Machine {
+/// The VM as a configured machine, with a limit on network traffic but not
+/// really on load.
+fn vm_machine(vm: &Vm) -> Machine {
+    Machine {
         hostname: harness::HOSTNAME.into(),
         ipv4: Ipv4Addr::LOCALHOST,
         ssh_port: vm.target.port,
@@ -238,7 +235,17 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
         luks_signing_key: "/nonexistent".into(),
-    };
+    }
+}
+
+fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let error = preflight::gather(&mut session, "someone-else").unwrap_err();
+    assert!(format!("{error:#}").contains(r#"calls itself "reboop-test", not "someone-else""#), "{error:#}");
+    // A fully qualified name for the machine will do.
+    preflight::gather(&mut session, &format!("{}.example.com", harness::HOSTNAME))?;
+
+    let machine = vm_machine(vm);
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     assert_eq!(facts.systems, facts::systems(&mut session)?);
     assert!(facts.btrfs.iter().any(|fs| fs.filesystem.mountpoint == "/"), "{facts:#?}");
@@ -379,41 +386,49 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
 }
 
 fn luks_password_is_tested(vm: &Vm) -> Result<()> {
+    assert_eq!(initrd::luks_devices(&mut vm.session()?)?, ["/dev/vda2"]);
     let test = |password| initrd::test_luks_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
     assert_eq!(test(&vm.manifest.luks_password)?, ("/dev/vda2".into(), true));
     assert_eq!(test("not the password")?, ("/dev/vda2".into(), false));
     Ok(())
 }
 
-/// Reboots the VM and brings it back up, first answering the initrd with
-/// `first_password` (if any) and then the real password.  Returns a session
-/// to the rebooted machine.
-fn reboot_vm(vm: &Vm, session: Session, first_password: Option<&str>) -> Result<Session> {
-    reboot::reboot(session)?;
-    let deadline = Deadline::after(5 * MINUTE);
-    let interval = Duration::from_secs(1);
-    if let Some(password) = first_password {
-        let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, password, interval, deadline).unwrap_err();
-        let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
-        ensure!(wrong, "expected the password to be rejected, got: {error:#}");
-    }
-    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, &vm.manifest.luks_password, interval, deadline)?;
-    eprintln!("answered {prompts:?}");
-    let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
-    assert_eq!(facts::wait_until_booted(&mut session, 5 * MINUTE)?, "running");
-    Ok(session)
-}
-
 fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let boot_id = facts::boot_id(&mut session)?;
-    let mut session = reboot_vm(vm, session, Some("not the password"))?;
+    reboot::reboot(session)?;
+    let deadline = Deadline::after(5 * MINUTE);
+    let interval = Duration::from_secs(1);
+    let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, "not the password", interval, deadline).unwrap_err();
+    let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
+    ensure!(wrong, "expected the password to be rejected, got: {error:#}");
+    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, &vm.manifest.luks_password, interval, deadline)?;
+    eprintln!("answered {prompts:?}");
+
+    let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
+    assert_eq!(facts::wait_until_booted(&mut session, 5 * MINUTE)?, "running");
     assert_ne!(facts::boot_id(&mut session)?, boot_id);
     Ok(())
 }
 
-fn reboot_into_new_default_configuration(vm: &Vm) -> Result<()> {
+fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
+    let machine = vm_machine(vm);
+    let password = || Ok(vm.manifest.luks_password.clone());
+    let mut stdout = std::io::stdout();
+    let mut printer = Printer::new(&mut stdout, false, false);
+
+    // Not while someone has a tmux
+    sh(&mut session, START_TMUX)?;
+    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    let boot_id = facts::boot_id(&mut session)?;
+    let Outcome::NotOkay(blockers) = bounce::bounce(&vm.ssh, &machine, password, &mut printer)? else {
+        bail!("bounced despite the tmux");
+    };
+    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: ")), "{blockers:?}");
+    assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    clean_up(&mut session)?;
+
     let before = facts::systems(&mut session)?;
     let systems = &vm.manifest.systems;
     let (next, next_variant) = if before.current == systems.base { (&systems.alt, "alt") } else { (&systems.base, "base") };
@@ -423,10 +438,11 @@ fn reboot_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let expected = facts::systems(&mut session)?;
     assert_eq!((&expected.current, &expected.default), (&before.current, next));
 
-    assert_eq!(reboot::stop_unit(&mut session, "postgresql.service", MINUTE)?, Stopped::NotLoaded);
-    let boot_id = facts::boot_id(&mut session)?;
-    let mut session = reboot_vm(vm, session, None)?;
+    let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut printer)?;
+    assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
+    let mut session = vm.session()?;
     assert_ne!(facts::boot_id(&mut session)?, boot_id);
+    assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Finished);
     let after = facts::systems(&mut session)?;
     assert_eq!((&after.booted, &after.current), (next, next));
     assert_eq!(after.running_kernel, expected.default_kernel);
@@ -461,7 +477,7 @@ fn main() {
         ("postflight_facts", postflight_facts),
         ("luks_password_is_tested", luks_password_is_tested),
         ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
-        ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
+        ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
     ];
     let trials = tests.iter().map(|&(name, test)| Trial::test(name, move || run(test))).collect();
     libtest_mimic::run(&args, trials).exit();
