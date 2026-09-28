@@ -82,6 +82,10 @@ At the workspace root:
 
 	cargo test
 
+That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop check`'s table), run just the unit tests instead:
+
+	cargo test --lib --bins
+
 Never `git commit -a` because there may others working; stage changes manually.
 
 Then automatically commit your changes with this commit template:

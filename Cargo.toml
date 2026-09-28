@@ -24,7 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libtest-mimic = "0.8"
 tempfile = "3"
 
-# Runs against a NixOS VM; see tests/vm/main.rs.
+# Runs against NixOS VMs; see tests/vm/main.rs.  `cargo test --lib --bins`
+# skips it.
 [[test]]
 name = "vm"
 harness = false
