@@ -34,11 +34,11 @@ const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWIT
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
 
-/// Short names for the reasons in `facts` not to reboot `machine` that have
-/// no column of their own.
-fn other_reasons(machine: &Machine, facts: &Facts) -> Vec<String> {
+/// Short names for the reasons in `facts` not to reboot that have no column
+/// of their own.
+fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
-    if !preflight::boot_problems(machine, facts).is_empty() {
+    if !preflight::boot_problems(facts).is_empty() {
         reasons.push("boot".to_string());
     }
     let activities = facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity));
@@ -87,7 +87,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         number(preflight::network_over_limit(machine, facts), human::column_rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
-        list(other_reasons(machine, facts).iter().map(String::as_str).collect()),
+        list(other_reasons(facts).iter().map(String::as_str).collect()),
         Plain.cell(kernel),
     ]
 }
@@ -266,9 +266,9 @@ mod tests {
     #[test]
     fn names_boot_trouble() {
         let mut facts = idle_facts();
-        assert_eq!(other_reasons(&test_machine(), &facts), Vec::<String>::new());
+        assert_eq!(other_reasons(&facts), Vec::<String>::new());
         facts.boot[0].missing_files.push("/boot/EFI/nixos/initrd.efi".into());
-        assert_eq!(other_reasons(&test_machine(), &facts), ["boot"]);
+        assert_eq!(other_reasons(&facts), ["boot"]);
     }
 
     #[test]

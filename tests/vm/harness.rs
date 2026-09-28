@@ -200,8 +200,10 @@ for m in /mnt/reboop-test-*; do
 done
 # What the boot loader tests change
 bootctl set-oneshot '' >/dev/null 2>&1
-if [ -e /var/tmp/reboop-test-grub.cfg ]; then cp /var/tmp/reboop-test-grub.cfg /boot-fallback/grub/grub.cfg || exit 1; fi
-if [ -e /var/tmp/reboop-test-kernel ]; then mv /var/tmp/reboop-test-kernel "$(cat /var/tmp/reboop-test-kernel-path)" || exit 1; fi
+bootctl reboot-to-firmware false >/dev/null 2>&1
+for f in grub.cfg kernel; do
+    if [ -e /var/tmp/reboop-test-$f ]; then cp /var/tmp/reboop-test-$f "$(cat /var/tmp/reboop-test-$f-path)" || exit 1; fi
+done
 for i in /var/tmp/reboop-test-*.img; do
     [ -e "$i" ] || continue
     for l in $(losetup -j "$i" -n -O NAME); do losetup -d "$l"; done

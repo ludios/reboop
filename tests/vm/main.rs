@@ -23,7 +23,7 @@ use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
 use reboop::processes::{self, Activity};
 use reboop::reboot::{self, Stopped};
-use reboop::ssh::{Session, wait_for_session};
+use reboop::ssh::{Session, shell_quote, wait_for_session};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -477,13 +477,19 @@ fn systemd_boots_default_is_checked(vm: &Vm) -> Result<()> {
     let [boot] = &boot::default_boots(&mut session)?[..] else { bail!("not one default boot") };
     assert_eq!((boot.loader.as_str(), boot.system(), boot.missing_files.len()), ("systemd-boot", Some(default.as_str()), 0), "{boot:?}");
 
-    // A one-time boot into the firmware's setup
-    sh(&mut session, "bootctl set-oneshot auto-reboot-to-firmware-setup")?;
+    // A one-time boot into the firmware's setup, by systemd-boot and by the
+    // firmware itself
+    sh(&mut session, "bootctl set-oneshot auto-reboot-to-firmware-setup && bootctl reboot-to-firmware true")?;
     let machine = vm_machine(vm);
     let facts = preflight::gather(&mut session, &machine.hostname);
     clean_up(&mut session)?;
-    let expected = r#"boot: systemd-boot's default, "auto-reboot-to-firmware-setup", doesn't boot a NixOS system (no init=/nix/store/…/init)"#;
-    assert_eq!(preflight::blockers(&machine, &facts?), [expected]);
+    assert_eq!(
+        preflight::blockers(&machine, &facts?),
+        [
+            "boot: the firmware will open its setup at the next boot (OsIndications)",
+            r#"boot: systemd-boot's default, "auto-reboot-to-firmware-setup", doesn't boot a NixOS system (no init=/nix/store/…/init)"#,
+        ]
+    );
     Ok(())
 }
 
@@ -497,22 +503,29 @@ fn grubs_defaults_are_checked(vm: &Vm) -> Result<()> {
         assert_eq!((boot.entry.as_str(), boot.system(), boot.missing_files.len()), ("NixOS", Some(default.as_str()), 0), "{boot:?}");
     }
 
-    // A mirror that's behind, and a kernel gone from the other /boot.
-    // (clean_up puts both back.)
+    // Set aside `file`, and have clean_up put it back.
+    let set_aside = |name: &str, file: &str| {
+        let (backup, file) = (format!("/var/tmp/reboop-test-{name}"), shell_quote(file));
+        format!("cp {file} {backup} && printf %s {file} >{backup}-path")
+    };
+    let machine = vm_machine(vm);
+
+    // A mirror that's behind, and a kernel gone from the other /boot
     let stale = "/nix/store/00000000000000000000000000000000-nixos-system-stale";
-    let kernel = sh(
+    let kernel = &boots[0].files[0];
+    sh(
         &mut session,
         &format!(
             "set -e
-            cp /boot-fallback/grub/grub.cfg /var/tmp/reboop-test-grub.cfg
+            {}
             sed -i 's|init={default}/init|init={stale}/init|' /boot-fallback/grub/grub.cfg
-            kernel=$(ls /boot/kernels/*-bzImage)
-            printf %s $kernel >/var/tmp/reboop-test-kernel-path
-            mv $kernel /var/tmp/reboop-test-kernel
-            printf %s $kernel"
+            {}
+            rm {}",
+            set_aside("grub.cfg", "/boot-fallback/grub/grub.cfg"),
+            set_aside("kernel", kernel),
+            shell_quote(kernel)
         ),
     )?;
-    let machine = vm_machine(vm);
     let facts = preflight::gather(&mut session, &machine.hostname);
     clean_up(&mut session)?;
     assert_eq!(
@@ -522,6 +535,12 @@ fn grubs_defaults_are_checked(vm: &Vm) -> Result<()> {
             format!(r#"boot: /boot-fallback/grub/grub.cfg's default, "NixOS", boots {stale}, not the system profile's {default}"#),
         ]
     );
+
+    // A mirror without its grub.cfg
+    sh(&mut session, &format!("{} && rm /boot-fallback/grub/grub.cfg", set_aside("grub.cfg", "/boot-fallback/grub/grub.cfg")))?;
+    let facts = preflight::gather(&mut session, &machine.hostname);
+    clean_up(&mut session)?;
+    assert_eq!(preflight::blockers(&machine, &facts?), ["boot: /boot-fallback/grub/grub.cfg is missing"]);
     Ok(())
 }
 

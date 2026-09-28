@@ -4,6 +4,7 @@
 //! LUKS device from the initrd if it has one, shows how it came back, and
 //! scrubs its btrfs filesystems.
 
+use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
 use crate::deadline::{Deadline, retry};
@@ -16,6 +17,7 @@ use crate::reboot::{self, Stopped};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, Target};
 use anyhow::{Context, Result, ensure};
 use std::io::{self, IsTerminal, Write};
+use std::net::Ipv4Addr;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -127,11 +129,14 @@ pub enum Outcome {
 
 /// The password that `machine`'s initrd will ask for, if any: if `machine`
 /// (at the other end of `session`) has a LUKS device beneath /, gets it from
-/// `password`, and makes sure that it opens the device.
+/// `password`, and makes sure that it opens the device, and that the initrd
+/// will be where bounce looks for it, given what the boot loader will boot
+/// (`boots`).
 fn password_for_initrd(
     ssh: &Ssh,
     machine: &Machine,
     session: &mut Session,
+    boots: &[DefaultBoot],
     password: impl FnOnce() -> Result<String>,
     printer: &mut Printer,
 ) -> Result<Option<String>> {
@@ -139,6 +144,13 @@ fn password_for_initrd(
     if initrd::luks_devices(session)?.is_empty() {
         printer.line("There's no LUKS device beneath /, so there'll be nothing to unlock");
         return Ok(None);
+    }
+    for boot in boots {
+        let addresses = boot.initrd_addresses();
+        let elsewhere = !addresses.is_empty() && !addresses.contains(&machine.ipv4);
+        let addresses: Vec<_> = addresses.iter().map(Ipv4Addr::to_string).collect();
+        let (loader, entry, ipv4) = (&boot.loader, &boot.entry, machine.ipv4);
+        ensure!(!elsewhere, "{loader}'s default, {entry:?}, has the initrd take {} (ip=), not {ipv4}", addresses.join(" and "));
     }
     let password = password().with_context(|| format!("couldn't get the stored LUKS password (`reboop set-luks-password {hostname}` sets it)"))?;
     let deadline = Deadline::after(OPEN_TIMEOUT + QUICK);
@@ -181,7 +193,7 @@ fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: De
 /// What's wrong with how a machine came back, given the systems from
 /// `before` it rebooted and `after`, systemd's `state` of it (from
 /// [`facts::wait_until_booted`]), and its `failed_units`.
-fn boot_problems(before: &Systems, after: &Systems, state: &str, failed_units: &[String]) -> Vec<String> {
+fn postflight_problems(before: &Systems, after: &Systems, state: &str, failed_units: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     // "degraded" means there are failed units, which get their own problem.
     if state != "running" && state != "degraded" {
@@ -201,7 +213,7 @@ fn boot_problems(before: &Systems, after: &Systems, state: &str, failed_units: &
 
 /// Waits for the machine at the other end of `session` to finish starting
 /// up, shows how it came back, and returns its problems (see
-/// [`boot_problems`]), given the systems from `before` it rebooted.
+/// [`postflight_problems`]), given the systems from `before` it rebooted.
 fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) -> Result<Vec<String>> {
     printer.line("Waiting for systemd to finish starting up");
     let state = facts::wait_until_booted(session, STARTUP_TIMEOUT)?;
@@ -221,7 +233,7 @@ fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) ->
     } else {
         printer.line(&indented_list("Kernel errors:", kernel_errors.trim_end().lines()));
     }
-    Ok(boot_problems(before, &after, &state, &failed_units))
+    Ok(postflight_problems(before, &after, &state, &failed_units))
 }
 
 /// Scrubs the btrfs filesystem mounted at `mountpoint`, or waits for the
@@ -307,7 +319,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     }
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", systems.default, systems.default_kernel));
-    let password = password_for_initrd(ssh, machine, &mut session, password, printer).with_context(not_rebooted)?;
+    let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
     let mut problems = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
@@ -401,18 +413,18 @@ mod tests {
     }
 
     #[test]
-    fn finds_boot_problems() {
+    fn finds_postflight_problems() {
         let before = idle_facts().systems;
-        assert_eq!(boot_problems(&before, &before, "running", &[]), Vec::<String>::new());
+        assert_eq!(postflight_problems(&before, &before, "running", &[]), Vec::<String>::new());
         let after = Systems { booted: "/nix/store/bbb-nixos-system-one-26.05".into(), running_kernel: "6.18.53".into(), ..before.clone() };
         assert_eq!(
-            boot_problems(&before, &after, "degraded", &["a.service".into(), "b.service".into()]),
+            postflight_problems(&before, &after, "degraded", &["a.service".into(), "b.service".into()]),
             [
                 "failed units: a.service, b.service",
                 "booted /nix/store/bbb-nixos-system-one-26.05, not /nix/store/aaa-nixos-system-one-26.05",
                 "booted kernel 6.18.53, not 6.18.54",
             ]
         );
-        assert_eq!(boot_problems(&before, &before, "maintenance", &[]), ["systemd says the system is maintenance"]);
+        assert_eq!(postflight_problems(&before, &before, "maintenance", &[]), ["systemd says the system is maintenance"]);
     }
 }
