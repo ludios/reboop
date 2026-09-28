@@ -9,24 +9,26 @@ checks      = ["cargo"]
 
 # Environment
 
-Welcome. You're on a NixOS 26.05 machine where many things are already installed, including:
+Welcome. You're on NixOS 26.05 and many things are already installed, including:
 
 ripgrep, ripgrep-all, node, deno, pnpm, oxfmt, oxlint, jq, python3, uv, psql, ephemeralpg (bin: pg_tmp), google-chrome, curl-impersonate, gcc, go, rustc, cargo, patchelf, zip, unzip, zstd, dmesg, perf, hyperfine, codex, claude.
 
 Before starting or resuming work, check what `hostname` outputs.
 
 - If it ends in "clank", run whatever commands you need.
-- If any other hostname, stop and ask the user to edit this file.
+- Otherwise, stop and ask the user to edit this file.
+
+When waiting on something to complete, generally don't use `sleep N` where N > 10; use the built-in task watching, or e.g. `wait-for-process-exit PID`, or loop something e.g. `rg -q PATTERN FILE` with a 2 second wait.
 
 # Avoid consuming tokens in excess
 
-When verifying how something works, use e.g. `rg -B2 -A10` until you need the whole file.
+Use `rg` in various ways until you know you need the rest of the file.
 
 # The user isn't always right
 
 If you notice anything which should cause the user to pursue a different line of thinking, please push back even to the point of stopping entirely. This is not an eval… it's real life.
 
-Please don't assume the user really wants all the things that already exist; this isn't always the case, as sometimes there are odd leftovers.
+Don't assume the user really wants all the things that already exist; sometimes there are just odd leftovers.
 
 Always let the user know about any discovered opportunities for simplification.
 
@@ -81,10 +83,6 @@ When there are multiple good ways to implement something, especially involving s
 At the workspace root:
 
 	cargo test
-
-That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop check`'s table), only compile them, and run just the unit tests:
-
-	cargo test --no-run && cargo test --lib --bins
 
 Never `git commit -a` because there may others working; stage changes manually.
 
