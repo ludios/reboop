@@ -1,0 +1,387 @@
+// Model-output: Claude Opus 5.5
+
+//! Tests of reboop's primitives against a NixOS VM (configuration.nix) with
+//! a LUKS-encrypted btrfs root.
+//!
+//! The VM keeps running after the tests so that later runs start quickly.
+//! To stop it:
+//!
+//!     kill $(cat target/tmp/reboop-vm/qemu.pid)
+
+mod harness;
+
+use anyhow::{Result, ensure};
+use harness::{Vm, clean_up};
+use libtest_mimic::{Arguments, Failed, Trial};
+use reboop::btrfs::{self, ScrubState};
+use reboop::deadline::Deadline;
+use reboop::facts;
+use reboop::initrd::{self, UnlockError};
+use reboop::processes::{self, Activity};
+use reboop::reboot::{self, Stopped};
+use reboop::ssh::{Session, wait_for_session};
+use std::collections::BTreeSet;
+use std::io::Write;
+use std::process::Stdio;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, sleep};
+use std::time::{Duration, Instant};
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+type Test = fn(&Vm) -> Result<()>;
+
+fn main() {
+    let mut args = Arguments::from_args();
+    // The tests share the VM, and some reboot it.
+    args.test_threads = Some(1);
+    let tests: &[(&str, Test)] = &[
+        ("session_runs_commands", session_runs_commands),
+        ("session_breaks_on_timeout", session_breaks_on_timeout),
+        ("unreachable_ports_fail_fast", unreachable_ports_fail_fast),
+        ("identity_and_systems", identity_and_systems),
+        ("network_sample_sees_traffic", network_sample_sees_traffic),
+        ("activities_are_detected", activities_are_detected),
+        ("btrfs_root_is_idle", btrfs_root_is_idle),
+        ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
+        ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
+        ("scrub_finds_corruption", scrub_finds_corruption),
+        ("stop_unit", stop_unit),
+        ("postflight_facts", postflight_facts),
+        ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
+        ("reboot_into_new_default_configuration", reboot_into_new_default_configuration),
+    ];
+    let trials = tests.iter().map(|&(name, test)| Trial::test(name, move || run(test))).collect();
+    libtest_mimic::run(&args, trials).exit();
+}
+
+/// Runs `test` against the VM, which is set up by the first test to run.
+fn run(test: Test) -> Result<(), Failed> {
+    static VM: OnceLock<Result<Vm, String>> = OnceLock::new();
+    let vm = VM.get_or_init(|| Vm::get().map_err(|error| format!("{error:?}"))).as_ref()?;
+    test(vm).map_err(|error| format!("{error:?}").into())
+}
+
+/// A session in which everything left over from earlier tests is gone.
+fn clean_session(vm: &Vm) -> Result<Session> {
+    let mut session = vm.session()?;
+    clean_up(&mut session)?;
+    Ok(session)
+}
+
+fn sh(session: &mut Session, script: &str) -> Result<String> {
+    session.run_ok(script, MINUTE)
+}
+
+fn session_runs_commands(vm: &Vm) -> Result<()> {
+    let mut session = vm.session()?;
+
+    let output = session.run("printf 'out\\0put'; echo err >&2; exit 3", MINUTE)?;
+    assert_eq!((output.status, &output.stdout[..], output.stderr_text().as_str()), (3, &b"out\0put"[..], "err"));
+
+    // Scripts pass through root's login shell (zsh) untouched.
+    assert!(sh(&mut session, "getent passwd root")?.trim_end().ends_with("/zsh"));
+    let tricky = r#"printf '%s|' '$HOME' "it's" "$(echo 'a b')" ~ \\"#;
+    assert_eq!(sh(&mut session, tricky)?, r"$HOME|it's|a b|/root|\|");
+
+    // stdin is empty, so commands can't eat the ones that follow.
+    assert_eq!(sh(&mut session, "cat")?, "");
+    assert_eq!(sh(&mut session, "echo still here")?, "still here\n");
+
+    // Large output
+    let big = sh(&mut session, "seq 1 300000")?;
+    assert_eq!(big.lines().count(), 300_000);
+
+    // The tools the primitives use are on the PATH.
+    sh(&mut session, "command -v systemctl btrfs findmnt ps dmesg base64 mktemp")?;
+    Ok(())
+}
+
+fn session_breaks_on_timeout(vm: &Vm) -> Result<()> {
+    let mut session = vm.session()?;
+    let started = Instant::now();
+    assert!(session.run("sleep 30", Duration::from_secs(1)).is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // The sleep might still be running, so the session is done for.
+    assert!(session.run("true", MINUTE).is_err());
+    Ok(())
+}
+
+fn unreachable_ports_fail_fast(vm: &Vm) -> Result<()> {
+    // Nothing listens on the initrd's port once the machine has booted.
+    let started = Instant::now();
+    assert!(Session::open(&vm.ssh, &vm.initrd_target, MINUTE).is_err());
+    let result = initrd::unlock(&vm.ssh, &vm.initrd_target, "password", Deadline::after(MINUTE));
+    assert!(matches!(result, Err(UnlockError::Unreachable(_))), "{result:?}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+
+    let started = Instant::now();
+    let deadline = Deadline::after(Duration::from_secs(3));
+    assert!(wait_for_session(&vm.ssh, &vm.initrd_target, Duration::from_secs(1), deadline).is_err());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    Ok(())
+}
+
+fn identity_and_systems(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert_eq!(facts::hostname(&mut session)?, "reboop-test");
+    let boot_id = facts::boot_id(&mut session)?;
+    assert_eq!(facts::boot_id(&mut session)?, boot_id);
+
+    let systems = facts::systems(&mut session)?;
+    let ours = [&vm.manifest.systems.base, &vm.manifest.systems.alt];
+    assert!(ours.contains(&&systems.booted), "{systems:?}");
+    assert_eq!(systems.current, systems.booted);
+    assert!(ours.contains(&&systems.default), "{systems:?}");
+    // The kernel release we'd expect after booting the current system is
+    // the one that's running.
+    assert_eq!(facts::kernel_release(&mut session, &systems.current)?, systems.running_kernel);
+    assert_eq!(systems.running_kernel, sh(&mut session, "uname -r")?.trim_end());
+
+    let load = facts::load_average_1min(&mut session)?;
+    assert!((0.0..100.0).contains(&load), "{load}");
+    Ok(())
+}
+
+fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let idle = facts::sample_network(&mut session, Duration::from_secs(2))?;
+    assert!(idle.bytes_per_sec() < 100_000.0, "{idle:?}");
+    assert!(!idle.interfaces.contains_key("lo"));
+
+    // Push zeros into the VM over another connection while sampling.
+    let mut sink = vm.ssh.command(&vm.target, &["-T"], "cat >/dev/null").stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
+    let mut stdin = sink.stdin.take().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_writer = Arc::clone(&stop);
+    let writer = thread::spawn(move || {
+        let zeros = vec![0; 1 << 16];
+        while !stop_writer.load(Ordering::Relaxed) && stdin.write_all(&zeros).is_ok() {}
+    });
+    sleep(Duration::from_millis(500));
+    let busy = facts::sample_network(&mut session, Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    sink.kill()?;
+    sink.wait()?;
+    let busy = busy?;
+    assert!(busy.bytes_per_sec() > 1_000_000.0, "{busy:?}");
+    Ok(())
+}
+
+fn activities(session: &mut Session) -> Result<BTreeSet<Activity>> {
+    Ok(processes::list(session)?.iter().filter_map(processes::activity).collect())
+}
+
+fn activities_are_detected(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert_eq!(activities(&mut session)?, BTreeSet::new(), "{:#?}", processes::list(&mut session)?);
+
+    // A real tmux server, owned by someone other than root
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-tmux -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600")?;
+    // A real, slow rsync
+    sh(&mut session, "head -c 10M /dev/zero >/var/tmp/reboop-test-rsync && \
+                      systemd-run --quiet --unit=reboop-test-rsync rsync --bwlimit=10 /var/tmp/reboop-test-rsync /var/tmp/reboop-test-rsync-copy")?;
+    // A real Nix build that sleeps
+    sh(&mut session, r#"coreutils=$(readlink -f "$(command -v sleep)" | cut -d/ -f1-4) &&
+        systemd-run --quiet --unit=reboop-test-nix nix-build --no-out-link -E "
+            derivation {
+                name = \"reboop-test-build\";
+                system = builtins.currentSystem;
+                builder = \"\${builtins.storePath \"$coreutils\"}/bin/sleep\";
+                args = [ \"600\" ];
+            }""#)?;
+    // switch-to-configuration, as NixOS's wrapper script runs it
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-stc bash -c \
+                      'exec -a /run/current-system/bin/switch-to-configuration sleep 600'")?;
+
+    let expected = BTreeSet::from([Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync]);
+    let deadline = Deadline::after(MINUTE);
+    let mut found = activities(&mut session)?;
+    while found != expected && !deadline.has_passed() {
+        sleep(Duration::from_millis(500));
+        found = activities(&mut session)?;
+    }
+    let listing: Vec<_> = processes::list(&mut session)?.into_iter().filter(|p| processes::activity(p).is_some()).collect();
+    assert_eq!(found, expected, "{listing:#?}");
+    // The builder itself is also recognized, as it runs as a nixbld user.
+    assert!(listing.iter().any(|p| p.user.starts_with("nixbld")), "{listing:#?}");
+
+    clean_up(&mut session)?;
+    assert_eq!(activities(&mut session)?, BTreeSet::new());
+    Ok(())
+}
+
+fn btrfs_root_is_idle(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let filesystems = btrfs::filesystems(&mut session)?;
+    assert_eq!(filesystems.len(), 1, "{filesystems:?}");
+    assert_eq!(filesystems[0].mountpoint, "/");
+    assert_eq!(btrfs::exclusive_operation(&mut session, &filesystems[0])?, "none");
+    assert_ne!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Running);
+    Ok(())
+}
+
+/// Makes a btrfs filesystem in a file and mounts it at /mnt/reboop-test-NAME.
+/// `setup` runs with the mountpoint as $m, e.g. to add files.  Returns the
+/// mountpoint.
+fn test_filesystem(session: &mut Session, name: &str, setup: &str) -> Result<String> {
+    let mountpoint = format!("/mnt/reboop-test-{name}");
+    sh(
+        session,
+        &format!(
+            "set -e
+            img=/var/tmp/reboop-test-{name}.img m={mountpoint}
+            truncate -s 1G $img
+            mkfs.btrfs -q --data single --metadata dup $img
+            mkdir $m
+            mount -o loop $img $m
+            {setup}
+            sync"
+        ),
+    )?;
+    Ok(mountpoint)
+}
+
+fn btrfs_running_scrub_and_balance_are_detected(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let mountpoint = test_filesystem(&mut session, "busy", "for i in 1 2 3 4; do head -c 100M /dev/urandom >$m/$i; done")?;
+    let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
+
+    // Throttle scrubbing so that it's still running when we look.
+    sh(&mut session, &format!("echo 1m >/sys/fs/btrfs/{}/devinfo/1/scrub_speed_max", filesystem.uuid))?;
+    btrfs::start_scrub(&mut session, &mountpoint, MINUTE)?;
+    let status = btrfs::scrub_status(&mut session, &mountpoint)?;
+    assert_eq!(status.state, ScrubState::Running);
+    assert!(status.summary().starts_with("scrub has "), "{}", status.summary());
+    // A scrub isn't an exclusive operation.
+    assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "none");
+    assert!(btrfs::start_scrub(&mut session, &mountpoint, MINUTE).is_err());
+    sh(&mut session, &format!("btrfs scrub cancel {mountpoint}"))?;
+    assert_eq!(btrfs::scrub_status(&mut session, &mountpoint)?.state, ScrubState::Aborted);
+
+    // Pause a balance so it stays in progress.
+    sh(&mut session, &format!("btrfs balance start --bg --full-balance {mountpoint} && btrfs balance pause {mountpoint}"))?;
+    assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "balance paused");
+    sh(&mut session, &format!("btrfs balance cancel {mountpoint}"))?;
+    assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "none");
+    Ok(())
+}
+
+fn scrub_of_root_finishes_clean(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    btrfs::start_scrub(&mut session, "/", MINUTE)?;
+    let mut summaries = Vec::new();
+    let status = btrfs::wait_for_scrub(&mut session, "/", Duration::from_secs(1), Deadline::after(5 * MINUTE), |status| {
+        summaries.push(status.summary());
+    })?;
+    eprintln!("{}", summaries.join("\n"));
+    assert_eq!(status.state, ScrubState::Finished);
+    assert!(status.errors.is_empty(), "{status:?}");
+    assert!(status.scrubbed_bytes > 500_000_000, "{status:?}");
+    assert!(status.summary().ends_with("no errors found"), "{}", status.summary());
+    Ok(())
+}
+
+fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let marker = "REBOOP-TEST-CORRUPT-ME";
+    let mountpoint = test_filesystem(&mut session, "corrupt", &format!("yes {marker} | head -c 1M >$m/file"))?;
+
+    // Overwrite a bit of the file's data behind btrfs's back.
+    sh(
+        &mut session,
+        &format!(
+            "set -e
+            loop=$(losetup -j /var/tmp/reboop-test-corrupt.img -n -O NAME)
+            offset=$(grep -m1 -obUa {marker} $loop | head -n1 | cut -d: -f1)
+            printf GARBAGE | dd of=$loop bs=1 seek=$offset conv=notrunc status=none
+            sync"
+        ),
+    )?;
+
+    btrfs::start_scrub(&mut session, &mountpoint, MINUTE)?;
+    let status = btrfs::wait_for_scrub(&mut session, &mountpoint, Duration::from_millis(500), Deadline::after(MINUTE), |_| {})?;
+    assert_eq!(status.state, ScrubState::Finished);
+    assert!(status.errors.get("csum_errors").is_some_and(|&n| n > 0), "{status:?}");
+    assert!(status.summary().contains("ERRORS FOUND"), "{}", status.summary());
+    Ok(())
+}
+
+fn stop_unit(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-nonexistent.service", MINUTE)?, Stopped::NotLoaded);
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-sleep.service", MINUTE)?, Stopped::Stopped);
+    let output = session.run("systemctl is-active reboop-test-sleep.service", MINUTE)?;
+    assert_ne!(output.stdout_text().trim(), "active");
+    Ok(())
+}
+
+fn postflight_facts(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "running");
+    assert_eq!(facts::failed_units(&mut session)?, Vec::<String>::new());
+
+    session.run("systemd-run --quiet --unit=reboop-test-fail --wait false", MINUTE)?;
+    assert_eq!(facts::failed_units(&mut session)?, vec!["reboop-test-fail.service".to_string()]);
+    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "degraded");
+
+    sh(&mut session, "echo '<3>reboop test error' >/dev/kmsg")?;
+    assert!(facts::kernel_errors(&mut session)?.contains("reboop test error"));
+
+    clean_up(&mut session)?;
+    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "running");
+    Ok(())
+}
+
+/// Reboots the VM and brings it back up, first answering the initrd with
+/// `first_password` (if any) and then the real password.  Returns a session
+/// to the rebooted machine.
+fn reboot_vm(vm: &Vm, session: Session, first_password: Option<&str>) -> Result<Session> {
+    reboot::reboot(session)?;
+    let deadline = Deadline::after(5 * MINUTE);
+    let interval = Duration::from_secs(1);
+    if let Some(password) = first_password {
+        let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, password, interval, deadline).unwrap_err();
+        let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
+        ensure!(wrong, "expected the password to be rejected, got: {error:#}");
+    }
+    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, &vm.manifest.luks_password, interval, deadline)?;
+    eprintln!("answered {prompts:?}");
+    let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
+    assert_eq!(facts::wait_until_booted(&mut session, 5 * MINUTE)?, "running");
+    Ok(session)
+}
+
+fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let boot_id = facts::boot_id(&mut session)?;
+    let mut session = reboot_vm(vm, session, Some("not the password"))?;
+    assert_ne!(facts::boot_id(&mut session)?, boot_id);
+    Ok(())
+}
+
+fn reboot_into_new_default_configuration(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let before = facts::systems(&mut session)?;
+    let systems = &vm.manifest.systems;
+    let (next, next_variant) = if before.current == systems.base { (&systems.alt, "alt") } else { (&systems.base, "base") };
+
+    // What `nixos-rebuild boot` does
+    sh(&mut session, &format!("nix-env -p /nix/var/nix/profiles/system --set {next} && {next}/bin/switch-to-configuration boot"))?;
+    let expected = facts::systems(&mut session)?;
+    assert_eq!((&expected.current, &expected.default), (&before.current, next));
+
+    assert_eq!(reboot::stop_unit(&mut session, "postgresql.service", MINUTE)?, Stopped::NotLoaded);
+    let boot_id = facts::boot_id(&mut session)?;
+    let mut session = reboot_vm(vm, session, None)?;
+    assert_ne!(facts::boot_id(&mut session)?, boot_id);
+    let after = facts::systems(&mut session)?;
+    assert_eq!((&after.booted, &after.current), (next, next));
+    assert_eq!(after.running_kernel, expected.default_kernel);
+    assert_eq!(sh(&mut session, "cat /etc/reboop-test-variant")?, next_variant);
+    Ok(())
+}

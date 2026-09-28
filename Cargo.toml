@@ -23,6 +23,11 @@ libc = "0.2"
 libtest-mimic = "0.8"
 tempfile = "3"
 
+# Runs against a NixOS VM; see tests/vm.rs.
+[[test]]
+name = "vm"
+harness = false
+
 [profile.dev]
 # Reduce debug rebuild time
 # https://github.com/rust-gamedev/wg/issues/50#issuecomment-527160611
