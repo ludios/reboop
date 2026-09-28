@@ -201,9 +201,22 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-stc -E PATH bash -c \
                       'exec -a /run/current-system/bin/switch-to-configuration bash -c \"sleep 600; true\"'")?;
 
+    // A btrfs receive and a cryptsetup, each waiting for its input
+    sh(&mut session, "mkdir /var/tmp/reboop-test-receive && truncate -s 32M /var/tmp/reboop-test-luks.img && \
+                      systemd-run --quiet --unit=reboop-test-receive -E PATH sh -c 'sleep 600 | btrfs receive /var/tmp/reboop-test-receive' && \
+                      systemd-run --quiet --unit=reboop-test-cryptsetup -E PATH \
+                          sh -c 'sleep 600 | cryptsetup luksFormat --batch-mode --key-file=- /var/tmp/reboop-test-luks.img'")?;
+
     // Wait for them all to start, including the build's builder, which
     // runs as a nixbld user.
-    let expected = BTreeSet::from([Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync]);
+    let expected = BTreeSet::from([
+        Activity::Nix,
+        Activity::SwitchToConfiguration,
+        Activity::Tmux,
+        Activity::Rsync,
+        Activity::BtrfsSendReceive,
+        Activity::Cryptsetup,
+    ]);
     let deadline = Deadline::after(MINUTE);
     loop {
         let listing: Vec<_> = processes::list(&mut session)?.into_iter().filter(|p| processes::activity(p).is_some()).collect();

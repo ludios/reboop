@@ -26,12 +26,17 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     Ok((facts, blockers))
 }
 
+/// The activities that have columns of their own.
+const ACTIVITY_COLUMNS: [Activity; 4] = [Activity::Nix, Activity::SwitchToConfiguration, Activity::Tmux, Activity::Rsync];
+
 const HEADER: [&str; 12] = ["MACHINE", "OKAY", "SCRUB", "BTRFS OP", "NIX", "SWITCH", "TMUX", "RSYNC", "NET", "LOAD", "OTHER", "KERNEL"];
 
 /// Short names for the reasons in `facts` not to reboot that have no column
 /// of their own.
 fn other_reasons(facts: &Facts) -> Vec<String> {
     let mut reasons = Vec::new();
+    let activities = facts.busy_processes.keys().filter(|activity| !ACTIVITY_COLUMNS.contains(activity));
+    reasons.extend(activities.map(Activity::to_string));
     if facts.btrfs.iter().flat_map(|fs| &fs.devices).any(|device| device.missing || !device.errors.is_empty()) {
         reasons.push("btrfs device".to_string());
     }
@@ -54,6 +59,7 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let operations: BTreeSet<_> = facts.btrfs.iter().map(|fs| fs.exclusive_operation.as_str()).filter(|&op| op != "none").collect();
     let count = |activity| facts.busy_processes.get(&activity).map_or(Gray.cell("-"), |processes| Red.cell(processes.len().to_string()));
+    let [nix, switch, tmux, rsync] = ACTIVITY_COLUMNS.map(count);
     let red_or_green = |red: bool, text: String| if red { Red.cell(text) } else { Green.cell(text) };
     let systems = &facts.systems;
     let kernel = if systems.default_kernel == systems.running_kernel {
@@ -66,10 +72,10 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
         list(scrubbing.collect()),
         list(operations.into_iter().collect()),
-        count(Activity::Nix),
-        count(Activity::SwitchToConfiguration),
-        count(Activity::Tmux),
-        count(Activity::Rsync),
+        nix,
+        switch,
+        tmux,
+        rsync,
         red_or_green(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         red_or_green(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         list(other_reasons(facts).iter().map(String::as_str).collect()),
@@ -190,6 +196,8 @@ mod tests {
         facts.btrfs[0].devices[0].missing = true;
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
+        let reencrypt = Process { pid: 1235, ppid: 1, user: "root".into(), args: "cryptsetup reencrypt /dev/sda2".into() };
+        facts.busy_processes.insert(Activity::Cryptsetup, vec![reencrypt]);
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.load_average_1min = 2.5;
         let crawl = Inhibitor { what: "shutdown".into(), who: "crawl".into(), why: "archiving".into(), mode: "block".into(), pid: 42, user: "at".into() };
@@ -208,14 +216,15 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER                   KERNEL\n\
-             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  btrfs device,inhibitor  6.18.54 → 6.18.55\n\
-             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -                       6.18.54\n\
+            "MACHINE  OKAY   SCRUB  BTRFS OP  NIX  SWITCH  TMUX  RSYNC  NET       LOAD  OTHER                              KERNEL\n\
+             one      no     -      balance   -    -       1     -      1.50MB/s  2.50  cryptsetup,btrfs device,inhibitor  6.18.54 → 6.18.55\n\
+             two      yes    -      -         -    -       -     -      1.00kB/s  0.50  -                                  6.18.54\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
+             one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: network: 1.50MB/s is over the limit of 1.00MB/s\n\
              one: load average: 2.50 is over the limit of 2\n\
@@ -240,7 +249,8 @@ mod tests {
         assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 6);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 7);
+        assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);
         assert_eq!(report["facts"]["btrfs"][0]["devices"][0]["missing"], true);
         assert_eq!(report["facts"]["inhibitors"][0]["who"], "crawl");
         assert_eq!(report["facts"]["busy_processes"]["tmux"][0]["pid"], 1234);

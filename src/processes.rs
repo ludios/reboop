@@ -26,6 +26,10 @@ pub enum Activity {
     SwitchToConfiguration,
     Tmux,
     Rsync,
+    /// Interrupting a receive leaves a partial subvolume behind.
+    BtrfsSendReceive,
+    /// Anything from opening a device to reencrypting it
+    Cryptsetup,
 }
 
 impl fmt::Display for Activity {
@@ -35,6 +39,8 @@ impl fmt::Display for Activity {
             Activity::SwitchToConfiguration => "switch-to-configuration",
             Activity::Tmux => "tmux",
             Activity::Rsync => "rsync",
+            Activity::BtrfsSendReceive => "btrfs send/receive",
+            Activity::Cryptsetup => "cryptsetup",
         })
     }
 }
@@ -108,6 +114,12 @@ fn program_names(args: &str) -> Vec<String> {
     names
 }
 
+/// The first argument of a command line that isn't an option, like "send"
+/// in "btrfs -q send /snapshot".
+fn subcommand(args: &str) -> Option<&str> {
+    args.split_whitespace().skip(1).find(|word| !word.starts_with('-'))
+}
+
 /// What `process` is doing that a reboot would interrupt, if anything.
 pub fn activity(process: &Process) -> Option<Activity> {
     // Builders run as the nixbld users.
@@ -127,6 +139,10 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::Tmux)
     } else if is("rsync") {
         Some(Activity::Rsync)
+    } else if is("btrfs") && matches!(subcommand(&process.args), Some("send" | "receive")) {
+        Some(Activity::BtrfsSendReceive)
+    } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
+        Some(Activity::Cryptsetup)
     } else {
         None
     }
@@ -182,7 +198,23 @@ mod tests {
         assert_eq!(activity_of("root", stc_wrapper), Some(Activity::SwitchToConfiguration));
         assert_eq!(activity_of("at", "tmux new -s work"), Some(Activity::Tmux));
         assert_eq!(activity_of("root", "rsync --server -logDtpre.iLsfxCIvu . /backup/"), Some(Activity::Rsync));
-        for args in ["man tmux", "less /var/log/rsync.log", "[kworker/0:1-events]", "sshd: root [priv]", ""] {
+        for args in ["btrfs send -p /snap/a /snap/b", "/nix/store/abc-btrfs-progs-6.17/bin/btrfs -q receive /backup", "btrfs receive -f stream /x"] {
+            assert_eq!(activity_of("root", args), Some(Activity::BtrfsSendReceive), "{args}");
+        }
+        for args in ["cryptsetup reencrypt /dev/sda2", "/nix/store/abc-cryptsetup-2.8.1/bin/cryptsetup luksOpen /dev/sdb x", "cryptsetup-reencrypt /dev/sdc"] {
+            assert_eq!(activity_of("root", args), Some(Activity::Cryptsetup), "{args}");
+        }
+        for args in [
+            "man tmux",
+            "less /var/log/rsync.log",
+            "[kworker/0:1-events]",
+            "sshd: root [priv]",
+            "",
+            "btrfs subvolume snapshot /a /send",
+            "btrfs scrub status /",
+            "btrfs",
+            "systemd-cryptsetup attach data /dev/sdb",
+        ] {
             assert_eq!(activity_of("root", args), None, "{args}");
         }
     }
