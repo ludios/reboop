@@ -62,27 +62,23 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<String> {
 
 /// A table with a row per machine, followed by a line per reason not to
 /// reboot a machine and per machine that couldn't be checked (with any
-/// further lines of the error indented).
+/// further lines of the error indented), a blank line before each machine's.
 fn table(outcomes: &[(&Machine, Outcome)]) -> String {
     let mut rows = vec![HEADER.map(String::from).to_vec()];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
     let mut text = human::table(&rows);
 
-    let mut details = Vec::new();
     for (machine, outcome) in outcomes {
-        match outcome {
-            Ok((_, blockers)) => details.extend(blockers.iter().map(|blocker| format!("{}: {blocker}", machine.hostname))),
-            Err(error) => {
-                let error = format!("{error:#}").replace('\n', "\n    ");
-                details.push(format!("{}: {error}", machine.hostname));
-            }
-        }
-    }
-    if !details.is_empty() {
-        text.push('\n');
-        for line in details {
-            text.push_str(&line);
+        let details: Vec<String> = match outcome {
+            Ok((_, blockers)) => blockers.iter().map(|blocker| format!("{}: {blocker}", machine.hostname)).collect(),
+            Err(error) => vec![format!("{}: {}", machine.hostname, format!("{error:#}").replace('\n', "\n    "))],
+        };
+        if !details.is_empty() {
             text.push('\n');
+            for line in details {
+                text.push_str(&line);
+                text.push('\n');
+            }
         }
     }
     text
@@ -192,6 +188,7 @@ mod tests {
              \n\
              one: btrfs on /: balance\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
+             \n\
              three: failed to open a session: no route to host\n    second line\n"
         );
         assert_eq!(exit_status(&outcomes), 1);
