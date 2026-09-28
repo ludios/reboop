@@ -6,7 +6,7 @@ use clap::{ColorChoice, Parser};
 use mimalloc::MiMalloc;
 use reboop::{check, luks_password};
 use std::process::ExitCode;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -60,9 +60,8 @@ fn styles(stream: &impl RawStream, color: ColorChoice) -> bool {
 }
 
 fn main() -> ExitCode {
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("warn"))
-        .unwrap();
+    // Directives in RUST_LOG that don't parse are reported and skipped.
+    let env_filter = EnvFilter::builder().with_default_directive(LevelFilter::WARN.into()).from_env_lossy();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(styles(&std::io::stderr(), ColorChoice::Auto))
