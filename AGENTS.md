@@ -24,7 +24,9 @@ Before starting or resuming work, check what `hostname` outputs.
 - If it ends in "clank", run whatever commands you need.
 - Otherwise, stop and ask the user to edit this file.
 
-When waiting on something to complete, generally don't use `sleep N` where N > 10; use the built-in task watching, or e.g. `wait-for-process-exit PID`, or loop something e.g. `rg -q PATTERN FILE` with a 2 second wait.
+When waiting on something, generally don't use `sleep N` where N > 10; use the built-in task watching, or e.g. `wait-for-process-exit PID`, or loop something e.g. `rg -q PATTERN FILE` with a 2 second wait.
+
+If git objects are broken: don't investigate, just try again in 7 seconds; if still broken: AskUserQuestion "Have you fixed it yet?" Y/N.
 
 # Avoid consuming tokens in excess
 
@@ -131,6 +133,7 @@ If acting on code reviews from Codex, Claude, or some other agent, inside the be
 After each commit you make, get it reviewed by Codex and by Claude, all at xhigh reasoning:
 
 	codex review --commit <sha> -c model="gpt-6-astra" -c model_reasoning_effort="xhigh"
+	codex review --commit <sha> -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh"
 	claude -p --model claude-fable-5-1 --effort xhigh "/code-review xhigh commit <sha>"
 	claude -p --model claude-opus-5-5 --effort xhigh "/code-review xhigh commit <sha>"
 
