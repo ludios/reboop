@@ -291,10 +291,10 @@ mod tests {
 
     #[test]
     fn command_dials_the_address_under_the_name() {
-        let target = Target { name: "one".into(), address: "10.0.0.1".into(), port: 904 };
+        let target = Target { name: "one".into(), address: "10.0.0.1".into(), port: 22 };
         let command = Ssh { extra_args: vec!["-F".into(), "config".into()] }.command(&target, &["-T"], "true");
         let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
-        let tail = ["-T", "-F", "config", "-o", "HostName=10.0.0.1", "-p", "904", "root@one", "--", "true"];
+        let tail = ["-T", "-F", "config", "-o", "HostName=10.0.0.1", "-p", "22", "root@one", "--", "true"];
         assert_eq!(args[args.len() - tail.len()..], tail);
     }
 

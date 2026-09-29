@@ -275,7 +275,7 @@ pub(crate) fn test_machine() -> Machine {
     Machine {
         hostname: "one".into(),
         ipv4: std::net::Ipv4Addr::new(10, 0, 0, 1),
-        ssh_port: 904,
+        ssh_port: 22,
         initrd_ssh_port: 23,
         scrub_mounts: vec!["/".into()],
         max_network_transfer_bytes_per_sec: 1_000_000,

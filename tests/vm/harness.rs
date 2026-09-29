@@ -123,7 +123,7 @@ fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
     let _ = fs::remove_file(&pidfile);
     let output = command
         .args(["-device", "virtio-rng-pci"])
-        .args(["-nic", &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:904,hostfwd=tcp:127.0.0.1:{initrd_ssh_port}-:23")])
+        .args(["-nic", &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:22,hostfwd=tcp:127.0.0.1:{initrd_ssh_port}-:23")])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-serial", &arg("file:", &dir.join("console.log"))])
         .args(["-daemonize", "-pidfile", &pidfile.display().to_string()])

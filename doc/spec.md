@@ -31,7 +31,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
 ```
 {
-    "ssh_port": 904,
+    "ssh_port": 22,
     "initrd_ssh_port": 23,
     "scrub_mounts": ["/"],
     "max_network_transfer_bytes_per_sec": 1000000,
@@ -45,7 +45,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 `~/.config/reboop/machines.jsonl`
 
 ```
-{"hostname": "one", "ipv4": "...", "ssh_port": 22, "initrd_ssh_port": 23, "stop_services": []}
+{"hostname": "one", "ipv4": "...", "ssh_port": 2222, "initrd_ssh_port": 23, "stop_services": []}
 {"hostname": "two", "ipv4": "...", "scrub_mounts": ["/", "/small"]}
 {"hostname": "three", "ipv4": "...", "max_network_transfer_bytes_per_sec": 1000000, "max_load_average_1min": 2}
 ```
@@ -123,9 +123,9 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
 ## Postflight
 
-1. Keep trying to SSH in over port 904, with a 15 second timeout, once every 15 seconds:
+1. Keep trying to SSH in over port 22, with a 15 second timeout, once every 15 seconds:
 
-    `ssh root@[ipv4 address of machine] -p 904`
+    `ssh root@[ipv4 address of machine] -p 22`
 
 2. Wait for the system to finish booting:
 

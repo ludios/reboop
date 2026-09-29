@@ -221,7 +221,7 @@ mod tests {
 
     const DEFAULTS: &str = r#"{
         // comments are fine
-        "ssh_port": 904,
+        "ssh_port": 22,
         "initrd_ssh_port": 23,
         "scrub_mounts": ["/"],
         "max_network_transfer_bytes_per_sec": 1000000,
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn machines_override_defaults() {
-        let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 22}\n\n\
+        let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 2222}\n\n\
                         {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": []}\n";
         let machines = parse(Some(DEFAULTS), machines, Path::new(HOME)).unwrap();
         assert_eq!(
@@ -243,7 +243,7 @@ mod tests {
             Machine {
                 hostname: "one".into(),
                 ipv4: Ipv4Addr::new(10, 0, 0, 1),
-                ssh_port: 22,
+                ssh_port: 2222,
                 initrd_ssh_port: 23,
                 scrub_mounts: vec!["/".into()],
                 max_network_transfer_bytes_per_sec: 1_000_000,
@@ -253,11 +253,11 @@ mod tests {
                 stop_services: vec!["postgresql".into()],
             }
         );
-        assert_eq!(machines[1].ssh_port, 904);
+        assert_eq!(machines[1].ssh_port, 22);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
         assert_eq!(machines[1].luks_signing_key, Path::new("/keys/two.pub"));
         assert_eq!(machines[1].stop_services, Vec::<String>::new());
-        assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 904 });
+        assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 22 });
         assert_eq!(find(&machines, "two").unwrap(), &machines[1]);
         assert!(find(&machines, "three").is_err());
     }
@@ -286,7 +286,7 @@ mod tests {
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgres*"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql", "container@db.service"]}"#).is_ok());
         assert!(line("{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\"}\n{\"hostname\": \"one\", \"ipv4\": \"10.0.0.2\"}").is_err());
-        assert!(parse(Some(r#"{"ssh_port": 904, "extra": 1}"#), "", Path::new(HOME)).is_err());
+        assert!(parse(Some(r#"{"ssh_port": 22, "extra": 1}"#), "", Path::new(HOME)).is_err());
         let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#, Path::new(HOME)).unwrap_err();
         assert!(format!("{error:#}").contains("no ssh_port"), "{error:#}");
     }

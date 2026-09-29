@@ -3,8 +3,8 @@
 # What the NixOS machines that reboop's VM tests run against have in common
 # (see systemd-boot.nix and grub.nix for the machines themselves).  They
 # resemble the real machines where that matters (a btrfs root, a systemd
-# initrd, sshd on port 904, zsh as root's shell) and are otherwise stripped
-# down to boot quickly.
+# initrd, zsh as root's shell) and are otherwise stripped down to boot
+# quickly.
 #
 # `variant` is "base" or "alt", two configurations for tests to switch
 # between.  They'd ideally differ in their kernel too, but any second kernel
@@ -42,7 +42,6 @@
 
   services.openssh = {
     enable = true;
-    ports = [ 904 ];
     settings = {
       PasswordAuthentication = false;
       KbdInteractiveAuthentication = false;
