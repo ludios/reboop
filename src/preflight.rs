@@ -149,9 +149,9 @@ pub fn root_full(machine: &Machine, facts: &Facts) -> bool {
     facts.root_used_percent >= machine.root_full_percent
 }
 
-/// The reasons not to reboot `machine`, given `facts` about it, one line
-/// each for people.  Empty if it's okay to reboot.
-pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
+/// Like [`blockers`], but leaving out the limits on load average and network
+/// traffic.
+pub fn blockers_ignoring_load_and_network(machine: &Machine, facts: &Facts) -> Vec<String> {
     let mut blockers = boot_problems(facts);
     for fs in &facts.btrfs {
         // Linux hangs on shutdown while a scrub is running.
@@ -200,15 +200,22 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
     for job in &facts.lasting_jobs {
         blockers.push(format!("systemd job: {} {} ({}) for {seconds}s or more", job.job_type, job.unit, job.state));
     }
+    if root_full(machine, facts) {
+        blockers.push(format!("root filesystem: {}% used, and it's full at {}%", facts.root_used_percent, machine.root_full_percent));
+    }
+    blockers
+}
+
+/// The reasons not to reboot `machine`, given `facts` about it, one line
+/// each for people.  Empty if it's okay to reboot.
+pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
+    let mut blockers = blockers_ignoring_load_and_network(machine, facts);
     if network_over_limit(machine, facts) {
         let (rate, limit) = (human::rate(facts.network_bytes_per_sec), human::rate(machine.max_network_transfer_bytes_per_sec as f64));
         blockers.push(format!("network: {rate} is over the limit of {limit}"));
     }
     if load_over_limit(machine, facts) {
         blockers.push(format!("load average: {:.2} is over the limit of {}", facts.load_average_1min, machine.max_load_average_1min));
-    }
-    if root_full(machine, facts) {
-        blockers.push(format!("root filesystem: {}% used, and it's full at {}%", facts.root_used_percent, machine.root_full_percent));
     }
     blockers
 }
@@ -326,8 +333,9 @@ mod tests {
         facts.load_average_1min = 2.01;
         facts.network_bytes_per_sec = 1_500_000.0;
         facts.root_used_percent = 97;
+        let all = blockers(&test_machine(), &facts);
         assert_eq!(
-            blockers(&test_machine(), &facts),
+            all,
             [
                 "btrfs on /: scrub has 3m 30s left, 500.00 kB of 1.00 MB (50.00%) scrubbed at 100.00 kB/s, no errors found",
                 "btrfs on /small: balance paused",
@@ -337,11 +345,12 @@ mod tests {
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",
                 "systemd job: start nixos-upgrade.service (running) for 5s or more",
+                "root filesystem: 97% used, and it's full at 97%",
                 "network: 1.50 MB/s is over the limit of 1.00 MB/s",
                 "load average: 2.01 is over the limit of 2",
-                "root filesystem: 97% used, and it's full at 97%",
             ]
         );
+        assert_eq!(blockers_ignoring_load_and_network(&test_machine(), &facts), all[..all.len() - 2]);
     }
 
     #[test]

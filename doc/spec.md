@@ -93,6 +93,8 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
     `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have.
 
+    Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which stop_services are still stopped, and leave it at that.
+
     `shutdown -r now`
 
 2. After disconnection, keep trying to SSH in over port 23, with a 15 second timeout, once every 15 seconds:

@@ -254,9 +254,9 @@ mod tests {
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: systemd job: start nixos-upgrade.service (running) for 5s or more\n\
+             one: root filesystem: 98% used, and it's full at 97%\n\
              one: network: 12.50 MB/s is over the limit of 1.00 MB/s\n\
              one: load average: 12.50 is over the limit of 2\n\
-             one: root filesystem: 98% used, and it's full at 97%\n\
              \n\
              three: failed to open a session: no route to host\n    second line\n"
         );

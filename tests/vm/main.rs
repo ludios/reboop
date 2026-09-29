@@ -573,6 +573,7 @@ fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
 fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let machine = vm_machine(vm);
+    let hostname = &machine.hostname;
     let password = || vm.luks_password().map(str::to_string);
     // Bounces the VM, printing what it says, and returns that too.
     let bounce_vm = || -> Result<(Outcome, String)> {
@@ -597,6 +598,20 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     sh(&mut session, is_active)?;
     clean_up(&mut session)?;
 
+    // Nor when something starts while the stop_services stop, here a job
+    // that stopping one starts, which is left stopped.  (Absolute paths,
+    // since transient units get a minimal PATH.)
+    sh(&mut session, r#"systemd-run --quiet --unit=reboop-test-sleep \
+        -p "ExecStopPost=$(command -v systemd-run) --quiet --no-block --unit=reboop-test-job -p Type=oneshot $(command -v sleep) 600" sleep 600"#)?;
+    let (Outcome::NotOkay(blockers), printed) = bounce_vm()? else {
+        bail!("bounced despite the job");
+    };
+    assert_eq!(blockers, ["systemd job: start reboop-test-job.service (running) for 5s or more"]);
+    assert!(printed.contains(&format!("\nStill stopped on {hostname}:\n    reboop-test-sleep.service\n")), "{printed}");
+    assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    assert_ne!(session.run(is_active, MINUTE)?.status, 0);
+    clean_up(&mut session)?;
+
     let before = facts::systems(&mut session)?;
     let systems = &vm.manifest.systems;
     let (next, next_variant) = if before.current == systems.base { (&systems.alt, "alt") } else { (&systems.base, "base") };
@@ -610,7 +625,11 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     let (outcome, printed) = bounce_vm()?;
     assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
-    assert!(printed.contains("\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n"));
+    let stopping = format!(
+        "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
+         Checking again whether {hostname} is okay to reboot\nAsking {hostname} to reboot\n"
+    );
+    assert!(printed.contains(&stopping), "{printed}");
     if vm.manifest.initrd.is_some() {
         assert!(printed.contains("\nThe stored LUKS password opens /dev/vda2\n"));
     } else {

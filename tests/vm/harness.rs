@@ -288,6 +288,8 @@ fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<Pat
 
 /// Tests name everything they create "reboop-test-*".
 const CLEAN_UP: &str = r#"
+# Twice, for units that start others as they stop
+systemctl stop 'reboop-test-*' 2>/dev/null
 systemctl stop 'reboop-test-*' 2>/dev/null
 systemctl reset-failed 'reboop-test-*' 2>/dev/null
 for m in /mnt/reboop-test-*; do

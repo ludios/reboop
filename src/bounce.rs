@@ -120,7 +120,8 @@ fn indented_list(heading: &str, items: impl IntoIterator<Item = impl AsRef<str>>
 #[derive(Debug)]
 pub enum Outcome {
     /// The machine wasn't okay to reboot, for these reasons, so it wasn't
-    /// rebooted.
+    /// rebooted.  If that only turned out once its stop_services were
+    /// stopped, they're left stopped.
     NotOkay(Vec<String>),
     /// The machine came back with these problems, which are none if all is
     /// well.
@@ -161,9 +162,11 @@ fn password_for_initrd(
 }
 
 /// Stops `machine`'s stop_services in order, over `session`.  Fails, with the
-/// machine still up, if systemctl fails to stop one.  Returns the problems:
-/// services that systemd doesn't say stopped cleanly.
-fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer) -> Result<Vec<String>> {
+/// machine still up, if systemctl fails to stop one.  Returns the services
+/// that are stopped now (leaving out those the machine doesn't have), and
+/// the problems: services that systemd doesn't say stopped cleanly.
+fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer) -> Result<(Vec<String>, Vec<String>)> {
+    let mut stopped = Vec::new();
     let mut problems = Vec::new();
     for service in &machine.stop_services {
         match reboot::stop_unit(session, service, STOP_TIMEOUT)? {
@@ -173,10 +176,14 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
                 printer.styled_line(Red, &problem);
                 problems.push(problem);
             }
-            Stopped::NotLoaded => printer.line(&format!("There's no {service} to stop")),
+            Stopped::NotLoaded => {
+                printer.line(&format!("There's no {service} to stop"));
+                continue;
+            }
         }
+        stopped.push(service.clone());
     }
-    Ok(problems)
+    Ok((stopped, problems))
 }
 
 /// Opens a session to `target` once it's up in a boot other than
@@ -299,10 +306,11 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
 
 /// Bounces `machine`, telling the user about it with `printer`: checks that
 /// it's okay to reboot; if it has a LUKS device beneath /, gets the password
-/// from `password` and tests it; stops its stop_services; reboots it; answers
-/// its initrd's password prompt; waits for it to come back; shows how it
-/// did; and scrubs its scrub_mounts.  Problems along the way are collected
-/// for the end.
+/// from `password` and tests it; stops its stop_services; checks again,
+/// apart from load and network traffic (leaving the stop_services stopped if
+/// it's no longer okay); reboots it; answers its initrd's password prompt;
+/// waits for it to come back; shows how it did; and scrubs its
+/// scrub_mounts.  Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
 /// reboot; after, it may be down, e.g. waiting at its initrd.
@@ -320,7 +328,21 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", systems.default, systems.default_kernel));
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
-    let mut problems = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
+    let (stopped, mut problems) = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
+
+    // Testing the password and stopping services take a while, during which
+    // a timer, say, may have started an upgrade or scrub.  Stopping services
+    // changes the load and network traffic, so those don't count now.
+    printer.line(&format!("Checking again whether {hostname} is okay to reboot"));
+    let facts = preflight::gather(&mut session, hostname).with_context(not_rebooted)?;
+    let blockers = preflight::blockers_ignoring_load_and_network(machine, &facts);
+    if !blockers.is_empty() {
+        printer.styled_line(Red, &indented_list(&format!("Not rebooting {hostname} after all:"), &blockers));
+        if !stopped.is_empty() {
+            printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
+        }
+        return Ok(Outcome::NotOkay(blockers));
+    }
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
     reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot"))?;
