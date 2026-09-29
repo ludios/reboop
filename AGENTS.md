@@ -139,12 +139,14 @@ After each commit you make, get it reviewed by Codex and by Claude, all at xhigh
 
 Notes:
 
-- Codex is configured globally in `~/.codex/config.toml` (`approval_policy = "never"`, `sandbox_mode = "danger-full-access"`) to never ask for permission and run unsandboxed, so reviews and `codex exec` runs never block on prompts. If codex ever stalls waiting for approval, check that file.
-- A review can take several minutes; run them all in the background at once. The reviewers read the working tree, so don't edit files until all the reviews are in.
-- The findings are from **fallible machines**: think hard before adding a bunch of code to handle an irrelevant edge case.
-- Once all the reviews are in, fix the oversights that are really worth fixing and make one more commit as usual. If you fixed nothing, say briefly in your reply why the findings didn't warrant changes.
-- Do _not_ send that follow-up fix commit through another review — the review cycle for a change ends after one round of findings and fixes. (Exception: the follow-up grew into something substantial beyond addressing the findings.)
-- If you made several commits in a row, make sure the reviews cover all of them: either review each commit, or review the whole batch at once by replacing `--commit <sha>` with `--base <sha before your first commit>` for Codex, and `commit <sha>` with `commits <sha before your first commit>..<sha of your last commit>` for Claude.
+- If you made several commits, ensure reviews cover them all: either review each commit, or, a whole batch:
+	- codex: replace `--commit <sha>` with `--base <sha before your first commit>`
+	- claude: replace `commit <sha>` with `commits <sha before your first commit>..<sha of your last commit>`
+- Codex is already configured globally to never ask for permission and run unsandboxed.
+- A review can take several minutes; start them all in the background. Reviewers read the working tree, so don't edit files until the reviews are in.
+- Review findings are from **fallible machines eager to find issues**: think and prefer fixes that don't add a bunch of code we don't really need.
+- Once all the reviews are in, fix the oversights that are really worth fixing, in one or more commits. If nothing, say briefly why the findings didn't warrant changes.
+- Do _not_ send follow-up fixes through another review. (Exception: the follow-up grew into something substantial beyond addressing the findings.)
 
 # Thank you for your hard work on this project
 
