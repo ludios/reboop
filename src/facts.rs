@@ -118,13 +118,13 @@ fn network_sample(before: &NetSnapshot, after: &NetSnapshot) -> Result<NetworkSa
     ensure!(seconds > 0.0, "uptime didn't advance while sampling the network");
     let mut interfaces = BTreeMap::new();
     for (name, (received, sent)) in &after.1 {
-        // Interfaces that came or went during the sample are ignored.
+        // Interfaces that came or went during the sample are ignored, as are
+        // those whose byte counters went backwards: they were recreated.
         let Some((received_before, sent_before)) = before.1.get(name) else { continue };
         if name == "lo" {
             continue;
         }
-        let deltas = received.checked_sub(*received_before).zip(sent.checked_sub(*sent_before));
-        let deltas = deltas.ok_or_else(|| anyhow!("byte counters of {name} went backwards while sampling"))?;
+        let Some(deltas) = received.checked_sub(*received_before).zip(sent.checked_sub(*sent_before)) else { continue };
         interfaces.insert(name.clone(), deltas);
     }
     Ok(NetworkSample { seconds, interfaces })
@@ -351,10 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_counters_going_backwards() {
+    fn ignores_recreated_interfaces() {
         let before = parse_net_snapshot(&snapshot("100", (1_000, 2_000))).unwrap();
         let after = parse_net_snapshot(&snapshot("101", (500, 2_000))).unwrap();
-        assert!(network_sample(&before, &after).is_err());
+        assert_eq!(network_sample(&before, &after).unwrap().interfaces, BTreeMap::new());
     }
 
     #[test]

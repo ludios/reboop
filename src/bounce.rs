@@ -128,6 +128,20 @@ pub enum Outcome {
     Bounced(Vec<String>),
 }
 
+/// Makes sure that `machine`'s initrd will be where bounce looks for it, given
+/// what the boot loader will boot (`boots`): that it won't take a static
+/// address (ip=) other than the machine's.
+fn check_initrd_addresses(machine: &Machine, boots: &[DefaultBoot]) -> Result<()> {
+    for boot in boots {
+        let addresses = boot.initrd_addresses();
+        let elsewhere = !addresses.is_empty() && !addresses.contains(&machine.ipv4);
+        let addresses: Vec<_> = addresses.iter().map(Ipv4Addr::to_string).collect();
+        let (loader, entry, ipv4) = (&boot.loader, &boot.entry, machine.ipv4);
+        ensure!(!elsewhere, "{loader}'s default, {entry:?}, has the initrd take {} (ip=), not {ipv4}", addresses.join(" and "));
+    }
+    Ok(())
+}
+
 /// The password that `machine`'s initrd will ask for, if any: if `machine`
 /// (at the other end of `session`) has a LUKS device beneath /, gets it from
 /// `password`, and makes sure that it opens the device, and that the initrd
@@ -146,13 +160,7 @@ fn password_for_initrd(
         printer.line("There's no LUKS device beneath /, so there'll be nothing to unlock");
         return Ok(None);
     }
-    for boot in boots {
-        let addresses = boot.initrd_addresses();
-        let elsewhere = !addresses.is_empty() && !addresses.contains(&machine.ipv4);
-        let addresses: Vec<_> = addresses.iter().map(Ipv4Addr::to_string).collect();
-        let (loader, entry, ipv4) = (&boot.loader, &boot.entry, machine.ipv4);
-        ensure!(!elsewhere, "{loader}'s default, {entry:?}, has the initrd take {} (ip=), not {ipv4}", addresses.join(" and "));
-    }
+    check_initrd_addresses(machine, boots)?;
     let password = password().with_context(|| format!("couldn't get the stored LUKS password (`reboop set-luks-password {hostname}` sets it)"))?;
     let deadline = Deadline::after(OPEN_TIMEOUT + QUICK);
     let (device, opens) = initrd::test_luks_password(ssh, &machine.target(), &password, deadline)?;
@@ -184,6 +192,22 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
         stopped.push(service.clone());
     }
     Ok((stopped, problems))
+}
+
+/// Checks again whether `machine` (at the other end of `session`) is okay to
+/// reboot, as testing the password and stopping services take a while,
+/// during which a timer, say, may have started an upgrade or scrub.
+/// Stopping services changes the load and network traffic, so those don't
+/// count.  If it has a LUKS device beneath / (`luks`), also makes sure that
+/// its initrd will still be where bounce looks for it.  Returns the facts
+/// and the reasons not to reboot (none if it's okay).
+fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(Facts, Vec<String>)> {
+    let facts = preflight::gather(session, &machine.hostname)?;
+    if luks {
+        check_initrd_addresses(machine, &facts.boot)?;
+    }
+    let blockers = preflight::blockers_ignoring_load_and_network(machine, &facts);
+    Ok((facts, blockers))
 }
 
 /// Opens a session to `target` once it's up in a boot other than
@@ -330,19 +354,24 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
     let (stopped, mut problems) = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
 
-    // Testing the password and stopping services take a while, during which
-    // a timer, say, may have started an upgrade or scrub.  Stopping services
-    // changes the load and network traffic, so those don't count now.
-    printer.line(&format!("Checking again whether {hostname} is okay to reboot"));
-    let facts = preflight::gather(&mut session, hostname).with_context(not_rebooted)?;
-    let blockers = preflight::blockers_ignoring_load_and_network(machine, &facts);
-    if !blockers.is_empty() {
-        printer.styled_line(Red, &indented_list(&format!("Not rebooting {hostname} after all:"), &blockers));
+    let still_stopped = |printer: &mut Printer| {
         if !stopped.is_empty() {
             printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
         }
-        return Ok(Outcome::NotOkay(blockers));
-    }
+    };
+    printer.line(&format!("Checking again whether {hostname} is okay to reboot"));
+    let facts = match check_again(machine, &mut session, password.is_some()) {
+        Ok((facts, blockers)) if blockers.is_empty() => facts,
+        Ok((_, blockers)) => {
+            printer.styled_line(Red, &indented_list(&format!("Not rebooting {hostname} after all:"), &blockers));
+            still_stopped(printer);
+            return Ok(Outcome::NotOkay(blockers));
+        }
+        Err(error) => {
+            still_stopped(printer);
+            return Err(error.context(not_rebooted()));
+        }
+    };
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
     reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot"))?;

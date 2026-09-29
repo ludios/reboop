@@ -70,6 +70,12 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     let fqdn_of_actual = hostname.strip_prefix(actual.as_str()).is_some_and(|domain| domain.starts_with('.'));
     ensure!(actual == hostname || fqdn_of_actual, "{} calls itself {actual:?}, not {hostname:?}", session.target());
 
+    // The sample comes first, so that the rest is as fresh as can be.
+    let jobs_before = facts::jobs(session)?;
+    let network_bytes_per_sec = facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec();
+    let mut lasting_jobs = facts::jobs(session)?;
+    lasting_jobs.retain(|job| jobs_before.iter().any(|before| before.id == job.id));
+
     let mut busy_processes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for process in processes::list(session)? {
         if let Some(activity) = processes::activity(&process) {
@@ -83,10 +89,6 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         let devices = btrfs::devices(session, &filesystem)?;
         btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub, devices });
     }
-    let jobs_before = facts::jobs(session)?;
-    let network_bytes_per_sec = facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec();
-    let mut lasting_jobs = facts::jobs(session)?;
-    lasting_jobs.retain(|job| jobs_before.iter().any(|before| before.id == job.id));
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
         systems: facts::systems(session)?,
