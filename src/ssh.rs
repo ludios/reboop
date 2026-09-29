@@ -5,7 +5,7 @@
 
 use crate::child::ChildProcess;
 use crate::deadline::{Deadline, Permanent, retry};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::fmt;
@@ -197,11 +197,10 @@ impl Session {
                 Some(_) => {}
                 None => {
                     let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-                    let message = format!("failed to open a session to {target}: {stderr}");
                     if is_permanent_failure(&stderr) {
-                        return Err(Permanent(message).into());
+                        return Err(Permanent(format!("failed to open a session to {target}: {stderr}")).into());
                     }
-                    bail!(message);
+                    return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
                 }
             }
         }

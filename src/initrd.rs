@@ -243,7 +243,7 @@ pub fn wait_and_unlock(
 ) -> Result<Vec<String>> {
     let attempt = |deadline| match unlock(ssh, target, password, deadline) {
         Ok(prompts) => Ok(Ok(prompts)),
-        Err(UnlockError::Unreachable(stderr)) => bail!("couldn't reach the initrd at {target}: {stderr}"),
+        Err(UnlockError::Unreachable(stderr)) => Err(anyhow!(stderr.trim_end().to_string()).context(format!("couldn't reach the initrd at {target}"))),
         Err(fatal) => Ok(Err(fatal)),
     };
     let result = retry(deadline, interval, attempt, on_retry)?;

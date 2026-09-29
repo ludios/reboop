@@ -107,12 +107,14 @@ mod tests {
     #[test]
     fn retry_gives_up_with_last_error() {
         let mut calls = 0;
+        let mut retried = 0;
         let error = retry(Deadline::after(Duration::from_millis(50)), Duration::from_millis(20), |_| -> Result<()> {
             calls += 1;
             bail!("failure {calls}")
-        }, |_| ())
+        }, |_| retried += 1)
         .unwrap_err();
         assert!((2..=4).contains(&calls), "{calls} calls");
+        assert_eq!(retried, calls - 1, "the last error isn't retried");
         assert!(format!("{error:#}").contains(&format!("failure {calls}")));
     }
 }

@@ -20,7 +20,7 @@ use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long each of a machine's stop_services gets to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -107,26 +107,20 @@ impl<'a> Printer<'a> {
     }
 
     /// Shows `text` on the last line in place of the previous progress, if
-    /// rewriting, after the time if timestamped.  Runs of whitespace, like
-    /// line breaks, become single spaces.
+    /// rewriting, after the time if timestamped and there's room.  Runs of
+    /// whitespace, like line breaks, become single spaces.
     fn progress(&mut self, text: &str) {
         let Some(columns) = self.columns else { return };
-        let time = self.clock.map(|clock| clock());
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let line = match &time {
-            Some(time) => format!("{time} {text}"),
-            None => text,
-        };
         // \r only goes back to the start of the last row, so the line has to
         // fit in one, with room for the cursor.
-        let line = human::truncate(&line, columns().saturating_sub(1).max(1));
-        let chars = line.chars().count();
-        let line = match &time {
-            // Unless the time itself was cut short
-            Some(time) if line.starts_with(time.as_str()) => format!("{}{}", self.paint(Dim, time), &line[time.len()..]),
-            _ => line,
-        };
-        let _ = write!(self.out, "\r{line}{}", " ".repeat(self.progress_chars.saturating_sub(chars)));
+        let width = columns().saturating_sub(1).max(1);
+        // The time and a space, if that leaves room for some of the text
+        let time = self.clock.map(|clock| clock()).filter(|time| time.chars().count() + 1 < width);
+        let time_chars = time.as_ref().map_or(0, |time| time.chars().count() + 1);
+        let text = human::truncate(&text.split_whitespace().collect::<Vec<_>>().join(" "), width - time_chars);
+        let chars = time_chars + text.chars().count();
+        let time = time.map_or(String::new(), |time| format!("{} ", self.paint(Dim, &time)));
+        let _ = write!(self.out, "\r{time}{text}{}", " ".repeat(self.progress_chars.saturating_sub(chars)));
         let _ = self.out.flush();
         self.progress_chars = chars;
     }
@@ -247,12 +241,16 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
     Ok((facts, blockers))
 }
 
-/// What to do when a try fails while waiting for something: show on
-/// `printer`'s progress line how long it's been waiting, and why the last
-/// try failed.
-fn still_waiting<'p>(printer: &'p mut Printer) -> impl FnMut(&anyhow::Error) + 'p {
-    let started = Instant::now();
-    move |error| printer.progress(&format!("Still waiting after {}: {error:#}", human::seconds(started.elapsed().as_secs())))
+/// Shows on `printer`'s progress line why the last try at something
+/// failed: the last line of `error`'s root cause, since the line before
+/// says what it's trying (or all of `error`, if that line is blank).
+fn show_last_try(printer: &mut Printer, error: &anyhow::Error) {
+    let cause = error.root_cause().to_string();
+    let reason = match cause.lines().map(str::trim).rfind(|line| !line.is_empty()) {
+        Some(line) => line.to_string(),
+        None => format!("{error:#}"),
+    };
+    printer.progress(&format!("Last try: {reason}"));
 }
 
 /// Opens a session to `target` once it's up in a boot other than
@@ -261,7 +259,7 @@ fn still_waiting<'p>(printer: &'p mut Printer) -> impl FnMut(&anyhow::Error) + '
 fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: Deadline, on_retry: impl FnMut(&anyhow::Error)) -> Result<Session> {
     let attempt = |deadline: Deadline| {
         let mut session = Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining())?;
-        ensure!(facts::boot_id(&mut session)? != old_boot_id, "{target} hasn't rebooted yet");
+        ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
         Ok(session)
     };
     retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{target} didn't come back"))
@@ -339,7 +337,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
     if let Some(password) = password {
         let initrd_target = machine.initrd_target();
         printer.line(&format!("Waiting for the initrd at {initrd_target}"));
-        let prompts = initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline, still_waiting(printer))?;
+        let prompts = initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline, |error| show_last_try(printer, error))?;
         for prompt in prompts {
             printer.line(&format!("Answered {}", printer.bold(format!("{prompt:?}"))));
         }
@@ -350,7 +348,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
     }
     let target = machine.target();
     printer.line(&format!("Waiting for {target}"));
-    let mut session = wait_for_new_boot(ssh, &target, &before.boot_id, deadline, still_waiting(printer))?;
+    let mut session = wait_for_new_boot(ssh, &target, &before.boot_id, deadline, |error| show_last_try(printer, error))?;
     let mut problems = postflight(&mut session, &before.systems, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
@@ -455,9 +453,8 @@ fn terminal_columns() -> usize {
 }
 
 /// Bounces the configured machine `hostname` (see [`bounce`]), in color if
-/// `color`.  Returns the exit status: 0 if it came
-/// back fine, 1 if it came back with problems, or 2 if it wasn't okay to
-/// reboot.
+/// `color`.  Returns the exit status: 0 if it came back fine, 1 if it came
+/// back with problems, or 2 if it wasn't okay to reboot.
 pub fn run(hostname: &str, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
@@ -533,8 +530,26 @@ mod tests {
         });
         let time = "\x1b[2m12:34:56\x1b[0m";
         assert_eq!(text, format!("{time} \x1b[31mproblems:\n             one\x1b[0m\n\r{time} two lines\r{time} more than…\n"));
-        let text = printed(true, Some(|| 6), Some(|| "12:34:56".into()), |printer| printer.progress("cut"));
-        assert_eq!(text, "\r12:3…\n");
+        // Without room for the time and some of the text, just the text
+        let text = printed(true, Some(|| 10), Some(|| "12:34:56".into()), |printer| printer.progress("cut short"));
+        assert_eq!(text, "\rcut short\n");
+    }
+
+    #[test]
+    fn tells_the_time() {
+        let time = time_of_day();
+        let shape = time.char_indices().all(|(i, c)| if i % 3 == 2 { c == ':' } else { c.is_ascii_digit() });
+        assert!(time.len() == 8 && shape, "{time}");
+    }
+
+    #[test]
+    fn shows_why_the_last_try_failed() {
+        let stderr = "Warning: Permanently added '10.0.0.5' (ED25519) to the list of known hosts.\r\nConnection refused\n";
+        let text = printed(false, Some(|| 80), None, |printer| {
+            show_last_try(printer, &anyhow::anyhow!(stderr).context("failed to open a session to one"));
+            show_last_try(printer, &anyhow::anyhow!(" \n").context("failed to open a session to one"));
+        });
+        assert_eq!(text, "\rLast try: Connection refused\rLast try: failed to open a session to one:\n");
     }
 
     #[test]
