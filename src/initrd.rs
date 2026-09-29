@@ -231,13 +231,22 @@ pub fn unlock(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) ->
 }
 
 /// Like [`unlock`], but when the initrd's sshd is unreachable, tries again
-/// once per `interval` until `deadline`.
-pub fn wait_and_unlock(ssh: &Ssh, target: &Target, password: &str, interval: Duration, deadline: Deadline) -> Result<Vec<String>> {
-    let result = retry(deadline, interval, |deadline| match unlock(ssh, target, password, deadline) {
+/// once per `interval` until `deadline`, passing each such error to
+/// `on_retry` first.
+pub fn wait_and_unlock(
+    ssh: &Ssh,
+    target: &Target,
+    password: &str,
+    interval: Duration,
+    deadline: Deadline,
+    on_retry: impl FnMut(&anyhow::Error),
+) -> Result<Vec<String>> {
+    let attempt = |deadline| match unlock(ssh, target, password, deadline) {
         Ok(prompts) => Ok(Ok(prompts)),
         Err(UnlockError::Unreachable(stderr)) => bail!("couldn't reach the initrd at {target}: {stderr}"),
         Err(fatal) => Ok(Err(fatal)),
-    })?;
+    };
+    let result = retry(deadline, interval, attempt, on_retry)?;
     Ok(result?)
 }
 

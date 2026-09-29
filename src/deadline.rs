@@ -2,7 +2,7 @@
 
 //! Deadlines, and retrying until one passes.
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use std::fmt;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -46,13 +46,15 @@ impl std::error::Error for Permanent {}
 
 /// Calls `attempt` until it succeeds, starting attempts at most once per
 /// `interval`.  Gives up with the last error if it's [`Permanent`] or when
-/// the next attempt would start after `deadline`.
+/// the next attempt would start after `deadline`.  Otherwise, each error is
+/// passed to `on_retry` before waiting to try again.
 ///
 /// `attempt` is given the overall deadline, which it should not exceed.
 pub fn retry<T>(
     deadline: Deadline,
     interval: Duration,
     mut attempt: impl FnMut(Deadline) -> Result<T>,
+    mut on_retry: impl FnMut(&Error),
 ) -> Result<T> {
     loop {
         let started = Instant::now();
@@ -68,6 +70,7 @@ pub fn retry<T>(
             return Err(error.context("gave up retrying at the deadline"));
         }
         debug!("attempt failed, retrying in {:?}: {error:#}", next.remaining());
+        on_retry(&error);
         sleep(next.remaining());
     }
 }
@@ -80,12 +83,14 @@ mod tests {
     #[test]
     fn retry_returns_first_success() {
         let mut calls = 0;
+        let mut retried = Vec::new();
         let value = retry(Deadline::after(Duration::from_secs(5)), Duration::ZERO, |_| {
             calls += 1;
             if calls < 3 { bail!("not yet") } else { Ok(calls) }
-        })
+        }, |error| retried.push(error.to_string()))
         .unwrap();
         assert_eq!(value, 3);
+        assert_eq!(retried, ["not yet", "not yet"]);
     }
 
     #[test]
@@ -94,7 +99,7 @@ mod tests {
         let error = retry(Deadline::after(Duration::from_secs(5)), Duration::ZERO, |_| -> Result<()> {
             calls += 1;
             Err(Permanent("no".into()).into())
-        })
+        }, |_| panic!("retried a permanent error"))
         .unwrap_err();
         assert_eq!((calls, error.to_string()), (1, "no".to_string()));
     }
@@ -105,7 +110,7 @@ mod tests {
         let error = retry(Deadline::after(Duration::from_millis(50)), Duration::from_millis(20), |_| -> Result<()> {
             calls += 1;
             bail!("failure {calls}")
-        })
+        }, |_| ())
         .unwrap_err();
         assert!((2..=4).contains(&calls), "{calls} calls");
         assert!(format!("{error:#}").contains(&format!("failure {calls}")));

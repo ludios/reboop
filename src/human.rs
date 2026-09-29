@@ -57,6 +57,7 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
 pub enum Style {
     Plain,
     Bold,
+    Dim,
     Red,
     Green,
 }
@@ -72,6 +73,7 @@ impl Style {
         let code = match self {
             Style::Plain => return text.to_string(),
             Style::Bold  => "1",
+            Style::Dim   => "2",
             Style::Red   => "31",
             Style::Green => "32",
         };

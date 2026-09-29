@@ -558,10 +558,10 @@ fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
     reboot::reboot(session)?;
     let deadline = Deadline::after(5 * MINUTE);
     let interval = Duration::from_secs(1);
-    let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, "not the password", interval, deadline).unwrap_err();
+    let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, "not the password", interval, deadline, |_| ()).unwrap_err();
     let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
     ensure!(wrong, "expected the password to be rejected, got: {error:#}");
-    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, vm.luks_password()?, interval, deadline)?;
+    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, vm.luks_password()?, interval, deadline, |_| ())?;
     eprintln!("answered {prompts:?}");
 
     let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
@@ -578,7 +578,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     // Bounces the VM, printing what it says, and returns that too.
     let bounce_vm = || -> Result<(Outcome, String)> {
         let mut printed = Vec::new();
-        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, None));
+        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, None, None));
         let printed = String::from_utf8(printed)?;
         print!("{printed}");
         Ok((outcome?, printed))

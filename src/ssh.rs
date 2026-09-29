@@ -264,7 +264,7 @@ impl Session {
 /// Tries to open a session to `target` once per `interval` until one
 /// succeeds, `deadline` passes, or a failure is [`Permanent`].
 pub fn wait_for_session(ssh: &Ssh, target: &Target, interval: Duration, deadline: Deadline) -> Result<Session> {
-    retry(deadline, interval, |deadline| Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining()))
+    retry(deadline, interval, |deadline| Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining()), |_| ())
         .with_context(|| format!("couldn't open a session to {target}"))
 }
 

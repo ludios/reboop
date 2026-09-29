@@ -9,7 +9,7 @@ use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
 use crate::deadline::{Deadline, retry};
 use crate::facts::{self, Systems};
-use crate::human::{self, Style::{self, Plain, Red}};
+use crate::human::{self, Style::{self, Dim, Plain, Red}};
 use crate::initrd;
 use crate::passwords;
 use crate::preflight::{self, Facts};
@@ -19,7 +19,7 @@ use anyhow::{Context, Result, ensure};
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long each of a machine's stop_services gets to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -45,28 +45,44 @@ const SCRUB_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// closed stdout is no reason to leave a machine half-bounced.
 pub struct Printer<'a> {
     out: &'a mut dyn Write,
-    /// Whether to show problems in color.
+    /// Whether to show problems in color, and timestamps dimmed.
     color: bool,
     /// If progress is shown by rewriting the last line (which takes a
     /// terminal), gives the terminal's width, which can change.
     columns: Option<fn() -> usize>,
+    /// If lines start with a timestamp, gives the time of day, like
+    /// "12:03:16".
+    clock: Option<fn() -> String>,
     /// How many characters of progress are on the last line.
     progress_chars: usize,
 }
 
 impl<'a> Printer<'a> {
-    pub fn new(out: &'a mut dyn Write, color: bool, columns: Option<fn() -> usize>) -> Printer<'a> {
-        Printer { out, color, columns, progress_chars: 0 }
+    pub fn new(out: &'a mut dyn Write, color: bool, columns: Option<fn() -> usize>, clock: Option<fn() -> String>) -> Printer<'a> {
+        Printer { out, color, columns, clock, progress_chars: 0 }
+    }
+
+    /// `text` in `style`, if in color.
+    fn paint(&self, style: Style, text: &str) -> String {
+        if self.color { style.paint(text) } else { text.to_string() }
     }
 
     /// Prints `text` in `style` and a newline, in place of any progress on
-    /// the last line.
+    /// the last line.  If timestamped, the first line of `text` comes after
+    /// the time, and the rest after as many spaces.
     fn styled_line(&mut self, style: Style, text: &str) {
         if self.progress_chars > 0 {
             let _ = write!(self.out, "\r{}\r", " ".repeat(self.progress_chars));
             self.progress_chars = 0;
         }
-        let text = if self.color { style.paint(text) } else { text.to_string() };
+        let text = match self.clock {
+            Some(clock) => {
+                let time = clock();
+                let text = text.replace('\n', &format!("\n{}", " ".repeat(time.chars().count() + 1)));
+                format!("{} {}", self.paint(Dim, &time), self.paint(style, &text))
+            }
+            None => self.paint(style, text),
+        };
         let _ = writeln!(self.out, "{text}");
         let _ = self.out.flush();
     }
@@ -82,14 +98,26 @@ impl<'a> Printer<'a> {
     }
 
     /// Shows `text` on the last line in place of the previous progress, if
-    /// rewriting.
+    /// rewriting, after the time if timestamped.  Runs of whitespace, like
+    /// line breaks, become single spaces.
     fn progress(&mut self, text: &str) {
         let Some(columns) = self.columns else { return };
+        let time = self.clock.map(|clock| clock());
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = match &time {
+            Some(time) => format!("{time} {text}"),
+            None => text,
+        };
         // \r only goes back to the start of the last row, so the line has to
         // fit in one, with room for the cursor.
-        let text = human::truncate(text, columns().saturating_sub(1).max(1));
-        let chars = text.chars().count();
-        let _ = write!(self.out, "\r{text}{}", " ".repeat(self.progress_chars.saturating_sub(chars)));
+        let line = human::truncate(&line, columns().saturating_sub(1).max(1));
+        let chars = line.chars().count();
+        let line = match &time {
+            // Unless the time itself was cut short
+            Some(time) if line.starts_with(time.as_str()) => format!("{}{}", self.paint(Dim, time), &line[time.len()..]),
+            _ => line,
+        };
+        let _ = write!(self.out, "\r{line}{}", " ".repeat(self.progress_chars.saturating_sub(chars)));
         let _ = self.out.flush();
         self.progress_chars = chars;
     }
@@ -210,15 +238,24 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
     Ok((facts, blockers))
 }
 
+/// What to do when a try fails while waiting for something: show on
+/// `printer`'s progress line how long it's been waiting, and why the last
+/// try failed.
+fn still_waiting<'p>(printer: &'p mut Printer) -> impl FnMut(&anyhow::Error) + 'p {
+    let started = Instant::now();
+    move |error| printer.progress(&format!("Still waiting after {}: {error:#}", human::seconds(started.elapsed().as_secs())))
+}
+
 /// Opens a session to `target` once it's up in a boot other than
-/// `old_boot_id`, trying once per [`RETRY_INTERVAL`] until `deadline`.
-fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: Deadline) -> Result<Session> {
-    retry(deadline, RETRY_INTERVAL, |deadline| {
+/// `old_boot_id`, trying once per [`RETRY_INTERVAL`] until `deadline`, and
+/// passing each failed try to `on_retry`.
+fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: Deadline, on_retry: impl FnMut(&anyhow::Error)) -> Result<Session> {
+    let attempt = |deadline: Deadline| {
         let mut session = Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining())?;
         ensure!(facts::boot_id(&mut session)? != old_boot_id, "{target} hasn't rebooted yet");
         Ok(session)
-    })
-    .with_context(|| format!("{target} didn't come back"))
+    };
+    retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{target} didn't come back"))
 }
 
 /// What's wrong with how a machine came back, given the systems from
@@ -292,7 +329,8 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
     if let Some(password) = password {
         let initrd_target = machine.initrd_target();
         printer.line(&format!("Waiting for the initrd at {initrd_target}"));
-        for prompt in initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline)? {
+        let prompts = initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline, still_waiting(printer))?;
+        for prompt in prompts {
             printer.line(&format!("Answered {prompt:?}"));
         }
     } else {
@@ -302,7 +340,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
     }
     let target = machine.target();
     printer.line(&format!("Waiting for {target}"));
-    let mut session = wait_for_new_boot(ssh, &target, &before.boot_id, deadline)?;
+    let mut session = wait_for_new_boot(ssh, &target, &before.boot_id, deadline, still_waiting(printer))?;
     let mut problems = postflight(&mut session, &before.systems, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
@@ -386,6 +424,18 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     Ok(Outcome::Bounced(problems))
 }
 
+/// The local time of day, like "12:03:16".
+fn time_of_day() -> String {
+    // SAFETY: time() takes a null pointer to mean it should only return the
+    // time, and an all-zero tm is valid (with a null tm_zone).
+    let (now, mut tm) = unsafe { (libc::time(std::ptr::null_mut()), std::mem::zeroed::<libc::tm>()) };
+    // SAFETY: localtime_r only reads `now` and fills in `tm`.
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return "??:??:??".to_string();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 /// The width of the terminal on stdout, or 80 columns if that's unknown.
 fn terminal_columns() -> usize {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
@@ -404,7 +454,7 @@ pub fn run(hostname: &str, color: bool) -> Result<u8> {
     let password = || passwords::load(&config::passwords_dir()?, hostname, &passwords::master_key(&machine.luks_signing_key)?);
     let mut stdout = io::stdout();
     let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
-    let mut printer = Printer::new(&mut stdout, color, columns);
+    let mut printer = Printer::new(&mut stdout, color, columns, Some(time_of_day));
     Ok(match bounce(&Ssh::default(), machine, password, &mut printer)? {
         Outcome::Bounced(problems) if problems.is_empty() => 0,
         Outcome::Bounced(_) => 1,
@@ -417,15 +467,15 @@ mod tests {
     use super::*;
     use crate::preflight::idle_facts;
 
-    fn printed(color: bool, columns: Option<fn() -> usize>, print: impl FnOnce(&mut Printer)) -> String {
+    fn printed(color: bool, columns: Option<fn() -> usize>, clock: Option<fn() -> String>, print: impl FnOnce(&mut Printer)) -> String {
         let mut out = Vec::new();
-        print(&mut Printer::new(&mut out, color, columns));
+        print(&mut Printer::new(&mut out, color, columns, clock));
         String::from_utf8(out).unwrap()
     }
 
     #[test]
     fn prints_progress_over_itself() {
-        let text = printed(false, Some(|| 80), |printer| {
+        let text = printed(false, Some(|| 80), None, |printer| {
             printer.line("start");
             printer.progress("12345");
             printer.progress("123");
@@ -437,7 +487,7 @@ mod tests {
 
     #[test]
     fn fits_progress_in_a_row() {
-        let text = printed(false, Some(|| 6), |printer| {
+        let text = printed(false, Some(|| 6), None, |printer| {
             printer.progress("1234567");
             printer.line("done");
         });
@@ -446,7 +496,7 @@ mod tests {
 
     #[test]
     fn prints_no_progress_to_a_file() {
-        let text = printed(false, None, |printer| {
+        let text = printed(false, None, None, |printer| {
             printer.line("start");
             printer.progress("12345");
             printer.alarm("bad");
@@ -456,11 +506,24 @@ mod tests {
 
     #[test]
     fn colors_problems() {
-        let text = printed(true, None, |printer| {
+        let text = printed(true, None, None, |printer| {
             printer.line("fine");
             printer.styled_line(Red, &indented_list("problems:", ["one", "two"]));
         });
         assert_eq!(text, "fine\n\x1b[31mproblems:\n    one\n    two\x1b[0m\n");
+    }
+
+    #[test]
+    fn prints_timestamps() {
+        let text = printed(true, Some(|| 20), Some(|| "12:34:56".into()), |printer| {
+            printer.styled_line(Red, &indented_list("problems:", ["one"]));
+            printer.progress("two\nlines");
+            printer.progress("more than fits in a row");
+        });
+        let time = "\x1b[2m12:34:56\x1b[0m";
+        assert_eq!(text, format!("{time} \x1b[31mproblems:\n             one\x1b[0m\n\r{time} two lines\r{time} more than…\n"));
+        let text = printed(true, Some(|| 6), Some(|| "12:34:56".into()), |printer| printer.progress("cut"));
+        assert_eq!(text, "\r12:3…\n");
     }
 
     #[test]
