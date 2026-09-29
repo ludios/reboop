@@ -9,13 +9,14 @@ use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
 use crate::deadline::{Deadline, retry};
 use crate::facts::{self, Systems};
-use crate::human::{self, Style::{self, Dim, Plain, Red}};
+use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use crate::initrd;
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Stopped};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, Target};
 use anyhow::{Context, Result, ensure};
+use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::thread::sleep;
@@ -45,7 +46,8 @@ const SCRUB_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// closed stdout is no reason to leave a machine half-bounced.
 pub struct Printer<'a> {
     out: &'a mut dyn Write,
-    /// Whether to show problems in color, and timestamps dimmed.
+    /// Whether to show problems in red, values in bold, and timestamps
+    /// dimmed.
     color: bool,
     /// If progress is shown by rewriting the last line (which takes a
     /// terminal), gives the terminal's width, which can change.
@@ -65,6 +67,13 @@ impl<'a> Printer<'a> {
     /// `text` in `style`, if in color.
     fn paint(&self, style: Style, text: &str) -> String {
         if self.color { style.paint(text) } else { text.to_string() }
+    }
+
+    /// `value` in bold, if in color, to stand out in a plain line.  Not for
+    /// other lines, since the reset at the end would also end a red line's
+    /// color, and would throw off progress's count of characters.
+    fn bold(&self, value: impl fmt::Display) -> String {
+        self.paint(Bold, &value.to_string())
     }
 
     /// Prints `text` in `style` and a newline, in place of any progress on
@@ -193,7 +202,7 @@ fn password_for_initrd(
     let deadline = Deadline::after(OPEN_TIMEOUT + QUICK);
     let (device, opens) = initrd::test_luks_password(ssh, &machine.target(), &password, deadline)?;
     ensure!(opens, "the stored LUKS password doesn't open {device} (`reboop set-luks-password {hostname}` replaces it)");
-    printer.line(&format!("The stored LUKS password opens {device}"));
+    printer.line(&format!("The stored LUKS password opens {}", printer.bold(&device)));
     Ok(Some(password))
 }
 
@@ -206,14 +215,14 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
     let mut problems = Vec::new();
     for service in &machine.stop_services {
         match reboot::stop_unit(session, service, STOP_TIMEOUT)? {
-            Stopped::Cleanly => printer.line(&format!("{service} is stopped")),
+            Stopped::Cleanly => printer.line(&format!("{} is stopped", printer.bold(service))),
             Stopped::Uncleanly(result) => {
                 let problem = format!("{service} is stopped, but systemd's result for it is {result}, not success");
                 printer.styled_line(Red, &problem);
                 problems.push(problem);
             }
             Stopped::NotLoaded => {
-                printer.line(&format!("There's no {service} to stop"));
+                printer.line(&format!("There's no {} to stop", printer.bold(service)));
                 continue;
             }
         }
@@ -289,12 +298,13 @@ fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) ->
     let after = facts::systems(session)?;
     let kernel_errors = facts::kernel_errors(session)?;
 
-    printer.line(&format!("systemd says the system is {state}"));
-    printer.line(&format!("Booted {} with kernel {}", after.booted, after.running_kernel));
+    printer.line(&format!("systemd says the system is {}", printer.bold(&state)));
+    printer.line(&format!("Booted {} with kernel {}", printer.bold(&after.booted), printer.bold(&after.running_kernel)));
     if failed_units.is_empty() {
         printer.line("Failed units: none");
     } else {
-        printer.line(&format!("Failed units: {}", failed_units.join(", ")));
+        let units: Vec<_> = failed_units.iter().map(|unit| printer.bold(unit)).collect();
+        printer.line(&format!("Failed units: {}", units.join(", ")));
     }
     if kernel_errors.trim().is_empty() {
         printer.line("Kernel errors: none");
@@ -310,9 +320,9 @@ fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) ->
 fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Result<ScrubStatus> {
     // Such as one started by a timer that came due while the machine was down
     if btrfs::scrub_status(session, mountpoint)?.state == ScrubState::Running {
-        printer.line(&format!("Waiting for the scrub that's already running on {mountpoint}"));
+        printer.line(&format!("Waiting for the scrub that's already running on {}", printer.bold(mountpoint)));
     } else {
-        printer.line(&format!("Scrubbing btrfs on {mountpoint}"));
+        printer.line(&format!("Scrubbing btrfs on {}", printer.bold(mountpoint)));
         btrfs::start_scrub(session, mountpoint, QUICK)?;
     }
     btrfs::wait_for_scrub(session, mountpoint, SCRUB_INTERVAL, Deadline::after(SCRUB_TIMEOUT), |status| {
@@ -331,7 +341,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
         printer.line(&format!("Waiting for the initrd at {initrd_target}"));
         let prompts = initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline, still_waiting(printer))?;
         for prompt in prompts {
-            printer.line(&format!("Answered {prompt:?}"));
+            printer.line(&format!("Answered {}", printer.bold(format!("{prompt:?}"))));
         }
     } else {
         // So that the first try doesn't log in to the old boot on its way
@@ -388,7 +398,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
         return Ok(Outcome::NotOkay(blockers));
     }
     let systems = &facts.systems;
-    printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", systems.default, systems.default_kernel));
+    printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
     let (stopped, mut problems) = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
 
@@ -444,8 +454,8 @@ fn terminal_columns() -> usize {
     if result == 0 && size.ws_col > 0 { size.ws_col.into() } else { 80 }
 }
 
-/// Bounces the configured machine `hostname` (see [`bounce`]), with
-/// problems in color if `color`.  Returns the exit status: 0 if it came
+/// Bounces the configured machine `hostname` (see [`bounce`]), in color if
+/// `color`.  Returns the exit status: 0 if it came
 /// back fine, 1 if it came back with problems, or 2 if it wasn't okay to
 /// reboot.
 pub fn run(hostname: &str, color: bool) -> Result<u8> {
@@ -505,12 +515,13 @@ mod tests {
     }
 
     #[test]
-    fn colors_problems() {
+    fn styles_values_and_problems() {
         let text = printed(true, None, None, |printer| {
-            printer.line("fine");
+            printer.line(&format!("{} is fine", printer.bold("one")));
             printer.styled_line(Red, &indented_list("problems:", ["one", "two"]));
         });
-        assert_eq!(text, "fine\n\x1b[31mproblems:\n    one\n    two\x1b[0m\n");
+        assert_eq!(text, "\x1b[1mone\x1b[0m is fine\n\x1b[31mproblems:\n    one\n    two\x1b[0m\n");
+        assert_eq!(printed(false, None, None, |printer| printer.line(&printer.bold("plain"))), "plain\n");
     }
 
     #[test]
