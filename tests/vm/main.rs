@@ -462,6 +462,7 @@ fn postflight_facts(vm: &Vm) -> Result<()> {
     session.run("systemd-run --quiet --unit=reboop-test-fail --wait false", MINUTE)?;
     assert_eq!(facts::failed_units(&mut session)?, vec!["reboop-test-fail.service".to_string()]);
     assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "degraded");
+    assert_eq!(facts::system_state(&mut session)?, "degraded");
 
     sh(&mut session, "echo '<3>reboop test error' >/dev/kmsg")?;
     assert!(facts::kernel_errors(&mut session)?.contains("reboop test error"));
@@ -552,21 +553,38 @@ fn luks_password_is_tested(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-fn reboot_with_wrong_password_first(vm: &Vm) -> Result<()> {
+/// Catches the VM (see [`bounce::catch`]) with `password`, printing what it
+/// says, and returns its problems and what it said.
+fn catch_vm(vm: &Vm, password: Option<&str>) -> Result<(Vec<String>, String)> {
+    let mut printed = Vec::new();
+    let problems = bounce::catch(&vm.ssh, &vm_machine(vm), password, &mut Printer::new(&mut printed, false, None, None));
+    let printed = String::from_utf8(printed)?;
+    print!("{printed}");
+    Ok((problems?, printed))
+}
+
+fn catch_when_up(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let boot_id = facts::boot_id(&mut session)?;
+    let (problems, printed) = catch_vm(vm, None)?;
+    assert_eq!(problems, Vec::<String>::new());
+    let no_password = format!("There's no stored LUKS password for {}, so its initrd won't be unlocked\n", vm.manifest.hostname);
+    assert!(printed.starts_with(&no_password), "{printed}");
+    assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    Ok(())
+}
+
+fn catch_with_wrong_password_first(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let boot_id = facts::boot_id(&mut session)?;
     reboot::reboot(session)?;
-    let deadline = Deadline::after(5 * MINUTE);
-    let interval = Duration::from_secs(1);
-    let error = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, "not the password", interval, deadline, |_| ()).unwrap_err();
+    let error = catch_vm(vm, Some("not the password")).unwrap_err();
     let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
     ensure!(wrong, "expected the password to be rejected, got: {error:#}");
-    let prompts = initrd::wait_and_unlock(&vm.ssh, &vm.initrd_target, vm.luks_password()?, interval, deadline, |_| ())?;
-    eprintln!("answered {prompts:?}");
-
-    let mut session = wait_for_session(&vm.ssh, &vm.target, interval, deadline)?;
-    assert_eq!(facts::wait_until_booted(&mut session, 5 * MINUTE)?, "running");
-    assert_ne!(facts::boot_id(&mut session)?, boot_id);
+    let (problems, printed) = catch_vm(vm, Some(vm.luks_password()?))?;
+    assert_eq!(problems, Vec::<String>::new());
+    assert!(printed.contains("\nAnswered "), "{printed}");
+    assert_ne!(facts::boot_id(&mut vm.session()?)?, boot_id);
     Ok(())
 }
 
@@ -677,7 +695,7 @@ fn main() {
         ("postflight_facts", postflight_facts),
         ("systemd_boots_default_is_checked", systemd_boots_default_is_checked),
         ("luks_password_is_tested", luks_password_is_tested),
-        ("reboot_with_wrong_password_first", reboot_with_wrong_password_first),
+        ("catch_with_wrong_password_first", catch_with_wrong_password_first),
         ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
     ];
     let grub: &[(&str, Test)] = &[
@@ -686,6 +704,7 @@ fn main() {
         ("btrfs_root_is_idle", btrfs_root_is_idle),
         ("postflight_facts", postflight_facts),
         ("grubs_defaults_are_checked", grubs_defaults_are_checked),
+        ("catch_when_up", catch_when_up),
         ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
     ];
     let trials = [(Name::SystemdBoot, systemd_boot), (Name::Grub, grub)]

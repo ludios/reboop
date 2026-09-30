@@ -4,7 +4,7 @@
 //! the password beforehand, and unlocking them over SSH to the systemd initrd.
 
 use crate::child::{self, ChildProcess};
-use crate::deadline::{Deadline, Permanent, retry};
+use crate::deadline::{Deadline, Permanent};
 use crate::ssh::{QUICK, Session, Ssh, Target, is_permanent_failure, sh_c};
 use anyhow::{Result, anyhow, bail};
 use std::fmt;
@@ -228,26 +228,6 @@ pub fn unlock(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) ->
         let screen = redact(&screen, password);
         Err(anyhow!("the connection to {target} closed before any passphrase prompt; output: {screen:?} {stderr}").into())
     }
-}
-
-/// Like [`unlock`], but when the initrd's sshd is unreachable, tries again
-/// once per `interval` until `deadline`, passing each such error to
-/// `on_retry` first.
-pub fn wait_and_unlock(
-    ssh: &Ssh,
-    target: &Target,
-    password: &str,
-    interval: Duration,
-    deadline: Deadline,
-    on_retry: impl FnMut(&anyhow::Error),
-) -> Result<Vec<String>> {
-    let attempt = |deadline| match unlock(ssh, target, password, deadline) {
-        Ok(prompts) => Ok(Ok(prompts)),
-        Err(UnlockError::Unreachable(stderr)) => Err(anyhow!(stderr.trim_end().to_string()).context(format!("couldn't reach the initrd at {target}"))),
-        Err(fatal) => Ok(Err(fatal)),
-    };
-    let result = retry(deadline, interval, attempt, on_retry)?;
-    Ok(result?)
 }
 
 #[cfg(test)]

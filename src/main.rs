@@ -48,6 +48,19 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
+    /// Do what bounce does after the reboot, for a machine that was rebooted
+    /// some other way, or whose bounce was cut short: unlock its LUKS device
+    /// from the initrd if it's waiting there, show how it came back, and
+    /// scrub its btrfs filesystems.
+    /// Exits 0 if it came back fine, or 1 if it came back with problems or
+    /// something failed.
+    #[clap(name = "catch")]
+    Catch {
+        /// A machine from machines.jsonl
+        hostname: String,
+        #[clap(flatten)]
+        color: ColorOption,
+    },
     /// Ask for a machine's LUKS password, check over SSH that it opens the
     /// LUKS device beneath /, and store it encrypted with the machine's
     /// luks_signing_key for unlocking the machine after a reboot
@@ -98,6 +111,7 @@ fn main() -> ExitCode {
     let result = match command {
         ReboopCommand::Check { hostnames, json, color: ColorOption { color } } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
         ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
+        ReboopCommand::Catch { hostname, color: ColorOption { color } } => bounce::run_catch(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };

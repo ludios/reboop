@@ -97,7 +97,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
     `shutdown -r now`
 
-2. After disconnection, keep trying to SSH in over initrd_ssh_port, with a 15 second timeout, once every 15 seconds:
+2. After disconnection, keep trying to SSH in over initrd_ssh_port (and ssh_port, in case it was unlocked at the console), with a 15 second timeout, once every 15 seconds:
 
     `ssh root@[ipv4 address of machine] -p [initrd_ssh_port]`
 
@@ -152,3 +152,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     `scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found`
 
     If any errors are found, print a very loud warning and return non-0 exit status.
+
+## Catch
+
+`reboop catch HOSTNAME` does Reboot step 2 and Postflight for a machine that was rebooted some other way, or whose bounce was cut short. It keeps trying ssh_port and initrd_ssh_port. If the initrd answers and there's a stored LUKS password, it unlocks it as above. Once the machine is up, and `systemctl is-system-running` doesn't say `stopping`, that's the boot it checks.

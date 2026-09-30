@@ -139,12 +139,10 @@ pub fn sample_network(session: &mut Session, duration: Duration) -> Result<Netwo
     network_sample(&before, &after)
 }
 
-/// Waits for the machine to finish booting (or `timeout`) and returns
-/// systemd's view of the system: "running" if all is well, "degraded" if
-/// some unit failed, or something else from systemctl(1)'s
-/// is-system-running.
-pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<String> {
-    let output = session.run("systemctl is-system-running --wait", timeout)?;
+/// The state that `systemctl is-system-running` prints, running it with
+/// `options`, for up to `timeout`.
+fn is_system_running(session: &mut Session, options: &str, timeout: Duration) -> Result<String> {
+    let output = session.run(&format!("systemctl is-system-running {options}"), timeout)?;
     let state = output.stdout_text().trim().to_string();
     ensure!(
         !state.is_empty() && !state.contains(char::is_whitespace),
@@ -153,6 +151,19 @@ pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<Str
         output.stderr_text()
     );
     Ok(state)
+}
+
+/// systemd's view of the system: "running" if all is well, "degraded" if
+/// some unit failed, "stopping" if it's shutting down, or something else
+/// from systemctl(1)'s is-system-running.
+pub fn system_state(session: &mut Session) -> Result<String> {
+    is_system_running(session, "", QUICK)
+}
+
+/// Waits for the machine to finish booting (or `timeout`) and returns its
+/// [`system_state`].
+pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<String> {
+    is_system_running(session, "--wait", timeout)
 }
 
 /// The names of units that have failed.

@@ -2,7 +2,8 @@
 
 //! `reboop bounce`: reboots a machine that's okay to reboot, unlocks its
 //! LUKS device from the initrd if it has one, shows how it came back, and
-//! scrubs its btrfs filesystems.
+//! scrubs its btrfs filesystems; and `reboop catch`, which does what comes
+//! after the reboot, for a machine that was rebooted some other way.
 
 use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState, ScrubStatus};
@@ -10,17 +11,18 @@ use crate::config::{self, Machine};
 use crate::deadline::{Deadline, retry};
 use crate::facts::{self, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
-use crate::initrd;
+use crate::initrd::{self, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Stopped};
-use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, Target};
+use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh};
 use anyhow::{Context, Result, ensure};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
 use std::thread::sleep;
 use std::time::Duration;
+use tracing::debug;
 
 /// How long each of a machine's stop_services gets to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -250,16 +252,55 @@ fn show_last_try(printer: &mut Printer, error: &anyhow::Error) {
     printer.progress(&format!("Latest try: {reason}"));
 }
 
-/// Opens a session to `target` once it's up in a boot other than
-/// `old_boot_id`, trying once per [`RETRY_INTERVAL`] until `deadline`, and
-/// passing each failed try to `on_retry`.
-fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: Deadline, on_retry: impl FnMut(&anyhow::Error)) -> Result<Session> {
-    let attempt = |deadline: Deadline| {
-        let mut session = Session::open(ssh, target, deadline.at_most(OPEN_TIMEOUT).remaining())?;
-        ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
+/// Where a machine coming back from a reboot was found.
+enum Found {
+    /// Back, at the other end of this session.
+    Back(Session),
+    /// At its initrd, which took the password at these prompts.
+    Unlocked(Vec<String>),
+}
+
+/// Waits for `machine` to be back from a reboot: up, not shutting down, and
+/// in a boot other than `old_boot_id` (if known).  Or, given a `password`,
+/// for its initrd to take it, if the initrd comes first.  Tries once per
+/// [`RETRY_INTERVAL`] until `deadline`, passing each failed try to
+/// `on_retry`.
+fn wait_for_return(
+    ssh: &Ssh,
+    machine: &Machine,
+    old_boot_id: Option<&str>,
+    password: Option<&str>,
+    deadline: Deadline,
+    on_retry: impl FnMut(&anyhow::Error),
+) -> Result<Found> {
+    let (target, initrd_target) = (machine.target(), machine.initrd_target());
+    let back = |deadline: Deadline| -> Result<Session> {
+        let mut session = Session::open(ssh, &target, deadline.at_most(OPEN_TIMEOUT).remaining())?;
+        if let Some(old_boot_id) = old_boot_id {
+            ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
+        }
+        ensure!(facts::system_state(&mut session)? != "stopping", "it's shutting down");
         Ok(session)
     };
-    retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{target} didn't come back"))
+    // Failures to unlock, other than an unreachable initrd, are returned
+    // inside Ok so that retry doesn't try again.
+    let attempt = |deadline: Deadline| -> Result<Result<Found, UnlockError>> {
+        let error = match back(deadline) {
+            Ok(session) => return Ok(Ok(Found::Back(session))),
+            Err(error) => error,
+        };
+        let Some(password) = password else { return Err(error) };
+        match initrd::unlock(ssh, &initrd_target, password, deadline) {
+            Ok(prompts) => Ok(Ok(Found::Unlocked(prompts))),
+            Err(UnlockError::Unreachable(stderr)) => {
+                debug!("couldn't reach the initrd at {initrd_target}: {}", stderr.trim_end());
+                Err(error)
+            }
+            Err(fatal) => Ok(Err(fatal)),
+        }
+    };
+    let found = retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{} didn't come back", machine.hostname))?;
+    Ok(found?)
 }
 
 /// What's wrong with how a machine came back, given its `systems`, systemd's
@@ -325,27 +366,31 @@ fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Resu
     })
 }
 
-/// After asking `machine` to reboot out of boot `old_boot_id`, unlocks its
-/// initrd with `password` (if any), waits for it to come back, shows how it
-/// did, and scrubs its scrub_mounts.  Returns the problems (none if all is
-/// well).
-fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: &str, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
+/// Waits for `machine` to come back from a reboot, out of boot `old_boot_id`
+/// if that's known, unlocking its initrd with `password` (if any) if it
+/// waits there; shows how it did; and scrubs its scrub_mounts.  Returns the
+/// problems (none if all is well).
+fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
-    if let Some(password) = password {
-        let initrd_target = machine.initrd_target();
-        printer.line(&format!("Waiting for the initrd at {initrd_target}"));
-        let prompts = initrd::wait_and_unlock(ssh, &initrd_target, password, RETRY_INTERVAL, deadline, |error| show_last_try(printer, error))?;
-        for prompt in prompts {
-            printer.line(&format!("Answered {}", printer.bold(format!("{prompt:?}"))));
+    let (target, initrd_target) = (machine.target(), machine.initrd_target());
+    printer.line(&match password {
+        Some(_) => format!("Waiting for {target}, or for the initrd at {initrd_target}"),
+        None => format!("Waiting for {target}"),
+    });
+    // Unlocks the initrd at most once, since its asking again would mean
+    // that the password didn't work.
+    let mut session = loop {
+        match wait_for_return(ssh, machine, old_boot_id, password, deadline, |error| show_last_try(printer, error))? {
+            Found::Back(session) => break session,
+            Found::Unlocked(prompts) => {
+                for prompt in prompts {
+                    printer.line(&format!("Answered {}", printer.bold(format!("{prompt:?}"))));
+                }
+                printer.line(&format!("Waiting for {target}"));
+                password = None;
+            }
         }
-    } else {
-        // So that the first try doesn't log in to the old boot on its way
-        // down, which costs a key touch for some.
-        sleep(RETRY_INTERVAL);
-    }
-    let target = machine.target();
-    printer.line(&format!("Waiting for {target}"));
-    let mut session = wait_for_new_boot(ssh, &target, old_boot_id, deadline, |error| show_last_try(printer, error))?;
+    };
     let mut problems = postflight(&mut session, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
@@ -369,6 +414,15 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: &str, password: Option<&
         }
     }
     Ok(problems)
+}
+
+/// Tells the user that `hostname` is back, and its `problems` (if any).
+fn show_back(hostname: &str, problems: &[String], printer: &mut Printer) {
+    if problems.is_empty() {
+        printer.line(&format!("{hostname} is back, and all is well"));
+    } else {
+        printer.styled_line(Red, &indented_list(&format!("{hostname} is back, but:"), problems));
+    }
 }
 
 /// Bounces `machine`, telling the user about it with `printer`: checks that
@@ -418,15 +472,29 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
     reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot"))?;
+    // So that the first try doesn't log in to the old boot on its way down,
+    // which costs a key touch for some.
+    sleep(RETRY_INTERVAL);
 
-    let came_back = come_back(ssh, machine, &facts.boot_id, password.as_deref(), printer);
-    problems.extend(came_back.with_context(|| format!("after asking {hostname} to reboot"))?);
-    if problems.is_empty() {
-        printer.line(&format!("{hostname} is back, and all is well"));
-    } else {
-        printer.styled_line(Red, &indented_list(&format!("{hostname} is back, but:"), &problems));
-    }
+    let came_back = come_back(ssh, machine, Some(&facts.boot_id), password.as_deref(), printer);
+    problems.extend(came_back.with_context(|| format!("after asking {hostname} to reboot (`reboop catch {hostname}` takes it from there)"))?);
+    show_back(hostname, &problems, printer);
     Ok(Outcome::Bounced(problems))
+}
+
+/// Catches `machine` on its way back up from a reboot that wasn't a bounce,
+/// or whose bounce was cut short: waits for it, unlocking its initrd with
+/// `password` (if any) if it waits there; shows how it came back; and
+/// scrubs its scrub_mounts.  If it's up, that's taken to be the boot it
+/// came back in.  Returns the problems (none if all is well).
+pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
+    let hostname = &machine.hostname;
+    if password.is_none() {
+        printer.line(&format!("There's no stored LUKS password for {hostname}, so its initrd won't be unlocked"));
+    }
+    let problems = come_back(ssh, machine, None, password, printer)?;
+    show_back(hostname, &problems, printer);
+    Ok(problems)
 }
 
 /// The local time of day, like "12:03:16".
@@ -449,6 +517,14 @@ fn terminal_columns() -> usize {
     if result == 0 && size.ws_col > 0 { size.ws_col.into() } else { 80 }
 }
 
+/// Calls `print` with a [`Printer`] to stdout that timestamps lines, is in
+/// color if `color`, and shows progress if stdout is a terminal.
+fn with_stdout_printer<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
+    let mut stdout = io::stdout();
+    let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
+    print(&mut Printer::new(&mut stdout, color, columns, Some(time_of_day)))
+}
+
 /// Bounces the configured machine `hostname` (see [`bounce`]), in color if
 /// `color`.  Returns the exit status: 0 if it came back fine, 1 if it came
 /// back with problems, or 2 if it wasn't okay to reboot.
@@ -456,14 +532,29 @@ pub fn run(hostname: &str, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
     let password = || passwords::load(&config::passwords_dir()?, hostname, &passwords::master_key(&machine.luks_signing_key)?);
-    let mut stdout = io::stdout();
-    let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
-    let mut printer = Printer::new(&mut stdout, color, columns, Some(time_of_day));
-    Ok(match bounce(&Ssh::default(), machine, password, &mut printer)? {
+    Ok(match with_stdout_printer(color, |printer| bounce(&Ssh::default(), machine, password, printer))? {
         Outcome::Bounced(problems) if problems.is_empty() => 0,
         Outcome::Bounced(_) => 1,
         Outcome::NotOkay(_) => 2,
     })
+}
+
+/// Catches the configured machine `hostname` (see [`catch`]), with its
+/// stored LUKS password if it has one, in color if `color`.  Returns the
+/// exit status: 0 if it came back fine, or 1 if it came back with problems.
+pub fn run_catch(hostname: &str, color: bool) -> Result<u8> {
+    let machines = config::load(&config::config_dir()?)?;
+    let machine = config::find(&machines, hostname)?;
+    let dir = config::passwords_dir()?;
+    let file = passwords::password_file(&dir, hostname)?;
+    let load = || passwords::load(&dir, hostname, &passwords::master_key(&machine.luks_signing_key)?);
+    let password = if file.try_exists().with_context(|| format!("failed to check for {}", file.display()))? {
+        Some(load().context("couldn't get the stored LUKS password")?)
+    } else {
+        None
+    };
+    let problems = with_stdout_printer(color, |printer| catch(&Ssh::default(), machine, password.as_deref(), printer))?;
+    Ok(if problems.is_empty() { 0 } else { 1 })
 }
 
 #[cfg(test)]
