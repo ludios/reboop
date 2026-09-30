@@ -247,7 +247,7 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
 fn show_last_try(printer: &mut Printer, error: &anyhow::Error) {
     let last_line = |message: String| message.lines().map(str::trim).rfind(|line| !line.is_empty()).map(str::to_string);
     let reason = error.chain().rev().find_map(|cause| last_line(cause.to_string())).unwrap_or_default();
-    printer.progress(&format!("Trying: {reason}"));
+    printer.progress(&format!("Latest try: {reason}"));
 }
 
 /// Opens a session to `target` once it's up in a boot other than
@@ -546,7 +546,7 @@ mod tests {
             show_last_try(printer, &anyhow::anyhow!(stderr).context("failed to open a session to one"));
             show_last_try(printer, &anyhow::anyhow!(" \n").context("failed to open a session to one"));
         });
-        assert_eq!(text, "\rTrying: Connection refused\rTrying: failed to open a session to one\n");
+        assert_eq!(text, "\rLatest try: Connection refused\rLatest try: failed to open a session to one\n");
     }
 
     #[test]
