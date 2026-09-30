@@ -262,10 +262,10 @@ fn wait_for_new_boot(ssh: &Ssh, target: &Target, old_boot_id: &str, deadline: De
     retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{target} didn't come back"))
 }
 
-/// What's wrong with how a machine came back, given the systems from
-/// `before` it rebooted and `after`, systemd's `state` of it (from
-/// [`facts::wait_until_booted`]), and its `failed_units`.
-fn postflight_problems(before: &Systems, after: &Systems, state: &str, failed_units: &[String]) -> Vec<String> {
+/// What's wrong with how a machine came back, given its `systems`, systemd's
+/// `state` of it (from [`facts::wait_until_booted`]), and its
+/// `failed_units`.  It should have booted its system profile.
+fn postflight_problems(systems: &Systems, state: &str, failed_units: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     // "degraded" means there are failed units, which get their own problem.
     if state != "running" && state != "degraded" {
@@ -274,19 +274,19 @@ fn postflight_problems(before: &Systems, after: &Systems, state: &str, failed_un
     if !failed_units.is_empty() {
         problems.push(format!("failed units: {}", failed_units.join(", ")));
     }
-    if after.booted != before.default {
-        problems.push(format!("booted {}, not {}", after.booted, before.default));
+    if systems.booted != systems.default {
+        problems.push(format!("booted {}, not {}", systems.booted, systems.default));
     }
-    if after.running_kernel != before.default_kernel {
-        problems.push(format!("booted kernel {}, not {}", after.running_kernel, before.default_kernel));
+    if systems.running_kernel != systems.default_kernel {
+        problems.push(format!("booted kernel {}, not {}", systems.running_kernel, systems.default_kernel));
     }
     problems
 }
 
 /// Waits for the machine at the other end of `session` to finish starting
 /// up, shows how it came back, and returns its problems (see
-/// [`postflight_problems`]), given the systems from `before` it rebooted.
-fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) -> Result<Vec<String>> {
+/// [`postflight_problems`]).
+fn postflight(session: &mut Session, printer: &mut Printer) -> Result<Vec<String>> {
     printer.line("Waiting for systemd to finish starting up");
     let state = facts::wait_until_booted(session, STARTUP_TIMEOUT)?;
     let failed_units = facts::failed_units(session)?;
@@ -306,7 +306,7 @@ fn postflight(session: &mut Session, before: &Systems, printer: &mut Printer) ->
     } else {
         printer.line(&indented_list("Kernel errors:", kernel_errors.trim_end().lines()));
     }
-    Ok(postflight_problems(before, &after, &state, &failed_units))
+    Ok(postflight_problems(&after, &state, &failed_units))
 }
 
 /// Scrubs the btrfs filesystem mounted at `mountpoint`, or waits for the
@@ -325,11 +325,11 @@ fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Resu
     })
 }
 
-/// After asking `machine` to reboot, unlocks its initrd with `password` (if
-/// any), waits for it to come back, shows how it did, and scrubs its
-/// scrub_mounts.  `before` is what [`preflight::gather`] found before
-/// the reboot.  Returns the problems (none if all is well).
-fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
+/// After asking `machine` to reboot out of boot `old_boot_id`, unlocks its
+/// initrd with `password` (if any), waits for it to come back, shows how it
+/// did, and scrubs its scrub_mounts.  Returns the problems (none if all is
+/// well).
+fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: &str, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
     if let Some(password) = password {
         let initrd_target = machine.initrd_target();
@@ -345,8 +345,8 @@ fn come_back(ssh: &Ssh, machine: &Machine, before: &Facts, password: Option<&str
     }
     let target = machine.target();
     printer.line(&format!("Waiting for {target}"));
-    let mut session = wait_for_new_boot(ssh, &target, &before.boot_id, deadline, |error| show_last_try(printer, error))?;
-    let mut problems = postflight(&mut session, &before.systems, printer)?;
+    let mut session = wait_for_new_boot(ssh, &target, old_boot_id, deadline, |error| show_last_try(printer, error))?;
+    let mut problems = postflight(&mut session, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
         let status = match scrub(&mut session, mountpoint, printer) {
@@ -419,7 +419,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     // Which may have worked even if it failed, e.g. by hanging
     reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot"))?;
 
-    let came_back = come_back(ssh, machine, &facts, password.as_deref(), printer);
+    let came_back = come_back(ssh, machine, &facts.boot_id, password.as_deref(), printer);
     problems.extend(came_back.with_context(|| format!("after asking {hostname} to reboot"))?);
     if problems.is_empty() {
         printer.line(&format!("{hostname} is back, and all is well"));
@@ -551,17 +551,17 @@ mod tests {
 
     #[test]
     fn finds_postflight_problems() {
-        let before = idle_facts().systems;
-        assert_eq!(postflight_problems(&before, &before, "running", &[]), Vec::<String>::new());
-        let after = Systems { booted: "/nix/store/bbb-nixos-system-one-26.05".into(), running_kernel: "6.18.53".into(), ..before.clone() };
+        let systems = idle_facts().systems;
+        assert_eq!(postflight_problems(&systems, "running", &[]), Vec::<String>::new());
+        let booted_older = Systems { booted: "/nix/store/bbb-nixos-system-one-26.05".into(), running_kernel: "6.18.53".into(), ..systems.clone() };
         assert_eq!(
-            postflight_problems(&before, &after, "degraded", &["a.service".into(), "b.service".into()]),
+            postflight_problems(&booted_older, "degraded", &["a.service".into(), "b.service".into()]),
             [
                 "failed units: a.service, b.service",
                 "booted /nix/store/bbb-nixos-system-one-26.05, not /nix/store/aaa-nixos-system-one-26.05",
                 "booted kernel 6.18.53, not 6.18.54",
             ]
         );
-        assert_eq!(postflight_problems(&before, &before, "maintenance", &[]), ["systemd says the system is maintenance"]);
+        assert_eq!(postflight_problems(&systems, "maintenance", &[]), ["systemd says the system is maintenance"]);
     }
 }
