@@ -8,7 +8,7 @@
 use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
-use crate::deadline::{Deadline, retry};
+use crate::deadline::{Deadline, Permanent, retry};
 use crate::facts::{self, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use crate::initrd::{self, UnlockError};
@@ -16,7 +16,7 @@ use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Stopped};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
@@ -260,11 +260,11 @@ enum Found {
     Unlocked(Vec<String>),
 }
 
-/// Waits for `machine` to be back from a reboot: up, not shutting down, and
-/// in a boot other than `old_boot_id` (if known).  Or, given a `password`,
-/// for its initrd to take it, if the initrd comes first.  Tries once per
-/// [`RETRY_INTERVAL`] until `deadline`, passing each failed try to
-/// `on_retry`.
+/// Waits for `machine` to be back from a reboot: up (past its initrd), not
+/// shutting down, and in a boot other than `old_boot_id` (if known).  Or,
+/// given a `password`, for its initrd to take it, if the initrd comes first.
+/// Tries once per [`RETRY_INTERVAL`] until `deadline`, passing each failed
+/// try to `on_retry`.
 fn wait_for_return(
     ssh: &Ssh,
     machine: &Machine,
@@ -279,6 +279,8 @@ fn wait_for_return(
         if let Some(old_boot_id) = old_boot_id {
             ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
         }
+        // As when ssh_port is initrd_ssh_port
+        ensure!(!facts::in_initrd(&mut session)?, "it's at its initrd");
         ensure!(facts::system_state(&mut session)? != "stopping", "it's shutting down");
         Ok(session)
     };
@@ -292,10 +294,14 @@ fn wait_for_return(
         let Some(password) = password else { return Err(error) };
         match initrd::unlock(ssh, &initrd_target, password, deadline) {
             Ok(prompts) => Ok(Ok(Found::Unlocked(prompts))),
-            Err(UnlockError::Unreachable(stderr)) => {
-                debug!("couldn't reach the initrd at {initrd_target}: {}", stderr.trim_end());
-                Err(error)
+            // Until it's unlocked, it's likelier to be at its initrd than up,
+            // so it's the initrd's failure that's passed on (like its
+            // refusing the user's key), unless ssh_port's is Permanent.
+            Err(UnlockError::Unreachable(stderr)) if error.downcast_ref::<Permanent>().is_none() => {
+                debug!("{target} isn't back: {error:#}");
+                Err(anyhow!(stderr.trim_end().to_string()).context(format!("couldn't reach the initrd at {initrd_target}")))
             }
+            Err(UnlockError::Unreachable(_)) => Err(error),
             Err(fatal) => Ok(Err(fatal)),
         }
     };
@@ -471,7 +477,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     };
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
-    reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot"))?;
+    reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot (if it's rebooting anyway, `reboop catch {hostname}` takes it from there)"))?;
     // So that the first try doesn't log in to the old boot on its way down,
     // which costs a key touch for some.
     sleep(RETRY_INTERVAL);

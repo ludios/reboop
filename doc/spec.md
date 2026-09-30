@@ -155,4 +155,4 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
 ## Catch
 
-`reboop catch HOSTNAME` does Reboot step 2 and Postflight for a machine that was rebooted some other way, or whose bounce was cut short. It keeps trying ssh_port and initrd_ssh_port. If the initrd answers and there's a stored LUKS password, it unlocks it as above. Once the machine is up, and `systemctl is-system-running` doesn't say `stopping`, that's the boot it checks.
+`reboop catch HOSTNAME` does Reboot step 2 and Postflight for a machine that was rebooted some other way, or whose bounce was cut short. It keeps trying ssh_port, and initrd_ssh_port if there's a stored LUKS password, which it unlocks the initrd with as above. Once the machine is up past its initrd (no /etc/initrd-release), and `systemctl is-system-running` doesn't say `stopping`, that's the boot it checks.

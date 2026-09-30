@@ -581,9 +581,14 @@ fn catch_with_wrong_password_first(vm: &Vm) -> Result<()> {
     let error = catch_vm(vm, Some("not the password")).unwrap_err();
     let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
     ensure!(wrong, "expected the password to be rejected, got: {error:#}");
+    // What keeps an initrd listening on ssh_port from being taken to be back
+    assert!(facts::in_initrd(&mut Session::open(&vm.ssh, &vm.initrd_target, MINUTE)?)?);
+
+    // Unlocked some other way, as at the console
+    initrd::unlock(&vm.ssh, &vm.initrd_target, vm.luks_password()?, Deadline::after(MINUTE))?;
     let (problems, printed) = catch_vm(vm, Some(vm.luks_password()?))?;
     assert_eq!(problems, Vec::<String>::new());
-    assert!(printed.contains("\nAnswered "), "{printed}");
+    assert!(!printed.contains("Answered"), "{printed}");
     assert_ne!(facts::boot_id(&mut vm.session()?)?, boot_id);
     Ok(())
 }
