@@ -242,14 +242,11 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
 }
 
 /// Shows on `printer`'s progress line why the last try at something
-/// failed: the last line of `error`'s root cause, since the line before
-/// says what it's trying (or all of `error`, if that line is blank).
+/// failed: the last non-blank line of the innermost message in `error`'s
+/// chain that has one, since the line before says what it's trying.
 fn show_last_try(printer: &mut Printer, error: &anyhow::Error) {
-    let cause = error.root_cause().to_string();
-    let reason = match cause.lines().map(str::trim).rfind(|line| !line.is_empty()) {
-        Some(line) => line.to_string(),
-        None => format!("{error:#}"),
-    };
+    let last_line = |message: String| message.lines().map(str::trim).rfind(|line| !line.is_empty()).map(str::to_string);
+    let reason = error.chain().rev().find_map(|cause| last_line(cause.to_string())).unwrap_or_default();
     printer.progress(&format!("Trying: {reason}"));
 }
 
@@ -549,7 +546,7 @@ mod tests {
             show_last_try(printer, &anyhow::anyhow!(stderr).context("failed to open a session to one"));
             show_last_try(printer, &anyhow::anyhow!(" \n").context("failed to open a session to one"));
         });
-        assert_eq!(text, "\rTrying: Connection refused\rTrying: failed to open a session to one:\n");
+        assert_eq!(text, "\rTrying: Connection refused\rTrying: failed to open a session to one\n");
     }
 
     #[test]
