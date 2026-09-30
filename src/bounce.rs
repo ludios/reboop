@@ -250,7 +250,7 @@ fn show_last_try(printer: &mut Printer, error: &anyhow::Error) {
         Some(line) => line.to_string(),
         None => format!("{error:#}"),
     };
-    printer.progress(&format!("Last try: {reason}"));
+    printer.progress(&format!("Trying: {reason}"));
 }
 
 /// Opens a session to `target` once it's up in a boot other than
@@ -549,7 +549,7 @@ mod tests {
             show_last_try(printer, &anyhow::anyhow!(stderr).context("failed to open a session to one"));
             show_last_try(printer, &anyhow::anyhow!(" \n").context("failed to open a session to one"));
         });
-        assert_eq!(text, "\rLast try: Connection refused\rLast try: failed to open a session to one:\n");
+        assert_eq!(text, "\rTrying: Connection refused\rTrying: failed to open a session to one:\n");
     }
 
     #[test]
