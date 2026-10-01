@@ -263,9 +263,11 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     })
 }
 
-/// What `btrfs scrub status` says when another btrfs command, or a scrub
-/// recording its progress, has the status file locked.  It reads that file
-/// when it can't reach a running scrub, and doesn't wait for the lock.
+/// What `btrfs scrub status` says when another btrfs command has the status
+/// file locked, such as a scrub rewriting it, which one does every 5s.  It
+/// reads that file whenever it can't ask the scrub over its socket, which
+/// `btrfs scrub start` removes as the scrub goes into the background, and
+/// doesn't wait for the lock.
 const STATUS_FILE_LOCKED: &str = "failed to open status file: Resource temporarily unavailable";
 
 /// How long to wait before each retry of a `btrfs scrub status` that found
@@ -285,7 +287,7 @@ fn run_scrub_status(session: &mut Session, script: &str) -> Result<String> {
             result => return result,
         }
     }
-    session.run_ok(script, QUICK)
+    session.run_ok(script, QUICK).with_context(|| format!("tried {} times", LOCKED_RETRY_DELAYS.len() + 1))
 }
 
 /// The state of the latest scrub of the btrfs filesystem mounted at

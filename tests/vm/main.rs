@@ -444,18 +444,22 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
 fn scrub_status_outlasts_a_locked_status_file(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let mountpoint = test_filesystem(&mut session, "locked", "")?;
-    // In the foreground, so that it's done with its progress socket and
-    // `btrfs scrub status` reads the status file.
+    // In the foreground, so that it's over, and won't replace the status
+    // file once that's locked.
     sh(&mut session, &format!("btrfs scrub start -B {mountpoint} >/dev/null"))?;
     let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
 
-    // Lock it from the background, for long enough to take more than one
-    // retry.
+    // Lock it from the background for 2s: past the first retry, but not all
+    // of them.
     let file = format!("/var/lib/btrfs/scrub.status.{}", filesystem.uuid);
     sh(&mut session, &format!("flock {file} sleep 2 >/dev/null 2>&1 &\nwhile flock -n {file} true; do sleep 0.1; done"))?;
     let locked = session.run(&format!("btrfs scrub status {mountpoint}"), MINUTE)?;
     let stderr = locked.stderr_text();
-    assert!(locked.status != 0 && stderr.contains("failed to open status file: Resource temporarily unavailable"), "{stderr}");
+    assert!(
+        locked.status != 0 && stderr.contains("failed to open status file: Resource temporarily unavailable"),
+        "status {}: {stderr}",
+        locked.status
+    );
     assert_eq!(btrfs::scrub_status(&mut session, &mountpoint)?.state, ScrubState::Finished);
     Ok(())
 }
