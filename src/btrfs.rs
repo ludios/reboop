@@ -320,8 +320,8 @@ pub fn start_scrub(session: &mut Session, mountpoint: &str, timeout: Duration) -
 }
 
 /// Checks the scrub of `mountpoint` that [`start_scrub`] started every
-/// `interval`, passing each status to `progress`, until it has ended, then
-/// returns its final status.
+/// `interval`, passing each status to `progress`, until two checks in a row
+/// find that it ended the same way, then returns its final status.
 pub fn wait_for_scrub(
     session: &mut Session,
     mountpoint: &str,
@@ -329,12 +329,17 @@ pub fn wait_for_scrub(
     deadline: Deadline,
     mut progress: impl FnMut(&ScrubStatus),
 ) -> Result<ScrubStatus> {
+    let mut previous = ScrubState::Running;
     loop {
         let status = scrub_status(session, mountpoint)?;
         progress(&status);
-        if status.state != ScrubState::Running {
+        // Until the scrub has recorded how it ended, which takes it a moment
+        // after the kernel is done, btrfs-progs can say that it was
+        // interrupted, or that none ran.
+        if status.state != ScrubState::Running && status.state == previous {
             return Ok(status);
         }
+        previous = status.state;
         ensure!(!deadline.has_passed(), "the scrub of {mountpoint} is still running at the deadline");
         sleep(interval.min(deadline.remaining()));
     }
