@@ -17,6 +17,7 @@ use crate::preflight::{self, Facts};
 use crate::reboot::{self, Stopped};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh};
 use anyhow::{Context, Result, anyhow, ensure};
+use jiff::Zoned;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
@@ -505,14 +506,7 @@ pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut
 
 /// The local time of day, like "12:03:16".
 fn time_of_day() -> String {
-    // SAFETY: time() takes a null pointer to mean it should only return the
-    // time, and an all-zero tm is valid (with a null tm_zone).
-    let (now, mut tm) = unsafe { (libc::time(std::ptr::null_mut()), std::mem::zeroed::<libc::tm>()) };
-    // SAFETY: localtime_r only reads `now` and fills in `tm`.
-    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
-        return "??:??:??".to_string();
-    }
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    Zoned::now().strftime("%H:%M:%S").to_string()
 }
 
 /// The width of the terminal on stdout, or 80 columns if that's unknown.
