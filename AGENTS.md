@@ -96,7 +96,7 @@ That includes the VM tests in tests/vm, which take minutes.  If the change can't
 
 	cargo test --no-run && cargo test --lib --bins
 
-Never `git commit -a` because there may others working; stage changes manually.
+Never `git commit -a` because there may be others working; stage changes manually.
 
 Then automatically commit your changes with this commit template:
 
