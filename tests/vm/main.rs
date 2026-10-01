@@ -441,6 +441,25 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
+fn scrub_status_outlasts_a_locked_status_file(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let mountpoint = test_filesystem(&mut session, "locked", "")?;
+    // In the foreground, so that it's done with its progress socket and
+    // `btrfs scrub status` reads the status file.
+    sh(&mut session, &format!("btrfs scrub start -B {mountpoint} >/dev/null"))?;
+    let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
+
+    // Lock it from the background, for long enough to take more than one
+    // retry.
+    let file = format!("/var/lib/btrfs/scrub.status.{}", filesystem.uuid);
+    sh(&mut session, &format!("flock {file} sleep 2 >/dev/null 2>&1 &\nwhile flock -n {file} true; do sleep 0.1; done"))?;
+    let locked = session.run(&format!("btrfs scrub status {mountpoint}"), MINUTE)?;
+    let stderr = locked.stderr_text();
+    assert!(locked.status != 0 && stderr.contains("failed to open status file: Resource temporarily unavailable"), "{stderr}");
+    assert_eq!(btrfs::scrub_status(&mut session, &mountpoint)?.state, ScrubState::Finished);
+    Ok(())
+}
+
 fn stop_unit(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     assert_eq!(reboot::stop_unit(&mut session, "reboop-test-nonexistent.service", MINUTE)?, Stopped::NotLoaded);
@@ -700,6 +719,7 @@ fn main() {
         ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
         ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
         ("scrub_finds_corruption", scrub_finds_corruption),
+        ("scrub_status_outlasts_a_locked_status_file", scrub_status_outlasts_a_locked_status_file),
         ("stop_unit", stop_unit),
         ("postflight_facts", postflight_facts),
         ("systemd_boots_default_is_checked", systemd_boots_default_is_checked),

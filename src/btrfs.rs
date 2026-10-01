@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
+use tracing::debug;
 
 /// A mounted btrfs filesystem.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -262,12 +263,37 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     })
 }
 
+/// What `btrfs scrub status` says when another btrfs command, or a scrub
+/// recording its progress, has the status file locked.  It reads that file
+/// when it can't reach a running scrub, and doesn't wait for the lock.
+const STATUS_FILE_LOCKED: &str = "failed to open status file: Resource temporarily unavailable";
+
+/// How long to wait before each retry of a `btrfs scrub status` that found
+/// the status file locked.
+const LOCKED_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
+
+/// Runs `script`, a `btrfs scrub status` command, and returns its stdout.
+/// While it finds the status file locked, tries again after each of
+/// [`LOCKED_RETRY_DELAYS`].
+fn run_scrub_status(session: &mut Session, script: &str) -> Result<String> {
+    for delay in LOCKED_RETRY_DELAYS {
+        match session.run_ok(script, QUICK) {
+            Err(error) if error.to_string().contains(STATUS_FILE_LOCKED) => {
+                debug!("{error:#}; trying again in {delay:?}");
+                sleep(delay);
+            }
+            result => return result,
+        }
+    }
+    session.run_ok(script, QUICK)
+}
+
 /// The state of the latest scrub of the btrfs filesystem mounted at
 /// `mountpoint`.
 pub fn scrub_status(session: &mut Session, mountpoint: &str) -> Result<ScrubStatus> {
     let mountpoint = shell_quote(mountpoint);
-    let summary = session.run_ok(&format!("btrfs scrub status --raw -- {mountpoint}"), QUICK)?;
-    let raw = session.run_ok(&format!("btrfs scrub status -R -- {mountpoint}"), QUICK)?;
+    let summary = run_scrub_status(session, &format!("btrfs scrub status --raw -- {mountpoint}"))?;
+    let raw = run_scrub_status(session, &format!("btrfs scrub status -R -- {mountpoint}"))?;
     parse_scrub_status(&summary, &raw)
 }
 
