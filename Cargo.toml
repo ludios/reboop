@@ -10,6 +10,7 @@ base64 = "0.23"
 chacha20poly1305 = "0.11"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
+jiff = { version = "0.2", features = ["serde"] }
 json5 = "1"
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false } # Turn off the default secure mode

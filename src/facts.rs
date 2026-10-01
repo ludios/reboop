@@ -4,6 +4,9 @@
 
 use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use jiff::Timestamp;
+use jiff::fmt::strtime;
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::thread::sleep;
@@ -19,6 +22,18 @@ pub fn boot_id(session: &mut Session) -> Result<String> {
     let id = session.run_ok("cat /proc/sys/kernel/random/boot_id", QUICK)?.trim_end().to_string();
     ensure!(id.len() == 36, "unexpected boot_id {id:?}");
     Ok(id)
+}
+
+/// Parses /proc/stat's "btime SECONDS" line.
+fn parse_btime(line: &str) -> Result<Timestamp> {
+    let context = || format!("unexpected btime line {line:?}");
+    let seconds = line.trim_end().strip_prefix("btime ").ok_or_else(|| anyhow!(context()))?;
+    Timestamp::from_second(seconds.parse().with_context(context)?).with_context(context)
+}
+
+/// When the machine booted, by its clock as it is now.
+pub fn booted_at(session: &mut Session) -> Result<Timestamp> {
+    parse_btime(&session.run_ok("grep '^btime ' /proc/stat", QUICK)?)
 }
 
 pub fn load_average_1min(session: &mut Session) -> Result<f64> {
@@ -47,6 +62,16 @@ pub fn kernel_release(session: &mut Session, system: &str) -> Result<String> {
     Ok(release.to_string())
 }
 
+/// When a kernel was built, from the end of its `uname -v`, like "#1-NixOS
+/// SMP PREEMPT_DYNAMIC Fri Sep 25 14:35:54 UTC 2026".  None if that's not a
+/// UTC time, as `date` prints it, with the right weekday.
+fn parse_kernel_built_at(version: &str) -> Option<Timestamp> {
+    let words: Vec<&str> = version.split_whitespace().collect();
+    let time = words[words.len().checked_sub(6)?..].join(" ");
+    let datetime = strtime::parse("%a %b %e %H:%M:%S UTC %Y", time).ok()?.to_datetime().ok()?;
+    TimeZone::UTC.to_timestamp(datetime).ok()
+}
+
 /// The NixOS configurations and kernels involved in a reboot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Systems {
@@ -56,6 +81,9 @@ pub struct Systems {
     pub booted: String,
     /// The release of the running kernel, as in `uname -r`.
     pub running_kernel: String,
+    /// When the running kernel was built, if known: see
+    /// [`parse_kernel_built_at`].
+    pub running_kernel_built_at: Option<Timestamp>,
     /// The configuration of the system profile, which is what
     /// `nixos-rebuild boot` or `switch` makes the default boot entry.
     pub default: String,
@@ -69,9 +97,10 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     let current = store_path(&session.run_ok("readlink /run/current-system", QUICK)?)?;
     let booted = store_path(&session.run_ok("readlink /run/booted-system", QUICK)?)?;
     let running_kernel = session.run_ok("uname -r", QUICK)?.trim_end().to_string();
+    let running_kernel_built_at = parse_kernel_built_at(&session.run_ok("uname -v", QUICK)?);
     let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
     let default_kernel = kernel_release(session, &default)?;
-    Ok(Systems { current, booted, running_kernel, default, default_kernel })
+    Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel })
 }
 
 /// Seconds since boot and each interface's (received, sent) byte counters.
@@ -379,6 +408,20 @@ mod tests {
         assert_eq!(store_path("/nix/store/abc-foo\n").unwrap(), "/nix/store/abc-foo");
         assert!(store_path("/nix/store/abc-foo/bin").is_err());
         assert!(store_path("/run/current-system").is_err());
+    }
+
+    #[test]
+    fn parses_times() {
+        let time = |text: &str| Some(text.parse::<Timestamp>().unwrap());
+        assert_eq!(parse_btime("btime 1790756876\n").unwrap(), time("2026-09-30T08:27:56Z").unwrap());
+        assert!(parse_btime("btime\n").is_err());
+        assert!(parse_btime("ctxt 1790756876\n").is_err());
+        assert_eq!(parse_kernel_built_at("#1-NixOS SMP PREEMPT_DYNAMIC Fri Sep 25 14:35:54 UTC 2026\n"), time("2026-09-25T14:35:54Z"));
+        assert_eq!(parse_kernel_built_at("#1 SMP Sat Sep  5 04:05:06 UTC 2026"), time("2026-09-05T04:05:06Z"));
+        assert_eq!(parse_kernel_built_at("#1 SMP Fri Sep  5 04:05:06 UTC 2026"), None);
+        assert_eq!(parse_kernel_built_at("#1 SMP Sat Sep  5 04:05:06 CEST 2026"), None);
+        assert_eq!(parse_kernel_built_at("UTC 2026"), None);
+        assert_eq!(parse_kernel_built_at(""), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::human;
 use crate::processes::{self, Activity, Process};
 use crate::ssh::Session;
 use anyhow::{Result, ensure};
+use jiff::Timestamp;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
@@ -39,6 +40,8 @@ pub struct BtrfsFacts {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Facts {
     pub boot_id: String,
+    /// As from [`facts::booted_at`]
+    pub booted_at: Timestamp,
     pub systems: Systems,
     /// What the boot loader will boot next, as from [`boot::default_boots`]
     pub boot: Vec<DefaultBoot>,
@@ -91,6 +94,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     }
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
+        booted_at: facts::booted_at(session)?,
         systems: facts::systems(session)?,
         boot: boot::default_boots(session)?,
         firmware_overrides: boot::firmware_overrides(session)?,
@@ -244,10 +248,12 @@ pub(crate) fn idle_facts() -> Facts {
     };
     Facts {
         boot_id: "4f6f3fbb-4f0e-4ba0-9a8d-2f53f2c4f59e".into(),
+        booted_at: "2026-09-30T08:27:56Z".parse().unwrap(),
         systems: Systems {
             current: system.clone(),
             booted: system.clone(),
             running_kernel: "6.18.54".into(),
+            running_kernel_built_at: Some("2026-09-25T14:35:54Z".parse().unwrap()),
             default: system,
             default_kernel: "6.18.54".into(),
         },

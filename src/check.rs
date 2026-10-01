@@ -11,6 +11,7 @@ use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
 use anyhow::{Result, ensure};
+use jiff::tz::TimeZone;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::thread;
@@ -29,7 +30,7 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 /// The activities that have columns of their own.
 const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Rsync];
 
-const HEADER: [&str; 11] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL"];
+const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL", "BUILT", "BOOTED"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
@@ -63,9 +64,10 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
 }
 
 /// The table row about `machine`: the facts that decide whether to reboot
-/// it, red where they block a reboot, and the kernel it runs (and the one it
-/// would boot, if different).
-fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
+/// it, red where they block a reboot, the kernel it runs (and the one it
+/// would boot, if different), and when that kernel was built and booted, in
+/// `zone`.
+fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell> {
     let Ok((facts, blockers)) = outcome else {
         let mut row = vec![Plain.cell(machine.hostname.clone()), Red.cell("error")];
         row.resize(HEADER.len(), Plain.cell(""));
@@ -93,16 +95,18 @@ fn table_row(machine: &Machine, outcome: &Outcome) -> Vec<Cell> {
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         list(other_reasons(facts).iter().map(String::as_str).collect()),
         Plain.cell(kernel),
+        systems.running_kernel_built_at.map_or(Plain.cell("?"), |time| human::minute(time, zone)),
+        human::minute(facts.booted_at, zone),
     ]
 }
 
 /// A table with a row per machine, followed by a line per reason not to
 /// reboot a machine and per machine that couldn't be checked (with any
 /// further lines of the error indented), a blank line before each machine's.
-/// The table is styled if `color`.
-fn table(outcomes: &[(&Machine, Outcome)], color: bool) -> String {
+/// The table is styled if `color`, and shows times in `zone`.
+fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> String {
     let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title).aligned(if CENTERED.contains(&title) { Center } else { Left })))];
-    rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome)));
+    rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome, zone)));
     let mut text = human::table(&rows, color);
 
     for (machine, outcome) in outcomes {
@@ -170,8 +174,8 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
-/// `color`), or JSON if `json`.  Returns the exit status: see
-/// [`exit_status`].
+/// `color`, with times in the local time zone), or JSON if `json`.
+/// Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
@@ -187,7 +191,7 @@ pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
         let reports: Vec<_> = outcomes.iter().map(|(machine, outcome)| json_report(machine, outcome)).collect();
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
-        print!("{}", table(&outcomes, color));
+        print!("{}", table(&outcomes, color, &TimeZone::system()));
     }
     Ok(exit_status(&outcomes))
 }
@@ -206,6 +210,7 @@ mod tests {
     fn blocked_outcome() -> Outcome {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
+        facts.systems.running_kernel_built_at = None;
         facts.btrfs[0].exclusive_operation = "balance".into();
         facts.btrfs[0].devices[0].missing = true;
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
@@ -241,10 +246,10 @@ mod tests {
             (&machines[2], Err(anyhow!("no route to host\nsecond line").context("failed to open a session"))),
         ];
         assert_eq!(
-            table(&outcomes, false),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 KERNEL\n\
-             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55\n\
-             two      yes                              1.00 kB/s   0.50   45%                                                                       6.18.54\n\
+            table(&outcomes, false, &TimeZone::UTC),
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 KERNEL             BUILT        BOOTED\n\
+             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                              1.00 kB/s   0.50   45%                                                                       6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -260,9 +265,9 @@ mod tests {
              \n\
              three: failed to open a session: no route to host\n    second line\n"
         );
-        let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome).into_iter().map(|cell| cell.style).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain]);
+        let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain, Plain, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
@@ -306,6 +311,8 @@ mod tests {
         assert_eq!(report["facts"]["btrfs"][0]["mountpoint"], "/");
         assert_eq!(report["facts"]["btrfs"][0]["scrub"]["state"], "finished");
         assert_eq!(report["facts"]["systems"]["default_kernel"], "6.18.55");
+        assert_eq!(report["facts"]["systems"]["running_kernel_built_at"], Value::Null);
+        assert_eq!(report["facts"]["booted_at"], "2026-09-30T08:27:56Z");
         let report = json(&Err(anyhow!("no route to host")));
         assert_eq!(report, json!({"machine": "one", "okay_to_reboot": false, "error": "no route to host"}));
     }

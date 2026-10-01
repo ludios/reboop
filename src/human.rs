@@ -2,6 +2,9 @@
 
 //! Formatting quantities and tables for people.
 
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+
 /// The units above bytes, each 1000 times the last.
 const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
 
@@ -65,7 +68,7 @@ pub enum Style {
 impl Style {
     /// A table cell showing `text` in this style, flush left.
     pub fn cell(self, text: impl Into<String>) -> Cell {
-        Cell { text: text.into(), style: self, align: Align::Left }
+        Cell { spans: vec![(self, text.into())], align: Align::Left }
     }
 
     /// `text` in this style, with ANSI escape sequences.
@@ -93,8 +96,8 @@ pub enum Align {
 /// Text in a table, and how it looks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    pub text: String,
-    pub style: Style,
+    /// The text, in pieces that each have a style.
+    pub spans: Vec<(Style, String)>,
     pub align: Align,
 }
 
@@ -103,6 +106,25 @@ impl Cell {
     pub fn aligned(self, align: Align) -> Cell {
         Cell { align, ..self }
     }
+
+    /// This cell with `text` in `style` added at the end.
+    pub fn then(mut self, style: Style, text: impl Into<String>) -> Cell {
+        self.spans.push((style, text.into()));
+        self
+    }
+
+    /// How many characters the text has.
+    fn chars(&self) -> usize {
+        self.spans.iter().map(|(_, text)| text.chars().count()).sum()
+    }
+}
+
+/// A cell showing `time` in `zone` to the minute, without the year, like
+/// "12-31T23:59", the "T" dim to set apart the date and the time of day.
+pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
+    let zoned = time.to_zoned(zone.clone());
+    let (date, time_of_day) = (zoned.strftime("%m-%d").to_string(), zoned.strftime("%H:%M").to_string());
+    Style::Plain.cell(date).then(Style::Dim, "T").then(Style::Plain, time_of_day)
 }
 
 /// Lays out `rows` of cells in columns, two spaces apart, without trailing
@@ -111,7 +133,7 @@ impl Cell {
 pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
     let columns = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == columns), "rows have different numbers of cells");
-    let widths: Vec<usize> = (0..columns).map(|i| rows.iter().map(|row| row[i].text.chars().count()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..columns).map(|i| rows.iter().map(|row| row[i].chars()).max().unwrap_or(0)).collect();
     let mut text = String::new();
     for row in rows {
         let cells: Vec<String> = row
@@ -121,8 +143,9 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
                 // Padding counts chars, like the widths, and goes outside any
                 // escape sequences (none around empty text) so that
                 // trim_end can remove it from the end of a row.
-                let shown = if color && !cell.text.is_empty() { cell.style.paint(&cell.text) } else { cell.text.clone() };
-                let padding = width - cell.text.chars().count();
+                let paint = |(style, text): &(Style, String)| if color && !text.is_empty() { style.paint(text) } else { text.clone() };
+                let shown: String = cell.spans.iter().map(paint).collect();
+                let padding = width - cell.chars();
                 let before = match cell.align {
                     Align::Left   => 0,
                     Align::Right  => padding,
@@ -140,6 +163,7 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::tz;
 
     #[test]
     fn formats() {
@@ -182,5 +206,15 @@ mod tests {
         assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
         let rows = [vec![Style::Bold.cell("NET").aligned(Align::Center)], vec![Style::Red.cell("12.50").aligned(Align::Right)], vec![Style::Red.cell("1.0").aligned(Align::Right)]];
         assert_eq!(table(&rows, true), " \x1b[1mNET\x1b[0m\n\x1b[31m12.50\x1b[0m\n  \x1b[31m1.0\x1b[0m\n");
+        let rows = [vec![Style::Plain.cell("ab").then(Style::Red, "c").then(Style::Green, ""), Style::Plain.cell("x")], vec![Style::Plain.cell("a"), Style::Plain.cell("y")]];
+        assert_eq!(table(&rows, true), "ab\x1b[31mc\x1b[0m  x\na    y\n");
+    }
+
+    #[test]
+    fn shows_minutes() {
+        let time: Timestamp = "2026-12-31T22:30:59Z".parse().unwrap();
+        let cell = minute(time, &TimeZone::fixed(tz::offset(2)));
+        assert_eq!(cell.spans, [(Style::Plain, "01-01".into()), (Style::Dim, "T".into()), (Style::Plain, "00:30".into())]);
+        assert_eq!(minute(time, &TimeZone::UTC).spans[2].1, "22:30");
     }
 }

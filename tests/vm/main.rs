@@ -12,6 +12,7 @@ mod harness;
 
 use anyhow::{Result, bail, ensure};
 use harness::{Name, Vm, clean_up};
+use jiff::Timestamp;
 use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::boot;
 use reboop::bounce::{self, Outcome, Printer};
@@ -141,6 +142,9 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     // the one that's running.
     assert_eq!(facts::kernel_release(&mut session, &systems.current)?, systems.running_kernel);
     assert_eq!(systems.running_kernel, sh(&mut session, "uname -r")?.trim_end());
+    let built = systems.running_kernel_built_at.expect("NixOS kernels say when they were built in `uname -v`");
+    let booted = facts::booted_at(&mut session)?;
+    assert!(built < booted && booted < Timestamp::now(), "built at {built}, booted at {booted}");
 
     let load = facts::load_average_1min(&mut session)?;
     assert!((0.0..100.0).contains(&load), "{load}");
