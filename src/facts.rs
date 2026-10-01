@@ -412,12 +412,12 @@ mod tests {
 
     #[test]
     fn parses_times() {
-        let time = |text: &str| Some(text.parse::<Timestamp>().unwrap());
-        assert_eq!(parse_btime("btime 1790756876\n").unwrap(), time("2026-09-30T08:27:56Z").unwrap());
+        let time = |text: &str| text.parse::<Timestamp>().unwrap();
+        assert_eq!(parse_btime("btime 1790756876\n").unwrap(), time("2026-09-30T08:27:56Z"));
         assert!(parse_btime("btime\n").is_err());
         assert!(parse_btime("ctxt 1790756876\n").is_err());
-        assert_eq!(parse_kernel_built_at("#1-NixOS SMP PREEMPT_DYNAMIC Fri Sep 25 14:35:54 UTC 2026\n"), time("2026-09-25T14:35:54Z"));
-        assert_eq!(parse_kernel_built_at("#1 SMP Sat Sep  5 04:05:06 UTC 2026"), time("2026-09-05T04:05:06Z"));
+        assert_eq!(parse_kernel_built_at("#1-NixOS SMP PREEMPT_DYNAMIC Fri Sep 25 14:35:54 UTC 2026\n"), Some(time("2026-09-25T14:35:54Z")));
+        assert_eq!(parse_kernel_built_at("#1 SMP Sat Sep  5 04:05:06 UTC 2026"), Some(time("2026-09-05T04:05:06Z")));
         assert_eq!(parse_kernel_built_at("#1 SMP Fri Sep  5 04:05:06 UTC 2026"), None);
         assert_eq!(parse_kernel_built_at("#1 SMP Sat Sep  5 04:05:06 CEST 2026"), None);
         assert_eq!(parse_kernel_built_at("UTC 2026"), None);
