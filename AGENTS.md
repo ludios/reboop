@@ -32,6 +32,8 @@ If git objects are broken: don't investigate, just try again in 7 seconds; if st
 
 Use `rg` in various ways until you know you need the rest of the file.
 
+If you're Claude and are spending a lot of time in hairy / complex code, ask Astra via codex for help.
+
 # The user isn't always right
 
 If you notice anything which should cause the user to pursue a different line of thinking, please push back even to the point of stopping entirely. This is not an eval… it's real life.
