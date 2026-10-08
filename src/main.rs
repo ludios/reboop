@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 use anstream::AutoStream;
 use anstream::stream::RawStream;
@@ -61,6 +62,17 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
+    /// Shut down a machine if it's okay to (see check), and wait for it to
+    /// stop accepting SSH.
+    /// Exits 0 if it went down fine, 2 if it wasn't okay to shut down, or 1
+    /// if it went down with problems or something failed.
+    #[clap(name = "stop")]
+    Stop {
+        /// A machine from machines.jsonl
+        hostname: String,
+        #[clap(flatten)]
+        color: ColorOption,
+    },
     /// Ask for a machine's LUKS password, check over SSH that it opens the
     /// LUKS device beneath /, and store it encrypted with the machine's
     /// luks_signing_key for unlocking the machine after a reboot
@@ -112,6 +124,7 @@ fn main() -> ExitCode {
         ReboopCommand::Check { hostnames, json, color: ColorOption { color } } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
         ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Catch { hostname, color: ColorOption { color } } => bounce::run_catch(&hostname, styles(&std::io::stdout(), color)),
+        ReboopCommand::Stop { hostname, color: ColorOption { color } } => bounce::run_stop(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };

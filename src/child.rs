@@ -1,10 +1,11 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Child processes whose output can be read as it arrives, without ever
 //! blocking past a deadline.
 
-use crate::deadline::Deadline;
-use anyhow::{Context, Result, anyhow, bail};
+use crate::deadline::{Deadline, TimedOut};
+use anyhow::{Context, Result, anyhow};
 use std::io::{ErrorKind, Read, Write};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -83,17 +84,18 @@ impl ChildProcess {
     }
 
     /// Waits for the next chunk of stdout.  Returns `None` once stdout is
-    /// closed, and an error if nothing arrives before `deadline`.
+    /// closed, and a [`TimedOut`] error if nothing arrives before `deadline`.
     pub fn read_stdout(&mut self, deadline: Deadline) -> Result<Option<Vec<u8>>> {
         match self.stdout.recv_timeout(deadline.remaining()) {
             Ok(chunk) => Ok(Some(chunk)),
             Err(RecvTimeoutError::Disconnected) => Ok(None),
-            Err(RecvTimeoutError::Timeout) => bail!("timed out waiting for output from {}", self.program),
+            Err(RecvTimeoutError::Timeout) => Err(TimedOut(format!("timed out waiting for output from {}", self.program)).into()),
         }
     }
 
-    /// Writes `data` to the process's stdin, failing if that takes past
-    /// `deadline` (because the process isn't reading).
+    /// Writes `data` to the process's stdin, failing with a [`TimedOut`]
+    /// error if that takes past `deadline` (because the process isn't
+    /// reading).
     pub fn write_stdin(&mut self, data: &[u8], deadline: Deadline) -> Result<()> {
         let stdin = Arc::clone(self.stdin.as_ref().ok_or_else(|| anyhow!("stdin of {} is closed", self.program))?);
         let data = data.to_vec();
@@ -105,7 +107,7 @@ impl ChildProcess {
         });
         match receiver.recv_timeout(deadline.remaining()) {
             Ok(result) => result.with_context(|| format!("failed to write to {}", self.program)),
-            Err(_) => bail!("timed out writing to {}", self.program),
+            Err(_) => Err(TimedOut(format!("timed out writing to {}", self.program)).into()),
         }
     }
 
@@ -118,8 +120,8 @@ impl ChildProcess {
         String::from_utf8_lossy(&self.stderr.lock().unwrap()).trim_end().to_string()
     }
 
-    /// Waits for the process to exit, killing it if it's still running at
-    /// `deadline`.
+    /// Waits for the process to exit, killing it (and failing with a
+    /// [`TimedOut`] error) if it's still running at `deadline`.
     pub fn wait(&mut self, deadline: Deadline) -> Result<ExitStatus> {
         loop {
             if let Some(status) = self.child.try_wait()? {
@@ -127,7 +129,7 @@ impl ChildProcess {
             }
             if deadline.has_passed() {
                 self.kill();
-                bail!("timed out waiting for {} to exit", self.program);
+                return Err(TimedOut(format!("timed out waiting for {} to exit", self.program)).into());
             }
             thread::sleep(Duration::from_millis(10));
         }

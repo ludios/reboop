@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Deadlines, and retrying until one passes.
 
@@ -43,6 +44,18 @@ impl fmt::Display for Permanent {
 }
 
 impl std::error::Error for Permanent {}
+
+/// An error from giving up on something at a deadline.
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
 
 /// Calls `attempt` until it succeeds, starting attempts at most once per
 /// `interval`.  Gives up with the last error if it's [`Permanent`] or when

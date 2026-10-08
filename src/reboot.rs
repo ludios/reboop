@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Taking a remote machine down.
 
@@ -38,16 +39,52 @@ pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result
     })
 }
 
-/// Asks systemd to reboot the machine.  The connection often closes before
-/// systemctl can report back, which is fine, so success here doesn't prove
-/// the machine is rebooting; compare boot IDs afterwards.  Fails if the
-/// request can't have reached the machine, or systemctl failed or hung.
-pub fn reboot(mut session: Session) -> Result<()> {
-    match session.run_or_disconnect("systemctl reboot", Duration::from_secs(60))? {
+/// A way to take a machine down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Down {
+    Reboot,
+    /// Shut down and powered off
+    Shutdown,
+}
+
+impl Down {
+    /// For people, as in "okay to reboot" or "okay to shut down".
+    pub fn verb(self) -> &'static str {
+        match self {
+            Down::Reboot   => "reboot",
+            Down::Shutdown => "shut down",
+        }
+    }
+
+    /// For people, as in "Not rebooting" or "Not shutting down".
+    pub fn gerund(self) -> &'static str {
+        match self {
+            Down::Reboot   => "rebooting",
+            Down::Shutdown => "shutting down",
+        }
+    }
+
+    /// The systemctl command that asks for it.
+    fn command(self) -> &'static str {
+        match self {
+            Down::Reboot   => "systemctl reboot",
+            Down::Shutdown => "systemctl poweroff",
+        }
+    }
+}
+
+/// Asks systemd to take the machine `down`.  The connection often closes
+/// before systemctl can report back, which is fine, so success here doesn't
+/// prove the machine is going down: see afterwards (for a reboot, compare
+/// boot IDs).  Fails if the request can't have reached the machine, or
+/// systemctl failed or hung.
+pub fn ask(mut session: Session, down: Down) -> Result<()> {
+    let command = down.command();
+    match session.run_or_disconnect(command, Duration::from_secs(60))? {
         Some(output) if output.status == 0 => Ok(()),
-        Some(output) => bail!("systemctl reboot exited with status {}: {}", output.status, output.stderr_text()),
+        Some(output) => bail!("{command} exited with status {}: {}", output.status, output.stderr_text()),
         None => {
-            info!("the connection closed after asking for a reboot, as expected");
+            info!("the connection closed after asking to {}, as expected", down.verb());
             Ok(())
         }
     }

@@ -1,4 +1,5 @@
 <!-- Model-output: Claude Opus 5.5 -->
+<!-- Model-output: Claude Fable 5.1 -->
 
 # reboop
 
@@ -12,6 +13,8 @@ Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:
 6. Scrubs btrfs, failing loudly on errors.
 
 `reboop catch HOSTNAME` does steps 4 to 6 for a machine that was rebooted some other way, like by hand or by a power cut, or whose bounce was cut short. If the machine is already up, it checks the boot it's in.
+
+`reboop stop HOSTNAME` does steps 1 and 3 with a shutdown (`systemctl poweroff`) in place of the reboot, then waits for the machine to stop accepting SSH.
 
 LUKS passwords are stored in `~/.config/reboop/luks/`, encrypted with a key derived from an `ssh-keygen -Y sign` signature, so they're usable wherever your Ed25519 or RSA SSH key is. Machines and limits go in `~/.config/reboop/defaults.json` and `machines.jsonl`; see [doc/spec.md](doc/spec.md).
 

@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Logging in to machines as root with the ssh binary (so the user's ssh
 //! config, agent and known_hosts all apply), and running commands there.
@@ -185,7 +186,9 @@ impl Session {
     }
 
     /// Logs in to `target` and waits until it's ready to run commands.
-    /// Failures that trying again won't fix are [`Permanent`].
+    /// Failures that trying again won't fix are [`Permanent`], and giving up
+    /// at `timeout` is a [`TimedOut`](crate::deadline::TimedOut) error,
+    /// unlike ssh's own giving up (as when the connection is refused).
     pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
         let deadline = Deadline::after(timeout);
         let child = ChildProcess::spawn(ssh.command(target, &["-T"], &sh_c(SESSION_SHELL)))?;

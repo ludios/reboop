@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Builds a test VM (see default.nix), starts it if it isn't already
 //! running, and brings it up to where it accepts SSH connections.
@@ -23,6 +24,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
@@ -91,10 +93,18 @@ fn build(dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
 }
 
+/// Two free TCP ports on 127.0.0.1, bound at once so that they differ, then
+/// freed for qemu.
+fn free_ports() -> Result<[u16; 2]> {
+    let listeners = [TcpListener::bind("127.0.0.1:0")?, TcpListener::bind("127.0.0.1:0")?];
+    Ok(listeners.map(|listener| listener.local_addr().unwrap().port()))
+}
+
 /// Starts qemu in the background with what `manifest` (from the Nix build
-/// `bundle`) describes, logging its console to `dir`.  Returns what to
-/// remember about it: see [`State`].
-fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
+/// `bundle`) describes, logging its console to `dir`, and forwarding
+/// `ports` (to the system's sshd, and to the initrd's) to it.  Returns what
+/// to remember about it: see [`State`].
+fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest, [ssh_port, initrd_ssh_port]: [u16; 2]) -> Result<State> {
     ensure!(!manifest.disk_images.is_empty(), "{} has no disks to boot", manifest.hostname);
     eprintln!("starting the {} test VM...", manifest.hostname);
     let arg = |prefix: &str, path: &Path| format!("{prefix}{}", path.display());
@@ -114,10 +124,6 @@ fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest) -> Result<State> {
         // exits, so each VM starts from the pristine image.
         command.args(["-drive", &arg("if=virtio,format=qcow2,cache=unsafe,snapshot=on,file=", disk)]);
     }
-
-    // Bind two free ports at once, so they differ, then free them for qemu.
-    let listeners = [TcpListener::bind("127.0.0.1:0")?, TcpListener::bind("127.0.0.1:0")?];
-    let [ssh_port, initrd_ssh_port] = listeners.map(|listener| listener.local_addr().unwrap().port());
 
     let pidfile = dir.join("qemu.pid");
     let _ = fs::remove_file(&pidfile);
@@ -257,6 +263,17 @@ pub fn be_watchdog_if_started_as_one() {
     process::exit(0);
 }
 
+/// Starts qemu (see [`start_qemu`]) for `manifest` from `bundle` in `dir`,
+/// on `ports`, remembers it in state.json, and starts its watchdog.
+fn launch(dir: &Path, bundle: &Path, manifest: &Manifest, ports: [u16; 2]) -> Result<State> {
+    let state = start_qemu(dir, bundle, manifest, ports)?;
+    // First, so that if the watchdog doesn't start, the next run finds the
+    // VM and tries again.
+    fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&state)?)?;
+    start_watchdog(dir, state.pid)?;
+    Ok(state)
+}
+
 /// Writes the client key, known_hosts and an ssh config that uses them (and
 /// nothing from the user's own ssh setup), returning the config's path.
 fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<PathBuf> {
@@ -341,6 +358,10 @@ pub struct Vm {
     pub initrd_target: Target,
     pub manifest: Manifest,
     pub dir: PathBuf,
+    /// The Nix build the VM runs from
+    bundle: PathBuf,
+    /// Its qemu's, which changes if it's restarted
+    pid: AtomicU32,
     /// Held for as long as the tests run, so concurrent runs don't share the
     /// VM, and so its watchdog knows it's in use (see [`watch`]).
     _lock: File,
@@ -370,12 +391,7 @@ impl Vm {
                 if let Some(old) = old_state {
                     stop_qemu(&dir, old.pid)?;
                 }
-                let state = start_qemu(&dir, &bundle, &manifest)?;
-                // First, so that if the watchdog doesn't start, the next run
-                // finds the VM and tries again.
-                fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
-                start_watchdog(&dir, state.pid)?;
-                state
+                launch(&dir, &bundle, &manifest, free_ports()?)?
             }
         };
         // For the watchdog, which may not see a short run: see watch.
@@ -387,15 +403,27 @@ impl Vm {
             initrd_target: Target { name: manifest.hostname.clone(), address: "127.0.0.1".into(), port: state.initrd_ssh_port },
             manifest,
             dir,
+            bundle,
+            pid: AtomicU32::new(state.pid),
             _lock: lock,
         };
-        if let Err(error) = vm.bring_up() {
-            // Don't leave a broken VM for the next run.
-            let _ = stop_qemu(&vm.dir, state.pid);
-            let console = vm.dir.join("console.log");
-            return Err(error.context(format!("{} didn't come up; see {}", vm.manifest.hostname, console.display())));
-        }
+        vm.bring_up_or_stop()?;
         Ok(vm)
+    }
+
+    /// Whether the VM's qemu is running, which it stops doing when the guest
+    /// powers off.
+    pub fn is_running(&self) -> bool {
+        qemu_is_running(&self.dir, self.pid.load(Ordering::Relaxed))
+    }
+
+    /// Starts the VM again, on the same ports, once its guest has powered
+    /// off (so its qemu has exited), and brings it up.
+    pub fn restart(&self) -> Result<()> {
+        ensure!(!self.is_running(), "{}'s qemu is still running", self.manifest.hostname);
+        let state = launch(&self.dir, &self.bundle, &self.manifest, [self.target.port, self.initrd_target.port])?;
+        self.pid.store(state.pid, Ordering::Relaxed);
+        self.bring_up_or_stop()
     }
 
     pub fn session(&self) -> Result<Session> {
@@ -406,6 +434,17 @@ impl Vm {
     pub fn luks_password(&self) -> Result<&str> {
         let initrd = self.manifest.initrd.as_ref().ok_or_else(|| anyhow!("{} has no LUKS", self.manifest.hostname))?;
         Ok(&initrd.luks_password)
+    }
+
+    /// Brings the VM up (see [`Vm::bring_up`]), stopping its qemu if that
+    /// fails, so as not to leave a broken VM for the next run.
+    fn bring_up_or_stop(&self) -> Result<()> {
+        if let Err(error) = self.bring_up() {
+            let _ = stop_qemu(&self.dir, self.pid.load(Ordering::Relaxed));
+            let console = self.dir.join("console.log");
+            return Err(error.context(format!("{} didn't come up; see {}", self.manifest.hostname, console.display())));
+        }
+        Ok(())
     }
 
     /// Waits for the VM to accept SSH connections, unlocking its disk if

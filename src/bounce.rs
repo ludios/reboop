@@ -1,22 +1,24 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! `reboop bounce`: reboots a machine that's okay to reboot, unlocks its
 //! LUKS device from the initrd if it has one, shows how it came back, and
-//! scrubs its btrfs filesystems; and `reboop catch`, which does what comes
-//! after the reboot, for a machine that was rebooted some other way.
+//! scrubs its btrfs filesystems; `reboop catch`, which does what comes
+//! after the reboot, for a machine that was rebooted some other way; and
+//! `reboop stop`, which shuts down a machine that's okay to shut down.
 
 use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
-use crate::deadline::{Deadline, Permanent, retry};
+use crate::deadline::{Deadline, Permanent, TimedOut, retry};
 use crate::facts::{self, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use crate::initrd::{self, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
-use crate::reboot::{self, Stopped};
+use crate::reboot::{self, Down, Stopped};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use jiff::Zoned;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
@@ -28,7 +30,7 @@ use tracing::debug;
 /// How long each of a machine's stop_services gets to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// How often to try reaching a machine that's rebooting.
+/// How often to try reaching a machine that's rebooting or shutting down.
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long a machine gets from being asked to reboot until it accepts SSH
@@ -38,6 +40,10 @@ const RETURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How long systemd gets to finish starting up once the machine accepts SSH.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a machine gets from being asked to shut down until it stops
+/// accepting SSH.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How often to check on a scrub.
 const SCRUB_INTERVAL: Duration = Duration::from_secs(2);
@@ -150,16 +156,28 @@ fn indented_list(heading: &str, items: impl IntoIterator<Item = impl AsRef<str>>
     text
 }
 
-/// How a bounce ended, short of an error.
+/// How a bounce or stop ended, short of an error.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The machine wasn't okay to reboot, for these reasons, so it wasn't
-    /// rebooted.  If that only turned out once its stop_services were
+    /// The machine wasn't okay to reboot or shut down, for these reasons, so
+    /// it wasn't.  If that only turned out once its stop_services were
     /// stopped, they're left stopped.
     NotOkay(Vec<String>),
-    /// The machine came back with these problems, which are none if all is
-    /// well.
-    Bounced(Vec<String>),
+    /// The machine was rebooted or shut down, with these problems, which are
+    /// none if all is well.
+    Done(Vec<String>),
+}
+
+impl Outcome {
+    /// The exit status for it: 0 if all is well, 1 if there were problems,
+    /// or 2 if the machine wasn't okay to reboot or shut down.
+    pub fn exit_status(&self) -> u8 {
+        match self {
+            Outcome::Done(problems) if problems.is_empty() => 0,
+            Outcome::Done(_) => 1,
+            Outcome::NotOkay(_) => 2,
+        }
+    }
 }
 
 /// Makes sure that `machine`'s initrd will be where bounce looks for it, given
@@ -228,13 +246,33 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
     Ok((stopped, problems))
 }
 
+/// What a check of a machine found: what was wanted if it's okay to take
+/// down, or else the reasons not to.
+type Checked<T> = Result<T, Vec<String>>;
+
+/// Opens a session to `machine` and checks whether it's okay to take
+/// `down`, telling the user.  Returns the session and the facts if so, or
+/// else the reasons not to.
+fn check(ssh: &Ssh, machine: &Machine, down: Down, printer: &mut Printer) -> Result<Checked<(Session, Facts)>> {
+    let hostname = &machine.hostname;
+    printer.line(&format!("Checking whether {hostname} is okay to {}", down.verb()));
+    let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
+    let facts = preflight::gather(&mut session, hostname)?;
+    let blockers = preflight::blockers(machine, &facts);
+    if !blockers.is_empty() {
+        printer.styled_line(Red, &indented_list(&format!("Not {} {hostname}:", down.gerund()), &blockers));
+        return Ok(Err(blockers));
+    }
+    Ok(Ok((session, facts)))
+}
+
 /// Checks again whether `machine` (at the other end of `session`) is okay to
-/// reboot, as testing the password and stopping services take a while,
+/// take down, as testing the password and stopping services take a while,
 /// during which a timer, say, may have started an upgrade or scrub.
 /// Stopping services changes the load and network traffic, so those don't
-/// count.  If it has a LUKS device beneath / (`luks`), also makes sure that
-/// its initrd will still be where bounce looks for it.  Returns the facts
-/// and the reasons not to reboot (none if it's okay).
+/// count.  If it's to be unlocked after a reboot (`luks`), also makes sure
+/// that its initrd will still be where bounce looks for it.  Returns the
+/// facts and the reasons not to (none if it's okay).
 fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(Facts, Vec<String>)> {
     let facts = preflight::gather(session, &machine.hostname)?;
     if luks {
@@ -242,6 +280,34 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
     }
     let blockers = preflight::blockers_ignoring_load_and_network(machine, &facts);
     Ok((facts, blockers))
+}
+
+/// Stops `machine`'s stop_services over `session` (see [`stop_services`]),
+/// and checks again whether it's okay to take `down` (see [`check_again`],
+/// which `luks` is for), telling the user.  Returns the facts and the
+/// problems so far (services that didn't stop cleanly) if so; or else the
+/// reasons not to, leaving the stop_services stopped and saying so.
+fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Checked<(Facts, Vec<String>)>> {
+    let hostname = &machine.hostname;
+    let (stopped, problems) = stop_services(machine, session, printer)?;
+    let still_stopped = |printer: &mut Printer| {
+        if !stopped.is_empty() {
+            printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
+        }
+    };
+    printer.line(&format!("Checking again whether {hostname} is okay to {}", down.verb()));
+    match check_again(machine, session, luks) {
+        Ok((facts, blockers)) if blockers.is_empty() => Ok(Ok((facts, problems))),
+        Ok((_, blockers)) => {
+            printer.styled_line(Red, &indented_list(&format!("Not {} {hostname} after all:", down.gerund()), &blockers));
+            still_stopped(printer);
+            Ok(Err(blockers))
+        }
+        Err(error) => {
+            still_stopped(printer);
+            Err(error)
+        }
+    }
 }
 
 /// Shows on `printer`'s progress line why the last try at something
@@ -423,12 +489,13 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
     Ok(problems)
 }
 
-/// Tells the user that `hostname` is back, and its `problems` (if any).
-fn show_back(hostname: &str, problems: &[String], printer: &mut Printer) {
+/// Tells the user that `hostname` is `how` ("back" or "down"), and its
+/// `problems` (if any).
+fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Printer) {
     if problems.is_empty() {
-        printer.line(&format!("{hostname} is back, and all is well"));
+        printer.line(&format!("{hostname} is {how}, and all is well"));
     } else {
-        printer.styled_line(Red, &indented_list(&format!("{hostname} is back, but:"), problems));
+        printer.styled_line(Red, &indented_list(&format!("{hostname} is {how}, but:"), problems));
     }
 }
 
@@ -445,48 +512,28 @@ fn show_back(hostname: &str, problems: &[String], printer: &mut Printer) {
 pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<String>, printer: &mut Printer) -> Result<Outcome> {
     let hostname = &machine.hostname;
     let not_rebooted = || format!("didn't reboot {hostname}");
-    printer.line(&format!("Checking whether {hostname} is okay to reboot"));
-    let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT).with_context(not_rebooted)?;
-    let facts = preflight::gather(&mut session, hostname).with_context(not_rebooted)?;
-    let blockers = preflight::blockers(machine, &facts);
-    if !blockers.is_empty() {
-        printer.styled_line(Red, &indented_list(&format!("Not rebooting {hostname}:"), &blockers));
-        return Ok(Outcome::NotOkay(blockers));
-    }
+    let (mut session, facts) = match check(ssh, machine, Down::Reboot, printer).with_context(not_rebooted)? {
+        Ok(okay) => okay,
+        Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
+    };
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
-    let (stopped, mut problems) = stop_services(machine, &mut session, printer).with_context(not_rebooted)?;
-
-    let still_stopped = |printer: &mut Printer| {
-        if !stopped.is_empty() {
-            printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
-        }
-    };
-    printer.line(&format!("Checking again whether {hostname} is okay to reboot"));
-    let facts = match check_again(machine, &mut session, password.is_some()) {
-        Ok((facts, blockers)) if blockers.is_empty() => facts,
-        Ok((_, blockers)) => {
-            printer.styled_line(Red, &indented_list(&format!("Not rebooting {hostname} after all:"), &blockers));
-            still_stopped(printer);
-            return Ok(Outcome::NotOkay(blockers));
-        }
-        Err(error) => {
-            still_stopped(printer);
-            return Err(error.context(not_rebooted()));
-        }
+    let (facts, mut problems) = match stop_and_check_again(machine, &mut session, Down::Reboot, password.is_some(), printer).with_context(not_rebooted)? {
+        Ok(stopped) => stopped,
+        Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
-    reboot::reboot(session).with_context(|| format!("failed to ask {hostname} to reboot (if it's rebooting anyway, `reboop catch {hostname}` takes it from there)"))?;
+    reboot::ask(session, Down::Reboot).with_context(|| format!("failed to ask {hostname} to reboot (if it's rebooting anyway, `reboop catch {hostname}` takes it from there)"))?;
     // So that the first try doesn't log in to the old boot on its way down,
     // which costs a key touch for some.
     sleep(RETRY_INTERVAL);
 
     let came_back = come_back(ssh, machine, Some(&facts.boot_id), password.as_deref(), printer);
     problems.extend(came_back.with_context(|| format!("after asking {hostname} to reboot (`reboop catch {hostname}` takes it from there)"))?);
-    show_back(hostname, &problems, printer);
-    Ok(Outcome::Bounced(problems))
+    show_done(hostname, "back", &problems, printer);
+    Ok(Outcome::Done(problems))
 }
 
 /// Catches `machine` on its way back up from a reboot that wasn't a bounce,
@@ -500,8 +547,68 @@ pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut
         printer.line(&format!("There's no stored LUKS password for {hostname}, so its initrd won't be unlocked"));
     }
     let problems = come_back(ssh, machine, None, password, printer)?;
-    show_back(hostname, &problems, printer);
+    show_done(hostname, "back", &problems, printer);
     Ok(problems)
+}
+
+/// Waits for `machine` to stop accepting SSH, as it does on its way down,
+/// after being asked to shut down.  Tries once per [`RETRY_INTERVAL`] until
+/// `deadline`, passing each try that found it up to `on_retry`.
+fn wait_for_down(ssh: &Ssh, machine: &Machine, deadline: Deadline, on_retry: impl FnMut(&anyhow::Error)) -> Result<()> {
+    let target = machine.target();
+    let attempt = |deadline: Deadline| -> Result<()> {
+        let mut session = match Session::open(ssh, &target, deadline.at_most(OPEN_TIMEOUT).remaining()) {
+            Ok(session) => session,
+            // Giving up on ssh (as when a key isn't touched) doesn't show
+            // that it's down, but ssh's giving up (as when the connection is
+            // refused) does.
+            Err(error) if error.downcast_ref::<TimedOut>().is_some() || error.downcast_ref::<Permanent>().is_some() => return Err(error),
+            Err(error) => {
+                debug!("{target} is down: {error:#}");
+                return Ok(());
+            }
+        };
+        match facts::system_state(&mut session)?.as_str() {
+            "stopping" => bail!("it's shutting down"),
+            state => bail!("it's up: systemd says the system is {state}"),
+        }
+    };
+    retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{} didn't go down", machine.hostname))
+}
+
+/// Shuts `machine` down, telling the user about it with `printer`: checks
+/// that it's okay to shut down; stops its stop_services; checks again, apart
+/// from load and network traffic (leaving the stop_services stopped if it's
+/// no longer okay); powers it off; and waits for it to stop accepting SSH,
+/// which is as much of its going down as can be seen.  Problems along the
+/// way are collected for the end.
+///
+/// Errors say whether they happened before or after asking the machine to
+/// shut down.
+pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Outcome> {
+    let hostname = &machine.hostname;
+    let not_stopped = || format!("didn't shut down {hostname}");
+    let (mut session, facts) = match check(ssh, machine, Down::Shutdown, printer).with_context(not_stopped)? {
+        Ok(okay) => okay,
+        Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
+    };
+    let systems = &facts.systems;
+    printer.line(&format!("{hostname} is okay to shut down, and will boot {} with kernel {} next time", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
+    let (_, problems) = match stop_and_check_again(machine, &mut session, Down::Shutdown, false, printer).with_context(not_stopped)? {
+        Ok(stopped) => stopped,
+        Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
+    };
+    printer.line(&format!("Asking {hostname} to shut down"));
+    reboot::ask(session, Down::Shutdown).with_context(|| format!("failed to ask {hostname} to shut down"))?;
+    // So that the first try doesn't log in to the machine on its way down,
+    // which costs a key touch for some.
+    sleep(RETRY_INTERVAL);
+
+    printer.line(&format!("Waiting for {} to stop accepting SSH", machine.target()));
+    wait_for_down(ssh, machine, Deadline::after(SHUTDOWN_TIMEOUT), |error| show_last_try(printer, error))
+        .with_context(|| format!("after asking {hostname} to shut down"))?;
+    show_done(hostname, "down", &problems, printer);
+    Ok(Outcome::Done(problems))
 }
 
 /// The local time of day, like "12:03:16".
@@ -526,17 +633,20 @@ fn with_stdout_printer<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) ->
 }
 
 /// Bounces the configured machine `hostname` (see [`bounce`]), in color if
-/// `color`.  Returns the exit status: 0 if it came back fine, 1 if it came
-/// back with problems, or 2 if it wasn't okay to reboot.
+/// `color`.  Returns the exit status (see [`Outcome::exit_status`]).
 pub fn run(hostname: &str, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
     let password = || passwords::load(&config::passwords_dir()?, hostname, &passwords::master_key(&machine.luks_signing_key)?);
-    Ok(match with_stdout_printer(color, |printer| bounce(&Ssh::default(), machine, password, printer))? {
-        Outcome::Bounced(problems) if problems.is_empty() => 0,
-        Outcome::Bounced(_) => 1,
-        Outcome::NotOkay(_) => 2,
-    })
+    Ok(with_stdout_printer(color, |printer| bounce(&Ssh::default(), machine, password, printer))?.exit_status())
+}
+
+/// Shuts down the configured machine `hostname` (see [`stop`]), in color if
+/// `color`.  Returns the exit status (see [`Outcome::exit_status`]).
+pub fn run_stop(hostname: &str, color: bool) -> Result<u8> {
+    let machines = config::load(&config::config_dir()?)?;
+    let machine = config::find(&machines, hostname)?;
+    Ok(with_stdout_printer(color, |printer| stop(&Ssh::default(), machine, printer))?.exit_status())
 }
 
 /// Catches the configured machine `hostname` (see [`catch`]), with its

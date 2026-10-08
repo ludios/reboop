@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Tests of reboop against NixOS VMs: systemd-boot.nix, with a LUKS-encrypted
 //! btrfs root, and grub.nix, which boots from BIOS and has no LUKS.
@@ -23,7 +24,7 @@ use reboop::facts;
 use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
 use reboop::processes::{self, Activity};
-use reboop::reboot::{self, Stopped};
+use reboop::reboot::{self, Down, Stopped};
 use reboop::ssh::{Session, shell_quote, wait_for_session};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -604,7 +605,7 @@ fn catch_when_up(vm: &Vm) -> Result<()> {
 fn catch_with_wrong_password_first(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     let boot_id = facts::boot_id(&mut session)?;
-    reboot::reboot(session)?;
+    reboot::ask(session, Down::Reboot)?;
     let error = catch_vm(vm, Some("not the password")).unwrap_err();
     let wrong = matches!(error.downcast_ref(), Some(UnlockError::WrongPassword { .. }));
     ensure!(wrong, "expected the password to be rejected, got: {error:#}");
@@ -674,7 +675,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     // One of the stop_services is running, and one doesn't exist.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     let (outcome, printed) = bounce_vm()?;
-    assert!(matches!(&outcome, Outcome::Bounced(problems) if problems.is_empty()), "{outcome:?}");
+    assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
     let stopping = format!(
         "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
          Checking again whether {hostname} is okay to reboot\nAsking {hostname} to reboot\n"
@@ -693,6 +694,45 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_eq!(after.running_kernel, expected.default_kernel);
     assert_eq!(sh(&mut session, "cat /etc/reboop-test-variant")?, next_variant);
     Ok(())
+}
+
+fn stop_powers_off(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let machine = vm_machine(vm);
+    let hostname = &machine.hostname;
+    // Stops the VM, printing what it says, and returns that too.
+    let stop_vm = || -> Result<(Outcome, String)> {
+        let mut printed = Vec::new();
+        let outcome = bounce::stop(&vm.ssh, &machine, &mut Printer::new(&mut printed, false, None, None));
+        let printed = String::from_utf8(printed)?;
+        print!("{printed}");
+        Ok((outcome?, printed))
+    };
+
+    // Not while someone has a tmux
+    sh(&mut session, START_TMUX)?;
+    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    let (Outcome::NotOkay(blockers), printed) = stop_vm()? else {
+        bail!("stopped despite the tmux");
+    };
+    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: ")), "{blockers:?}");
+    assert!(printed.contains(&format!("\nNot shutting down {hostname}:\n")), "{printed}");
+    clean_up(&mut session)?;
+
+    // One of the stop_services is running, and one doesn't exist.
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    let (outcome, printed) = stop_vm()?;
+    assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
+    let stopping = format!(
+        "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
+         Checking again whether {hostname} is okay to shut down\nAsking {hostname} to shut down\n\
+         Waiting for {} to stop accepting SSH\n{hostname} is down, and all is well\n",
+        machine.target()
+    );
+    assert!(printed.contains(&stopping), "{printed}");
+    // qemu exits once the guest has powered off.
+    wait_for(|| Ok(!vm.is_running()))?;
+    vm.restart()
 }
 
 /// Runs `test` against the VM called `name`, which is set up by the first
@@ -730,6 +770,7 @@ fn main() {
         ("luks_password_is_tested", luks_password_is_tested),
         ("catch_with_wrong_password_first", catch_with_wrong_password_first),
         ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
+        ("stop_powers_off", stop_powers_off),
     ];
     let grub: &[(&str, Test)] = &[
         ("identity_and_systems", identity_and_systems),
@@ -739,6 +780,7 @@ fn main() {
         ("grubs_defaults_are_checked", grubs_defaults_are_checked),
         ("catch_when_up", catch_when_up),
         ("bounce_into_new_default_configuration", bounce_into_new_default_configuration),
+        ("stop_powers_off", stop_powers_off),
     ];
     let trials = [(Name::SystemdBoot, systemd_boot), (Name::Grub, grub)]
         .into_iter()
