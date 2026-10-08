@@ -159,4 +159,4 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
 ## Stop
 
-`reboop stop HOSTNAME` does Preflight and Reboot step 1 with `systemctl poweroff` in place of `shutdown -r now`, then keeps trying ssh_port once every 15 seconds until the machine stops accepting SSH, which is as much of its going down as can be seen from outside.
+`reboop stop HOSTNAME` does Preflight and Reboot step 1 with `systemctl poweroff` in place of the reboot, then keeps trying ssh_port once every 15 seconds until the machine stops accepting SSH, which is as much of its going down as can be seen from outside.

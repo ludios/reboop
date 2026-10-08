@@ -40,6 +40,17 @@ pub fn is_permanent_failure(stderr: &str) -> bool {
         .any(|message| stderr.contains(message))
 }
 
+/// Whether ssh's `stderr` shows that it found no SSH server to talk to: the
+/// connection was refused, timed out, or had no route, or whatever answered
+/// closed the connection before any SSH greeting.  (Not "Permission
+/// denied", which a server says, and not the client's own network being
+/// unreachable.)
+pub fn is_unreachable(stderr: &str) -> bool {
+    ["Connection refused", "Connection timed out", "No route to host", "kex_exchange_identification:"]
+        .iter()
+        .any(|message| stderr.contains(message))
+}
+
 /// An SSH server to log in to as root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -186,9 +197,7 @@ impl Session {
     }
 
     /// Logs in to `target` and waits until it's ready to run commands.
-    /// Failures that trying again won't fix are [`Permanent`], and giving up
-    /// at `timeout` is a [`TimedOut`](crate::deadline::TimedOut) error,
-    /// unlike ssh's own giving up (as when the connection is refused).
+    /// Failures that trying again won't fix are [`Permanent`].
     pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
         let deadline = Deadline::after(timeout);
         let child = ChildProcess::spawn(ssh.command(target, &["-T"], &sh_c(SESSION_SHELL)))?;
@@ -289,6 +298,16 @@ mod tests {
         let script = format!("printf %s {}", shell_quote(tricky));
         let output = std::process::Command::new("sh").arg("-c").arg(sh_c(&script)).output().unwrap();
         assert_eq!(String::from_utf8(output.stdout).unwrap(), tricky);
+    }
+
+    #[test]
+    fn tells_unreachable_servers_from_unwilling_ones() {
+        assert!(is_unreachable("ssh: connect to host 10.0.0.5 port 22: Connection refused"));
+        assert!(is_unreachable("ssh: connect to host 10.0.0.5 port 22: No route to host"));
+        assert!(is_unreachable("kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 10.0.0.5 port 22"));
+        assert!(!is_unreachable("root@10.0.0.5: Permission denied (publickey)."));
+        assert!(!is_unreachable("Host key verification failed."));
+        assert!(!is_unreachable("ssh: connect to host 10.0.0.5 port 22: Network is unreachable"));
     }
 
     #[test]

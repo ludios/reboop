@@ -722,7 +722,15 @@ fn stop_powers_off(vm: &Vm) -> Result<()> {
     // One of the stop_services is running, and one doesn't exist.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     let (outcome, printed) = stop_vm()?;
-    assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
+    let Outcome::Done(problems) = &outcome else {
+        bail!("didn't shut down: {outcome:?}");
+    };
+    // qemu exits once the guest has powered off.  The VM is started again
+    // before the checks below, so that a failed check doesn't leave it off
+    // for the tests that follow.
+    wait_for(|| Ok(!vm.is_running()))?;
+    vm.restart()?;
+    assert!(problems.is_empty(), "{problems:?}");
     let stopping = format!(
         "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
          Checking again whether {hostname} is okay to shut down\nAsking {hostname} to shut down\n\
@@ -730,9 +738,7 @@ fn stop_powers_off(vm: &Vm) -> Result<()> {
         machine.target()
     );
     assert!(printed.contains(&stopping), "{printed}");
-    // qemu exits once the guest has powered off.
-    wait_for(|| Ok(!vm.is_running()))?;
-    vm.restart()
+    Ok(())
 }
 
 /// Runs `test` against the VM called `name`, which is set up by the first

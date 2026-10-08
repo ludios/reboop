@@ -10,14 +10,14 @@
 use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState, ScrubStatus};
 use crate::config::{self, Machine};
-use crate::deadline::{Deadline, Permanent, TimedOut, retry};
+use crate::deadline::{Deadline, Permanent, retry};
 use crate::facts::{self, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use crate::initrd::{self, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Down, Stopped};
-use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh};
+use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, is_unreachable};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use jiff::Zoned;
 use std::fmt;
@@ -559,14 +559,14 @@ fn wait_for_down(ssh: &Ssh, machine: &Machine, deadline: Deadline, on_retry: imp
     let attempt = |deadline: Deadline| -> Result<()> {
         let mut session = match Session::open(ssh, &target, deadline.at_most(OPEN_TIMEOUT).remaining()) {
             Ok(session) => session,
-            // Giving up on ssh (as when a key isn't touched) doesn't show
-            // that it's down, but ssh's giving up (as when the connection is
-            // refused) does.
-            Err(error) if error.downcast_ref::<TimedOut>().is_some() || error.downcast_ref::<Permanent>().is_some() => return Err(error),
-            Err(error) => {
+            // Only ssh's finding no server there shows that it's down: not
+            // a server's refusing us (as when a key isn't touched), nor our
+            // giving up on ssh.
+            Err(error) if is_unreachable(&error.root_cause().to_string()) => {
                 debug!("{target} is down: {error:#}");
                 return Ok(());
             }
+            Err(error) => return Err(error),
         };
         match facts::system_state(&mut session)?.as_str() {
             "stopping" => bail!("it's shutting down"),
