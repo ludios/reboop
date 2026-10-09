@@ -66,15 +66,16 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
 }
 
 /// The SMART cell: the disks in trouble (without /dev/), "ok" if none is
-/// and every disk's SMART could be read, "?" if some disk's couldn't, or
-/// nothing if the machine has no smartctl.
+/// and every disk's SMART could be read in full, "?" if some disk's
+/// couldn't, or nothing if no disk was checked (no smartctl, or no disk
+/// beneath a btrfs filesystem).
 fn smart_cell(facts: &Facts) -> Cell {
-    let Some(disks) = &facts.disks else { return Plain.cell("") };
+    let Some(disks) = facts.disks.as_deref().filter(|disks| !disks.is_empty()) else { return Plain.cell("") };
     let name = |disk: &DiskFacts| disk.disk.path.strip_prefix("/dev/").unwrap_or(&disk.disk.path).to_string();
     let troubled: Vec<String> = disks.iter().filter(|disk| disk.smart.trouble().is_some()).map(name).collect();
     if !troubled.is_empty() {
         Red.cell(troubled.join(","))
-    } else if disks.iter().any(|disk| matches!(disk.smart, Smart::Unreadable { .. })) {
+    } else if disks.iter().any(|disk| matches!(disk.smart, Smart::Read { incomplete: Some(_), .. })) {
         Plain.cell("?")
     } else {
         Green.cell("ok")
@@ -242,7 +243,7 @@ mod tests {
         facts.systems.running_kernel_built_at = None;
         facts.btrfs[0].exclusive_operation = "balance".into();
         facts.btrfs[0].devices[0].missing = true;
-        facts.disks.as_mut().unwrap()[0].smart = Smart::Health { passed: false, warnings: BTreeMap::from([("Reallocated_Sector_Ct".into(), 5)]) };
+        facts.disks.as_mut().unwrap()[0].smart = Smart::Read { passed: Some(false), warnings: BTreeMap::from([("Reallocated_Sector_Ct".into(), 5)]), incomplete: None };
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         let switch = Process { pid: 1236, ppid: 1, user: "root".into(), args: "/run/current-system/bin/switch-to-configuration boot".into() };
@@ -320,15 +321,19 @@ mod tests {
             let cell = smart_cell(facts);
             (cell.spans[0].0, cell.spans[0].1.clone())
         };
+        let disk = |path: &str, smart: Smart| DiskFacts { disk: Disk { path: path.into(), model: None, serial: None }, smart };
         let mut facts = idle_facts();
         assert_eq!(cell(&facts), (Green, "ok".into()));
         let disks = facts.disks.as_mut().unwrap();
-        disks.push(DiskFacts { disk: Disk { path: "/dev/vda".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } });
+        disks.push(disk("/dev/vda", Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some("no".into()) }));
         assert_eq!(cell(&facts), (Plain, "?".into()));
         let disks = facts.disks.as_mut().unwrap();
-        disks[0].smart = Smart::Health { passed: false, warnings: BTreeMap::new() };
-        disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Health { passed: true, warnings: BTreeMap::from([("media_errors".into(), 1)]) } });
-        assert_eq!(cell(&facts), (Red, "sda,sdb".into()));
+        disks[0].smart = Smart::Read { passed: Some(false), warnings: BTreeMap::new(), incomplete: None };
+        disks.push(disk("/dev/sdb", Smart::Read { passed: Some(true), warnings: BTreeMap::from([("media_errors".into(), 1)]), incomplete: None }));
+        disks.push(disk("/dev/sdc", Smart::NoAnswer { no_answer_within_secs: 20 }));
+        assert_eq!(cell(&facts), (Red, "sda,sdb,sdc".into()));
+        facts.disks = Some(vec![]);
+        assert_eq!(cell(&facts), (Plain, "".into()));
         facts.disks = None;
         assert_eq!(cell(&facts), (Plain, "".into()));
     }
@@ -355,7 +360,7 @@ mod tests {
         assert_eq!(report["facts"]["systems"]["default_parts"]["kernel"], "/nix/store/bbb-linux-6.18.55");
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
         assert_eq!(report["blockers"].as_array().unwrap().len(), 11);
-        assert_eq!(report["facts"]["disks"][0]["smart"], json!({"passed": false, "warnings": {"Reallocated_Sector_Ct": 5}}));
+        assert_eq!(report["facts"]["disks"][0]["smart"], json!({"passed": false, "warnings": {"Reallocated_Sector_Ct": 5}, "incomplete": null}));
         assert_eq!(report["facts"]["disks"][0]["serial"], "QM00001");
         assert_eq!(report["facts"]["lasting_jobs"][0]["type"], "start");
         assert_eq!(report["facts"]["root_used_percent"], 98);

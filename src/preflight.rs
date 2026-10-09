@@ -77,16 +77,13 @@ pub struct Facts {
     pub disks: Option<Vec<DiskFacts>>,
 }
 
-/// The whole disks beneath the filesystems in `btrfs`, and what SMART says
-/// about them; `None` if the machine has no smartctl.
-fn disk_facts(session: &mut Session, btrfs: &[BtrfsFacts]) -> Result<Option<Vec<DiskFacts>>> {
+/// The whole disks beneath `filesystems`, and what SMART says about them;
+/// `None` if the machine has no smartctl.
+fn disk_facts(session: &mut Session, filesystems: &[Filesystem]) -> Result<Option<Vec<DiskFacts>>> {
     if !smart::is_available(session)? {
         return Ok(None);
     }
-    let mut paths = Vec::new();
-    for fs in btrfs {
-        paths.extend(btrfs::device_paths(session, &fs.filesystem)?);
-    }
+    let paths = btrfs::device_paths(session, filesystems)?;
     let disks = smart::disks_beneath(session, &paths)?;
     let health = smart::health(session, &disks)?;
     Ok(Some(disks.into_iter().zip(health).map(|(disk, smart)| DiskFacts { disk, smart }).collect()))
@@ -95,17 +92,21 @@ fn disk_facts(session: &mut Session, btrfs: &[BtrfsFacts]) -> Result<Option<Vec<
 /// Collects the facts about the machine at the other end of `session`, after
 /// making sure it calls itself `hostname`, or the first label of `hostname`
 /// if that's a fully qualified name (NixOS host names have no dots).  Takes
-/// [`NETWORK_SAMPLE`] or a bit longer.
+/// [`NETWORK_SAMPLE`] or a bit longer, plus up to [`smart::PATIENCE`] if a
+/// disk is slow to answer smartctl.
 pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     let actual = facts::hostname(session)?;
     let fqdn_of_actual = hostname.strip_prefix(actual.as_str()).is_some_and(|domain| domain.starts_with('.'));
     ensure!(actual == hostname || fqdn_of_actual, "{} calls itself {actual:?}, not {hostname:?}", session.target());
 
-    // The sample comes first, so that the rest is as fresh as can be.
+    // The sample comes first, and then SMART, which can take a while too, so
+    // that the rest is as fresh as can be.
     let jobs_before = facts::jobs(session)?;
     let network_bytes_per_sec = facts::sample_network(session, NETWORK_SAMPLE)?.bytes_per_sec();
     let mut lasting_jobs = facts::jobs(session)?;
     lasting_jobs.retain(|job| jobs_before.iter().any(|before| before.id == job.id));
+    let filesystems = btrfs::filesystems(session)?;
+    let disks = disk_facts(session, &filesystems)?;
 
     let mut busy_processes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for process in processes::list(session)? {
@@ -114,13 +115,12 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         }
     }
     let mut btrfs = Vec::new();
-    for filesystem in btrfs::filesystems(session)? {
+    for filesystem in filesystems {
         let exclusive_operation = btrfs::exclusive_operation(session, &filesystem)?;
         let scrub = btrfs::scrub_status(session, &filesystem.mountpoint)?;
         let devices = btrfs::devices(session, &filesystem)?;
         btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub, devices });
     }
-    let disks = disk_facts(session, &btrfs)?;
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
         booted_at: facts::booted_at(session)?,
@@ -318,7 +318,7 @@ pub(crate) fn idle_facts() -> Facts {
         }],
         disks: Some(vec![DiskFacts {
             disk: Disk { path: "/dev/sda".into(), model: Some("QEMU HARDDISK".into()), serial: Some("QM00001".into()) },
-            smart: Smart::Health { passed: true, warnings: BTreeMap::new() },
+            smart: Smart::Read { passed: Some(true), warnings: BTreeMap::new(), incomplete: None },
         }]),
     }
 }
@@ -360,7 +360,8 @@ mod tests {
         // Without smartctl, or with a disk whose SMART can't be read
         facts.disks = None;
         assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
-        facts.disks = Some(vec![DiskFacts { disk: Disk { path: "/dev/vda".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } }]);
+        let unread = Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some("no".into()) };
+        facts.disks = Some(vec![DiskFacts { disk: Disk { path: "/dev/vda".into(), model: None, serial: None }, smart: unread }]);
         assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
     }
 
@@ -380,9 +381,10 @@ mod tests {
             ],
         });
         let disks = facts.disks.as_mut().unwrap();
-        disks[0].smart = Smart::Health { passed: true, warnings: BTreeMap::from([("Current_Pending_Sector".into(), 2)]) };
-        disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } });
-        disks.push(DiskFacts { disk: Disk { path: "/dev/sdc".into(), model: None, serial: None }, smart: Smart::Health { passed: false, warnings: BTreeMap::new() } });
+        disks[0].smart = Smart::Read { passed: Some(true), warnings: BTreeMap::from([("Current_Pending_Sector".into(), 2)]), incomplete: None };
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some("no".into()) } });
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdc".into(), model: None, serial: None }, smart: Smart::Read { passed: Some(false), warnings: BTreeMap::new(), incomplete: None } });
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdd".into(), model: None, serial: None }, smart: Smart::NoAnswer { no_answer_within_secs: 20 } });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
         let inhibitor = |mode: &str, why: &str| Inhibitor {
             what: "shutdown".into(),
@@ -409,6 +411,7 @@ mod tests {
                 "btrfs on /small: device 2 is missing",
                 "smart on /dev/sda (QEMU HARDDISK, serial QM00001): Current_Pending_Sector=2",
                 "smart on /dev/sdc: overall health FAILED",
+                "smart on /dev/sdd: didn't answer smartctl within 20s",
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",

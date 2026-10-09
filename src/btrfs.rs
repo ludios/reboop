@@ -138,12 +138,19 @@ fn parse_devices(text: &str) -> Result<Vec<Device>> {
         .collect()
 }
 
-/// The block devices (as /dev paths) that `filesystem` is on, from sysfs,
+/// The /dev path of a block device from the name of its sysfs entry, which
+/// spells a "/" in the name as "!" (like cciss!c0d0 for /dev/cciss/c0d0).
+fn device_path(sysfs_name: &str) -> String {
+    format!("/dev/{}", sysfs_name.replace('!', "/"))
+}
+
+/// The block devices (as /dev paths) that `filesystems` are on, from sysfs,
 /// which leaves out a missing device.
-pub fn device_paths(session: &mut Session, filesystem: &Filesystem) -> Result<Vec<String>> {
-    let dir = format!("/sys/fs/btrfs/{}/devices", filesystem.uuid);
-    let listing = session.run_ok(&format!("ls -1 {}", shell_quote(&dir)), QUICK)?;
-    Ok(listing.lines().map(|name| format!("/dev/{name}")).collect())
+pub fn device_paths(session: &mut Session, filesystems: &[Filesystem]) -> Result<Vec<String>> {
+    let dirs: Vec<String> = filesystems.iter().map(|fs| shell_quote(&format!("/sys/fs/btrfs/{}/devices", fs.uuid))).collect();
+    let script = format!("set -e\nfor d in {}; do ls -1 \"$d\"; done", dirs.join(" "));
+    let listing = session.run_ok(&script, QUICK)?;
+    Ok(listing.lines().map(device_path).collect())
 }
 
 /// The devices of `filesystem`, from sysfs.
@@ -473,6 +480,12 @@ mod tests {
         assert!(parse_devices(&format!("1 missing 0\n{}", counters(1, 0).replace("1 read_errs 0\n", ""))).is_err());
         assert!(parse_devices(&format!("1 missing 2\n{}", counters(1, 0))).is_err());
         assert!(parse_devices(&counters(1, 0)).is_err());
+    }
+
+    #[test]
+    fn decodes_sysfs_names() {
+        assert_eq!(device_path("dm-0"), "/dev/dm-0");
+        assert_eq!(device_path("cciss!c0d0p1"), "/dev/cciss/c0d0p1");
     }
 
     #[test]

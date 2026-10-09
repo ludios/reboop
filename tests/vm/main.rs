@@ -373,7 +373,7 @@ fn smart_is_read_from_disks(vm: &Vm) -> Result<()> {
     let virtio: Vec<String> = (0..vm.manifest.disk_images.len()).map(|i| format!("/dev/vd{}", char::from(b'a' + i as u8))).collect();
     assert_eq!(disks.iter().map(|disk| disk.disk.path.clone()).collect::<Vec<_>>(), virtio);
     for disk in &disks {
-        assert!(matches!(&disk.smart, Smart::Unreadable { unreadable } if unreadable.contains("Unable to detect device type")), "{disk:?}");
+        assert!(matches!(&disk.smart, Smart::Read { passed: None, incomplete: Some(why), .. } if why.contains("Unable to detect device type")), "{disk:?}");
     }
 
     // btrfs on the scratch SATA and NVMe disks (see the harness), which
@@ -389,7 +389,7 @@ fn smart_is_read_from_disks(vm: &Vm) -> Result<()> {
     assert_eq!(disks.len(), virtio.len() + 2, "{disks:#?}");
     for path in &scratch {
         let disk = disks.iter().find(|disk| disk.disk.path == *path).unwrap();
-        assert_eq!(disk.smart, Smart::Health { passed: true, warnings: BTreeMap::new() }, "{disk:?}");
+        assert_eq!(disk.smart, Smart::Read { passed: Some(true), warnings: BTreeMap::new(), incomplete: None }, "{disk:?}");
         assert!(disk.disk.model.as_deref().is_some_and(|model| model.starts_with("QEMU")), "{disk:?}");
         assert!(disk.disk.serial.as_deref().is_some_and(|serial| serial.starts_with("reboop-test-")), "{disk:?}");
     }
