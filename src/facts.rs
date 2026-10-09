@@ -98,19 +98,23 @@ fn parse_kernel_built_at(version: &str) -> Option<Timestamp> {
 pub struct BootParts {
     pub kernel: String,
     pub kernel_modules: String,
-    pub initrd: String,
+    /// None if the configuration has no initrd (boot.initrd.enable off).
+    pub initrd: Option<String>,
     pub systemd: String,
 }
 
 /// The parts of `system` (a toplevel store path) that only a reboot puts
-/// into use: what its kernel, kernel-modules, initrd and systemd links lead
-/// to.
+/// into use: what its kernel, kernel-modules, systemd and initrd links lead
+/// to.  A configuration with boot.initrd.enable off has no initrd link.
 fn boot_parts(session: &mut Session, system: &str) -> Result<BootParts> {
     let quoted = shell_quote(system);
-    let script = format!("readlink -- {quoted}/kernel {quoted}/kernel-modules {quoted}/initrd {quoted}/systemd");
-    let entries: Vec<String> = session.run_ok(&script, QUICK)?.lines().map(store_entry).collect::<Result<_>>()?;
-    let [kernel, kernel_modules, initrd, systemd] =
-        <[String; 4]>::try_from(entries).map_err(|entries| anyhow!("expected 4 links in {system}, found {entries:?}"))?;
+    let script = format!(
+        "readlink -v -- {quoted}/kernel {quoted}/kernel-modules {quoted}/systemd && if test -L {quoted}/initrd; then readlink -v -- {quoted}/initrd; fi"
+    );
+    let mut entries: Vec<String> = session.run_ok(&script, QUICK)?.lines().map(store_entry).collect::<Result<_>>()?;
+    let initrd = if entries.len() == 4 { entries.pop() } else { None };
+    let [kernel, kernel_modules, systemd] =
+        <[String; 3]>::try_from(entries).map_err(|entries| anyhow!("expected 3 or 4 links in {system}, found {entries:?}"))?;
     Ok(BootParts { kernel, kernel_modules, initrd, systemd })
 }
 
@@ -131,37 +135,34 @@ pub struct Systems {
     pub default: String,
     /// The release of the default configuration's kernel.
     pub default_kernel: String,
-    /// The booted configuration's parts that only a reboot puts into use.
-    pub booted_parts: BootParts,
-    /// The default configuration's.
+    /// The parts in use: the booted configuration's kernel, kernel modules
+    /// and initrd, and the systemd that PID 1 runs, which switching
+    /// configurations re-executes.
+    pub running_parts: BootParts,
+    /// The default configuration's parts.
     pub default_parts: BootParts,
 }
 
 impl Systems {
     /// Why the machine needs a reboot, if it does: "new system" if the
     /// default configuration isn't the current one (after `nixos-rebuild
-    /// boot`); then, for each of the booted configuration's parts that the
-    /// default's differs from, "new X" if the default's has another name
-    /// (so, usually, another version), or "rebuilt X" if only its hash
+    /// boot`); then, for each of the parts in use that the default
+    /// configuration's differs from, "new X" if the default's has another
+    /// name (so, usually, another version), or "rebuilt X" if only its hash
     /// differs.  A kernel's modules and initrd come with it, so they're
     /// only named when the kernel is the same, and the initrd only when the
     /// modules are too.
     pub fn reboot_reasons(&self) -> Vec<String> {
-        let (booted, default) = (&self.booted_parts, &self.default_parts);
-        let differs = |part: &str, booted: &str, default: &str| {
-            if booted == default {
-                None
-            } else if store_name(booted) == store_name(default) {
-                Some(format!("rebuilt {part}"))
-            } else {
-                Some(format!("new {part}"))
-            }
+        let differs = |part: &str, of: fn(&BootParts) -> Option<&str>| match (of(&self.running_parts), of(&self.default_parts)) {
+            (running, default) if running == default => None,
+            (Some(running), Some(default)) if store_name(running) == store_name(default) => Some(format!("rebuilt {part}")),
+            _ => Some(format!("new {part}")),
         };
         let system = (self.current != self.default).then(|| "new system".to_string());
-        let kernel = differs("kernel", &booted.kernel, &default.kernel)
-            .or_else(|| differs("kernel modules", &booted.kernel_modules, &default.kernel_modules))
-            .or_else(|| differs("initrd", &booted.initrd, &default.initrd));
-        let systemd = differs("systemd", &booted.systemd, &default.systemd);
+        let kernel = differs("kernel", |parts| Some(parts.kernel.as_str()))
+            .or_else(|| differs("kernel modules", |parts| Some(parts.kernel_modules.as_str())))
+            .or_else(|| differs("initrd", |parts| parts.initrd.as_deref()));
+        let systemd = differs("systemd", |parts| Some(parts.systemd.as_str()));
         [system, kernel, systemd].into_iter().flatten().collect()
     }
 }
@@ -176,8 +177,10 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
     let default_kernel = kernel_release(session, &default)?;
     let booted_parts = boot_parts(session, &booted)?;
-    let default_parts = boot_parts(session, &default)?;
-    Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel, booted_parts, default_parts })
+    let default_parts = if default == booted { booted_parts.clone() } else { boot_parts(session, &default)? };
+    let systemd = store_entry(&session.run_ok("readlink -v /proc/1/exe", QUICK)?)?;
+    let running_parts = BootParts { systemd, ..booted_parts };
+    Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel, running_parts, default_parts })
 }
 
 /// Seconds since boot and each interface's (received, sent) byte counters.
@@ -489,6 +492,7 @@ mod tests {
         assert!(store_path("/run/current-system").is_err());
         assert!(store_path("/nix/store/abc-foo").is_err());
         assert_eq!(store_entry(&format!("{foo}/bin/sh\n")).unwrap(), foo);
+        assert_eq!(store_entry(&format!("{foo}/lib/systemd/systemd (deleted)")).unwrap(), foo);
         assert!(store_entry(&format!("/nix/store/{}-", "a".repeat(32))).is_err());
         assert!(store_entry(&format!("/nix/store/{}foo", "a".repeat(32))).is_err());
         assert!(store_entry("/nix/store/").is_err());
@@ -501,13 +505,13 @@ mod tests {
         let parts = |hash: &str, kernel: &str, systemd: &str| BootParts {
             kernel: format!("/nix/store/{hash}-linux-{kernel}"),
             kernel_modules: format!("/nix/store/{hash}-linux-{kernel}-modules"),
-            initrd: format!("/nix/store/{hash}-initrd-linux-{kernel}"),
+            initrd: Some(format!("/nix/store/{hash}-initrd-linux-{kernel}")),
             systemd: format!("/nix/store/{hash}-systemd-{systemd}"),
         };
-        let same = Systems { booted_parts: parts("aaa", "6.18.54", "260.5"), default_parts: parts("aaa", "6.18.54", "260.5"), ..idle_facts().systems };
+        let same = Systems { running_parts: parts("aaa", "6.18.54", "260.5"), default_parts: parts("aaa", "6.18.54", "260.5"), ..idle_facts().systems };
         assert_eq!(same.reboot_reasons(), Vec::<String>::new());
         // After `nixos-rebuild boot` to a configuration with a newer kernel
-        let newer = BootParts { systemd: same.booted_parts.systemd.clone(), ..parts("bbb", "6.18.55", "260.5") };
+        let newer = BootParts { systemd: same.running_parts.systemd.clone(), ..parts("bbb", "6.18.55", "260.5") };
         let booted = Systems { default: "/nix/store/bbb-nixos-system-one-26.05".into(), default_parts: newer, ..same.clone() };
         assert_eq!(booted.reboot_reasons(), ["new system", "new kernel"]);
         // After `nixos-rebuild switch` to a rebuilt kernel and a newer systemd
@@ -515,11 +519,13 @@ mod tests {
         assert_eq!(switched.reboot_reasons(), ["rebuilt kernel", "new systemd"]);
         // Extra modules, which the initrd picks up; a changed initrd; a rebuilt systemd
         let rebuilt = parts("bbb", "6.18.54", "260.5");
-        let modules = Systems { default_parts: BootParts { kernel_modules: rebuilt.kernel_modules.clone(), initrd: rebuilt.initrd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        let modules = Systems { default_parts: BootParts { kernel_modules: rebuilt.kernel_modules.clone(), initrd: rebuilt.initrd.clone(), ..same.running_parts.clone() }, ..same.clone() };
         assert_eq!(modules.reboot_reasons(), ["rebuilt kernel modules"]);
-        let initrd = Systems { default_parts: BootParts { initrd: rebuilt.initrd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        let initrd = Systems { default_parts: BootParts { initrd: rebuilt.initrd.clone(), ..same.running_parts.clone() }, ..same.clone() };
         assert_eq!(initrd.reboot_reasons(), ["rebuilt initrd"]);
-        let systemd = Systems { default_parts: BootParts { systemd: rebuilt.systemd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        let no_initrd = Systems { default_parts: BootParts { initrd: None, ..same.running_parts.clone() }, ..same.clone() };
+        assert_eq!(no_initrd.reboot_reasons(), ["new initrd"]);
+        let systemd = Systems { default_parts: BootParts { systemd: rebuilt.systemd.clone(), ..same.running_parts.clone() }, ..same.clone() };
         assert_eq!(systemd.reboot_reasons(), ["rebuilt systemd"]);
     }
 

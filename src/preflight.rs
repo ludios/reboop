@@ -250,7 +250,7 @@ pub(crate) fn idle_facts() -> Facts {
     let parts = facts::BootParts {
         kernel: "/nix/store/aaa-linux-6.18.54".into(),
         kernel_modules: "/nix/store/aaa-linux-6.18.54-modules".into(),
-        initrd: "/nix/store/aaa-initrd-linux-6.18.54".into(),
+        initrd: Some("/nix/store/aaa-initrd-linux-6.18.54".into()),
         systemd: "/nix/store/aaa-systemd-260.5".into(),
     };
     Facts {
@@ -263,7 +263,7 @@ pub(crate) fn idle_facts() -> Facts {
             running_kernel_built_at: Some("2026-09-25T14:35:54Z".parse().unwrap()),
             default: system,
             default_kernel: "6.18.54".into(),
-            booted_parts: parts.clone(),
+            running_parts: parts.clone(),
             default_parts: parts,
         },
         boot: vec![boot],

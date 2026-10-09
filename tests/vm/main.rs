@@ -142,7 +142,14 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     // The kernel release we'd expect after booting the current system is
     // the one that's running.
     assert_eq!(facts::kernel_release(&mut session, &systems.current)?, systems.running_kernel);
-    // Nothing needs a reboot while the system profile is what booted.
+    // The parts a reboot would replace are the running kernel's packages,
+    // its initrd, and systemd; nothing needs a reboot while the system
+    // profile is what booted.
+    let (parts, release) = (&systems.running_parts, &systems.running_kernel);
+    assert!(parts.kernel.ends_with(&format!("-linux-{release}")), "{parts:?}");
+    assert!(parts.kernel_modules.ends_with(&format!("-linux-{release}-modules")), "{parts:?}");
+    assert!(parts.initrd.as_ref().is_some_and(|initrd| initrd.ends_with(&format!("-initrd-linux-{release}"))), "{parts:?}");
+    assert!(parts.systemd.contains("-systemd-"), "{parts:?}");
     if systems.booted == systems.default {
         assert_eq!(systems.reboot_reasons(), Vec::<String>::new(), "{systems:?}");
     }

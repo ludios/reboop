@@ -7,7 +7,7 @@
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::Inhibitor;
-use crate::human::{self, Align::{Center, Left, Right}, Cell, Style::{Bold, Green, Plain, Red}};
+use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red}};
 use crate::preflight::{self, Facts};
 use crate::processes::Activity;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
@@ -74,11 +74,12 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         row.resize(HEADER.len(), Plain.cell(""));
         return row;
     };
-    let list = |items: Vec<&str>| if items.is_empty() { Plain.cell("") } else { Red.cell(items.join(",")) };
+    let list = |style: Style, items: Vec<&str>| if items.is_empty() { Plain.cell("") } else { style.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
     let count = |activity| facts.busy_processes.get(&activity).map_or(Plain.cell(""), |processes| Red.cell(processes.len().to_string())).aligned(Right);
     let number = |over_limit: bool, text: String| (if over_limit { Red } else { Green }).cell(text).aligned(Right);
     let systems = &facts.systems;
+    let reboot_reasons = systems.reboot_reasons();
     let kernel = if systems.default_kernel == systems.running_kernel {
         systems.running_kernel.clone()
     } else {
@@ -87,15 +88,15 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
     vec![
         Plain.cell(machine.hostname.clone()),
         if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
-        list(scrubbing.collect()),
+        list(Red, scrubbing.collect()),
         count(Activity::Nix),
         count(Activity::Tmux),
         count(Activity::Rsync),
         number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
-        list(other_reasons(facts).iter().map(String::as_str).collect()),
-        Plain.cell(systems.reboot_reasons().join(", ")),
+        list(Red, other_reasons(facts).iter().map(String::as_str).collect()),
+        list(Plain, reboot_reasons.iter().map(String::as_str).collect()),
         Plain.cell(kernel),
         systems.running_kernel_built_at.map_or(Plain.cell("?"), |time| human::minute(time, zone)),
         human::minute(facts.booted_at, zone),
@@ -255,9 +256,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false, &TimeZone::UTC),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 REBOOT                       KERNEL             BUILT        BOOTED\n\
-             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  new kernel, rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
-             two      yes                              1.00 kB/s   0.50   45%                                                                                                    6.18.54            09-25T14:35  09-30T08:27\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 REBOOT                      KERNEL             BUILT        BOOTED\n\
+             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                              1.00 kB/s   0.50   45%                                                                                                   6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
