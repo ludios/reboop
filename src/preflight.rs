@@ -9,6 +9,7 @@ use crate::config::Machine;
 use crate::facts::{self, Inhibitor, Job, Systems};
 use crate::human;
 use crate::processes::{self, Activity, Process};
+use crate::smart::{self, Disk, Smart};
 use crate::ssh::Session;
 use anyhow::{Result, ensure};
 use jiff::Timestamp;
@@ -34,6 +35,14 @@ pub struct BtrfsFacts {
     pub exclusive_operation: String,
     pub scrub: ScrubStatus,
     pub devices: Vec<Device>,
+}
+
+/// A disk beneath a btrfs filesystem, and what SMART says about it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DiskFacts {
+    #[serde(flatten)]
+    pub disk: Disk,
+    pub smart: Smart,
 }
 
 /// What a machine is doing that a reboot would interrupt, and what a reboot
@@ -63,6 +72,24 @@ pub struct Facts {
     pub lasting_jobs: Vec<Job>,
     /// Every mounted btrfs filesystem, not just those to scrub.
     pub btrfs: Vec<BtrfsFacts>,
+    /// The whole disks beneath the btrfs filesystems and what SMART says
+    /// about them, or `None` if the machine has no smartctl.
+    pub disks: Option<Vec<DiskFacts>>,
+}
+
+/// The whole disks beneath the filesystems in `btrfs`, and what SMART says
+/// about them; `None` if the machine has no smartctl.
+fn disk_facts(session: &mut Session, btrfs: &[BtrfsFacts]) -> Result<Option<Vec<DiskFacts>>> {
+    if !smart::is_available(session)? {
+        return Ok(None);
+    }
+    let mut paths = Vec::new();
+    for fs in btrfs {
+        paths.extend(btrfs::device_paths(session, &fs.filesystem)?);
+    }
+    let disks = smart::disks_beneath(session, &paths)?;
+    let health = smart::health(session, &disks)?;
+    Ok(Some(disks.into_iter().zip(health).map(|(disk, smart)| DiskFacts { disk, smart }).collect()))
 }
 
 /// Collects the facts about the machine at the other end of `session`, after
@@ -93,6 +120,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         let devices = btrfs::devices(session, &filesystem)?;
         btrfs.push(BtrfsFacts { filesystem, exclusive_operation, scrub, devices });
     }
+    let disks = disk_facts(session, &btrfs)?;
     Ok(Facts {
         boot_id: facts::boot_id(session)?,
         booted_at: facts::booted_at(session)?,
@@ -106,6 +134,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         inhibitors: facts::inhibitors(session)?,
         lasting_jobs,
         btrfs,
+        disks,
     })
 }
 
@@ -178,10 +207,17 @@ pub fn blockers_ignoring_load_and_network(machine: &Machine, facts: &Facts) -> V
                 blockers.push(format!("btrfs on {mountpoint}: device {} is missing", device.devid));
             }
             if let Some(errors) = device.errors.as_ref().filter(|errors| !errors.is_empty()) {
-                let errors = btrfs::format_counters(errors);
+                let errors = human::counters(errors);
                 let reset = format!("once dealt with, `btrfs device stats -z {mountpoint}` resets them");
                 blockers.push(format!("btrfs on {mountpoint}: device {} has had errors: {errors} ({reset})", device.devid));
             }
+        }
+    }
+    // A disk that SMART says is failing often doesn't come back from a
+    // power cycle.
+    for disk in facts.disks.iter().flatten() {
+        if let Some(trouble) = disk.smart.trouble() {
+            blockers.push(format!("smart on {}: {trouble}", disk.disk));
         }
     }
     for (activity, processes) in &facts.busy_processes {
@@ -280,6 +316,10 @@ pub(crate) fn idle_facts() -> Facts {
             scrub,
             devices: vec![Device { devid: 1, missing: false, errors: Some(BTreeMap::new()) }],
         }],
+        disks: Some(vec![DiskFacts {
+            disk: Disk { path: "/dev/sda".into(), model: Some("QEMU HARDDISK".into()), serial: Some("QM00001".into()) },
+            smart: Smart::Health { passed: true, warnings: BTreeMap::new() },
+        }]),
     }
 }
 
@@ -317,6 +357,11 @@ mod tests {
         facts.network_bytes_per_sec = 1_000_000.0;
         facts.root_used_percent = 96;
         assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
+        // Without smartctl, or with a disk whose SMART can't be read
+        facts.disks = None;
+        assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
+        facts.disks = Some(vec![DiskFacts { disk: Disk { path: "/dev/vda".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } }]);
+        assert_eq!(blockers(&test_machine(), &facts), Vec::<String>::new());
     }
 
     #[test]
@@ -334,6 +379,10 @@ mod tests {
                 Device { devid: 2, missing: true, errors: Some(BTreeMap::new()) },
             ],
         });
+        let disks = facts.disks.as_mut().unwrap();
+        disks[0].smart = Smart::Health { passed: true, warnings: BTreeMap::from([("Current_Pending_Sector".into(), 2)]) };
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } });
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdc".into(), model: None, serial: None }, smart: Smart::Health { passed: false, warnings: BTreeMap::new() } });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
         let inhibitor = |mode: &str, why: &str| Inhibitor {
             what: "shutdown".into(),
@@ -358,6 +407,8 @@ mod tests {
                 "btrfs on /small: balance paused",
                 "btrfs on /small: device 1 has had errors: corruption_errs=3 read_errs=1 (once dealt with, `btrfs device stats -z /small` resets them)",
                 "btrfs on /small: device 2 is missing",
+                "smart on /dev/sda (QEMU HARDDISK, serial QM00001): Current_Pending_Sector=2",
+                "smart on /dev/sdc: overall health FAILED",
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",

@@ -63,6 +63,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - Is an rsync process running?
     - Is a btrfs send or receive running, or cryptsetup?
     - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?
+    - If the machine has smartctl: what SMART says about each whole disk beneath the btrfs filesystems' devices (`lsblk --inverse` from sysfs' devices/*, then `smartctl -H -A` on all the disks at once, each with a timeout): its overall health, and the counts of sectors gone bad (ATA attributes 5, 187, 197 and 198; for NVMe, the critical warning and media errors)
     - Inhibitor locks (logind's ListInhibitors)
     - systemd jobs that last through the network sample
     - How full the root filesystem is (df)
@@ -84,6 +85,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - If any rsync process running, no.
     - If a btrfs send or receive, or cryptsetup, is running, no.
     - If a btrfs device is missing (the filesystem wouldn't mount at boot without the degraded option) or has had errors, no.
+    - If a disk's SMART self-assessment failed, or any of those counts is above zero, no. (A disk whose SMART smartctl can't read, like a virtual one, doesn't count, but `reboop check` marks it.)
     - If an inhibitor lock asks for no shutdown (mode block or block-weak), no.
     - If a systemd job has lasted 5 seconds, no.
     - If the root filesystem is root_full_percent (97%) used or more, no.

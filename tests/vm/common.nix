@@ -1,4 +1,5 @@
 # Model-output: Claude Opus 5.5
+# Model-output: Claude Fable 5.1
 #
 # What the NixOS machines that reboop's VM tests run against have in common
 # (see systemd-boot.nix and grub.nix for the machines themselves).  They
@@ -66,6 +67,7 @@
   environment.systemPackages = with pkgs; [
     tmux
     rsync
+    smartmontools
   ];
 
   services.timesyncd.enable = false;

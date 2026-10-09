@@ -8,8 +8,9 @@ use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::Inhibitor;
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red}};
-use crate::preflight::{self, Facts};
+use crate::preflight::{self, DiskFacts, Facts};
 use crate::processes::Activity;
+use crate::smart::Smart;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
 use anyhow::{Result, ensure};
 use jiff::tz::TimeZone;
@@ -31,7 +32,7 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 /// The activities that have columns of their own.
 const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Rsync];
 
-const HEADER: [&str; 14] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
+const HEADER: [&str; 15] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "SMART", "OTHER", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
@@ -62,6 +63,22 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
         reasons.push("jobs".to_string());
     }
     reasons
+}
+
+/// The SMART cell: the disks in trouble (without /dev/), "ok" if none is
+/// and every disk's SMART could be read, "?" if some disk's couldn't, or
+/// nothing if the machine has no smartctl.
+fn smart_cell(facts: &Facts) -> Cell {
+    let Some(disks) = &facts.disks else { return Plain.cell("") };
+    let name = |disk: &DiskFacts| disk.disk.path.strip_prefix("/dev/").unwrap_or(&disk.disk.path).to_string();
+    let troubled: Vec<String> = disks.iter().filter(|disk| disk.smart.trouble().is_some()).map(name).collect();
+    if !troubled.is_empty() {
+        Red.cell(troubled.join(","))
+    } else if disks.iter().any(|disk| matches!(disk.smart, Smart::Unreadable { .. })) {
+        Plain.cell("?")
+    } else {
+        Green.cell("ok")
+    }
 }
 
 /// The table row about `machine`: the facts that decide whether to reboot
@@ -95,6 +112,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
+        smart_cell(facts),
         list(Red, other_reasons(facts).iter().map(String::as_str).collect()),
         list(Plain, reboot_reasons.iter().map(String::as_str).collect()),
         Plain.cell(kernel),
@@ -209,8 +227,10 @@ mod tests {
     use crate::facts::Job;
     use crate::preflight::{idle_facts, test_machine};
     use crate::processes::Process;
+    use crate::smart::Disk;
     use anyhow::anyhow;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     /// The outcome of checking [`test_machine`] while it has something wrong
     /// for each column and each of the other reasons.
@@ -222,6 +242,7 @@ mod tests {
         facts.systems.running_kernel_built_at = None;
         facts.btrfs[0].exclusive_operation = "balance".into();
         facts.btrfs[0].devices[0].missing = true;
+        facts.disks.as_mut().unwrap()[0].smart = Smart::Health { passed: false, warnings: BTreeMap::from([("Reallocated_Sector_Ct".into(), 5)]) };
         let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
         facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
         let switch = Process { pid: 1236, ppid: 1, user: "root".into(), args: "/run/current-system/bin/switch-to-configuration boot".into() };
@@ -256,13 +277,14 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false, &TimeZone::UTC),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 REBOOT                      KERNEL             BUILT        BOOTED\n\
-             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
-             two      yes                              1.00 kB/s   0.50   45%                                                                                                   6.18.54            09-25T14:35  09-30T08:27\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT  SMART                                 OTHER                                 REBOOT                      KERNEL             BUILT        BOOTED\n\
+             one      no                    1         12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                              1.00 kB/s   0.50   45%  ok                                                                                                      6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
+             one: smart on /dev/sda (QEMU HARDDISK, serial QM00001): overall health FAILED, Reallocated_Sector_Ct=5\n\
              one: switch-to-configuration: pid 1236 (root): /run/current-system/bin/switch-to-configuration boot\n\
              one: tmux: pid 1234 (at): tmux new -s work\n\
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
@@ -275,8 +297,8 @@ mod tests {
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain, Plain, Plain, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
@@ -290,6 +312,25 @@ mod tests {
         assert_eq!(other_reasons(&facts), Vec::<String>::new());
         facts.boot[0].missing_files.push("/boot/EFI/nixos/initrd.efi".into());
         assert_eq!(other_reasons(&facts), ["boot"]);
+    }
+
+    #[test]
+    fn shows_smart_in_one_cell() {
+        let cell = |facts: &Facts| {
+            let cell = smart_cell(facts);
+            (cell.spans[0].0, cell.spans[0].1.clone())
+        };
+        let mut facts = idle_facts();
+        assert_eq!(cell(&facts), (Green, "ok".into()));
+        let disks = facts.disks.as_mut().unwrap();
+        disks.push(DiskFacts { disk: Disk { path: "/dev/vda".into(), model: None, serial: None }, smart: Smart::Unreadable { unreadable: "no".into() } });
+        assert_eq!(cell(&facts), (Plain, "?".into()));
+        let disks = facts.disks.as_mut().unwrap();
+        disks[0].smart = Smart::Health { passed: false, warnings: BTreeMap::new() };
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Health { passed: true, warnings: BTreeMap::from([("media_errors".into(), 1)]) } });
+        assert_eq!(cell(&facts), (Red, "sda,sdb".into()));
+        facts.disks = None;
+        assert_eq!(cell(&facts), (Plain, "".into()));
     }
 
     #[test]
@@ -313,7 +354,9 @@ mod tests {
         assert_eq!(report["reboot_reasons"], json!(["new kernel", "rebuilt systemd"]));
         assert_eq!(report["facts"]["systems"]["default_parts"]["kernel"], "/nix/store/bbb-linux-6.18.55");
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
-        assert_eq!(report["blockers"].as_array().unwrap().len(), 10);
+        assert_eq!(report["blockers"].as_array().unwrap().len(), 11);
+        assert_eq!(report["facts"]["disks"][0]["smart"], json!({"passed": false, "warnings": {"Reallocated_Sector_Ct": 5}}));
+        assert_eq!(report["facts"]["disks"][0]["serial"], "QM00001");
         assert_eq!(report["facts"]["lasting_jobs"][0]["type"], "start");
         assert_eq!(report["facts"]["root_used_percent"], 98);
         assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);

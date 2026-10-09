@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! btrfs filesystems on a remote machine: operations a reboot would
 //! interrupt, and scrubs.
@@ -75,12 +76,6 @@ fn nonzero_counters(names: &[&str], counter: impl Fn(&str) -> Result<u64>) -> Re
     Ok(nonzero)
 }
 
-/// Counters for people, e.g. "csum_errors=3 read_errs=1".
-pub fn format_counters(counters: &BTreeMap<String, u64>) -> String {
-    let counts: Vec<_> = counters.iter().map(|(name, count)| format!("{name}={count}")).collect();
-    counts.join(" ")
-}
-
 /// A device of a mounted btrfs filesystem, and its troubles.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Device {
@@ -141,6 +136,14 @@ fn parse_devices(text: &str) -> Result<Vec<Device>> {
             Ok(Device { devid, missing, errors })
         })
         .collect()
+}
+
+/// The block devices (as /dev paths) that `filesystem` is on, from sysfs,
+/// which leaves out a missing device.
+pub fn device_paths(session: &mut Session, filesystem: &Filesystem) -> Result<Vec<String>> {
+    let dir = format!("/sys/fs/btrfs/{}/devices", filesystem.uuid);
+    let listing = session.run_ok(&format!("ls -1 {}", shell_quote(&dir)), QUICK)?;
+    Ok(listing.lines().map(|name| format!("/dev/{name}")).collect())
 }
 
 /// The devices of `filesystem`, from sysfs.
@@ -353,7 +356,7 @@ impl ScrubStatus {
         let errors = if self.errors.is_empty() {
             "no errors found".to_string()
         } else {
-            format!("ERRORS FOUND: {}", format_counters(&self.errors))
+            format!("ERRORS FOUND: {}", human::counters(&self.errors))
         };
         match self.state {
             ScrubState::NeverRan => "no scrub has run".to_string(),

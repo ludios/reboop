@@ -93,6 +93,9 @@ fn build(dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
 }
 
+/// The size of each scratch disk (see [`start_qemu`]): room for a btrfs.
+const SCRATCH_DISK_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Two free TCP ports on 127.0.0.1, bound at once so that they differ, then
 /// freed for qemu.
 fn free_ports() -> Result<[u16; 2]> {
@@ -119,10 +122,24 @@ fn start_qemu(dir: &Path, bundle: &Path, manifest: &Manifest, [ssh_port, initrd_
             .args(["-drive", &arg("if=pflash,format=raw,unit=0,readonly=on,file=", &ovmf.code)])
             .args(["-drive", &arg("if=pflash,format=raw,unit=1,file=", &vars)]);
     }
-    for disk in &manifest.disk_images {
+    for (i, disk) in manifest.disk_images.iter().enumerate() {
         // snapshot=on: writes go to a temporary file that's gone when qemu
-        // exits, so each VM starts from the pristine image.
-        command.args(["-drive", &arg("if=virtio,format=qcow2,cache=unsafe,snapshot=on,file=", disk)]);
+        // exits, so each VM starts from the pristine image.  The bootindex
+        // keeps these ahead of the scratch disks below in the firmware's
+        // order, so that GRUB's disk is still the first hard disk.
+        command
+            .args(["-drive", &arg(&format!("if=none,id=disk{i},format=qcow2,cache=unsafe,snapshot=on,file="), disk)])
+            .args(["-device", &format!("virtio-blk-pci,drive=disk{i},bootindex={i}")]);
+    }
+    // A blank SATA disk and a blank NVMe disk for the SMART test, as qemu
+    // gives those SMART data but not virtio disks.  Tests find them by their
+    // serial numbers, and clean_up wipes them.
+    for (kind, device) in [("sata", "ide-hd,bus=ide.0"), ("nvme", "nvme")] {
+        let image = dir.join(format!("scratch-{kind}.img"));
+        File::create(&image)?.set_len(SCRATCH_DISK_SIZE)?;
+        command
+            .args(["-drive", &arg(&format!("if=none,id=scratch-{kind},format=raw,cache=unsafe,snapshot=on,file="), &image)])
+            .args(["-device", &format!("{device},drive=scratch-{kind},serial=reboop-test-{kind}")]);
     }
 
     let pidfile = dir.join("qemu.pid");
@@ -315,6 +332,10 @@ for m in /mnt/reboop-test-*; do
     btrfs balance cancel "$m" >/dev/null 2>&1
     if mountpoint -q "$m"; then umount "$m" || exit 1; fi
     rmdir "$m"
+done
+# The scratch disks (see start_qemu), which the SMART test puts btrfs on
+for d in $(lsblk --nodeps --noheadings --raw --output PATH,SERIAL | awk '$2 ~ /^reboop-test-/ { print $1 }'); do
+    wipefs --all --quiet "$d" || exit 1
 done
 # What the boot loader tests change
 bootctl set-oneshot '' >/dev/null 2>&1

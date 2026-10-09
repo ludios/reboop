@@ -11,7 +11,7 @@
 
 mod harness;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use harness::{Name, Vm, clean_up};
 use jiff::Timestamp;
 use libtest_mimic::{Arguments, Failed, Trial};
@@ -25,6 +25,7 @@ use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
 use reboop::processes::{self, Activity};
 use reboop::reboot::{self, Down, Stopped};
+use reboop::smart::Smart;
 use reboop::ssh::{Session, shell_quote, wait_for_session};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -355,6 +356,44 @@ fn btrfs_missing_device_is_detected(vm: &Vm) -> Result<()> {
     let machine = vm_machine(vm);
     let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
     assert_eq!(blockers, ["btrfs on /mnt/reboop-test-raid: device 2 is missing"]);
+    Ok(())
+}
+
+fn smart_is_read_from_disks(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let machine = vm_machine(vm);
+    // The disks beneath the btrfs filesystems, none of which may block
+    let gather_disks = |session: &mut Session| -> Result<Vec<preflight::DiskFacts>> {
+        let facts = preflight::gather(session, &machine.hostname)?;
+        assert_eq!(preflight::blockers(&machine, &facts), Vec::<String>::new(), "{facts:#?}");
+        facts.disks.ok_or_else(|| anyhow!("the VM has no smartctl"))
+    };
+    // The VM's own disks are virtio, which has no SMART.
+    let disks = gather_disks(&mut session)?;
+    let virtio: Vec<String> = (0..vm.manifest.disk_images.len()).map(|i| format!("/dev/vd{}", char::from(b'a' + i as u8))).collect();
+    assert_eq!(disks.iter().map(|disk| disk.disk.path.clone()).collect::<Vec<_>>(), virtio);
+    for disk in &disks {
+        assert!(matches!(&disk.smart, Smart::Unreadable { unreadable } if unreadable.contains("Unable to detect device type")), "{disk:?}");
+    }
+
+    // btrfs on the scratch SATA and NVMe disks (see the harness), which
+    // qemu gives SMART data
+    let listing = sh(&mut session, "lsblk --nodeps --noheadings --raw --output PATH,SERIAL")?;
+    let scratch: Vec<&str> = listing.lines().filter_map(|line| line.split_once(' ')).filter(|(_, serial)| serial.starts_with("reboop-test-")).map(|(path, _)| path).collect();
+    ensure!(scratch.len() == 2, "expected two scratch disks:\n{listing}");
+    for path in &scratch {
+        let name = path.strip_prefix("/dev/").unwrap();
+        sh(&mut session, &format!("set -e; mkfs.btrfs -q {path}; mkdir -p /mnt/reboop-test-{name}; mount {path} /mnt/reboop-test-{name}"))?;
+    }
+    let disks = gather_disks(&mut session)?;
+    assert_eq!(disks.len(), virtio.len() + 2, "{disks:#?}");
+    for path in &scratch {
+        let disk = disks.iter().find(|disk| disk.disk.path == *path).unwrap();
+        assert_eq!(disk.smart, Smart::Health { passed: true, warnings: BTreeMap::new() }, "{disk:?}");
+        assert!(disk.disk.model.as_deref().is_some_and(|model| model.starts_with("QEMU")), "{disk:?}");
+        assert!(disk.disk.serial.as_deref().is_some_and(|serial| serial.starts_with("reboop-test-")), "{disk:?}");
+    }
+    clean_up(&mut session)?;
     Ok(())
 }
 
@@ -780,6 +819,7 @@ fn main() {
         ("btrfs_root_is_idle", btrfs_root_is_idle),
         ("btrfs_missing_device_is_detected", btrfs_missing_device_is_detected),
         ("btrfs_running_scrub_and_balance_are_detected", btrfs_running_scrub_and_balance_are_detected),
+        ("smart_is_read_from_disks", smart_is_read_from_disks),
         ("scrub_of_root_finishes_clean", scrub_of_root_finishes_clean),
         ("scrub_finds_corruption", scrub_finds_corruption),
         ("scrub_status_outlasts_a_locked_status_file", scrub_status_outlasts_a_locked_status_file),
@@ -795,6 +835,7 @@ fn main() {
         ("identity_and_systems", identity_and_systems),
         ("preflight_finds_blockers", preflight_finds_blockers),
         ("btrfs_root_is_idle", btrfs_root_is_idle),
+        ("smart_is_read_from_disks", smart_is_read_from_disks),
         ("postflight_facts", postflight_facts),
         ("grubs_defaults_are_checked", grubs_defaults_are_checked),
         ("catch_when_up", catch_when_up),

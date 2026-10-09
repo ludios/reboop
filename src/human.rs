@@ -1,9 +1,11 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Formatting quantities and tables for people.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use std::collections::BTreeMap;
 
 /// The units above bytes, each 1000 times the last.
 const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
@@ -41,6 +43,12 @@ pub fn seconds(seconds: u64) -> String {
         (0, _) => format!("{minutes}m {seconds}s"),
         _ => format!("{hours}h {minutes}m {seconds}s"),
     }
+}
+
+/// Formats counters by name, e.g. "csum_errors=3 read_errs=1".
+pub fn counters(counters: &BTreeMap<String, u64>) -> String {
+    let counts: Vec<_> = counters.iter().map(|(name, count)| format!("{name}={count}")).collect();
+    counts.join(" ")
 }
 
 /// `text`, cut to at most `max_chars` characters with an ellipsis at the end
