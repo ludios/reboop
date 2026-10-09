@@ -142,6 +142,10 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     // The kernel release we'd expect after booting the current system is
     // the one that's running.
     assert_eq!(facts::kernel_release(&mut session, &systems.current)?, systems.running_kernel);
+    // Nothing needs a reboot while the system profile is what booted.
+    if systems.booted == systems.default {
+        assert_eq!(systems.reboot_reasons(), Vec::<String>::new(), "{systems:?}");
+    }
     assert_eq!(systems.running_kernel, sh(&mut session, "uname -r")?.trim_end());
     let built = systems.running_kernel_built_at.expect("NixOS kernels say when they were built in `uname -v`");
     let booted = facts::booted_at(&mut session)?;
@@ -671,6 +675,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     sh(&mut session, &format!("nix-env -p /nix/var/nix/profiles/system --set {next} && {next}/bin/switch-to-configuration boot"))?;
     let expected = facts::systems(&mut session)?;
     assert_eq!((&expected.current, &expected.default), (&before.current, next));
+    assert_eq!(expected.reboot_reasons(), ["new system"], "{expected:?}");
 
     // One of the stop_services is running, and one doesn't exist.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
@@ -691,6 +696,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Finished);
     let after = facts::systems(&mut session)?;
     assert_eq!((&after.booted, &after.current), (next, next));
+    assert_eq!(after.reboot_reasons(), Vec::<String>::new(), "{after:?}");
     assert_eq!(after.running_kernel, expected.default_kernel);
     assert_eq!(sh(&mut session, "cat /etc/reboop-test-variant")?, next_variant);
     Ok(())

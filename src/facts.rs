@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Facts about a remote NixOS machine, from before and after rebooting it.
 
@@ -42,12 +43,31 @@ pub fn load_average_1min(session: &mut Session) -> Result<f64> {
     first.parse().with_context(|| format!("unexpected /proc/loadavg {loadavg:?}"))
 }
 
-/// Parses a store path printed by a command, checking that it is one.
+/// Parses a path in the store printed by a command, returning its store
+/// entry: the /nix/store/HASH-NAME directory, without any path beneath it.
+fn store_entry(output: &str) -> Result<String> {
+    let path = output.trim_end_matches('\n');
+    let context = || anyhow!("not a path in the store: {path:?}");
+    let rest = path.strip_prefix("/nix/store/").ok_or_else(context)?;
+    let entry = rest.split_once('/').map_or(rest, |(entry, _)| entry);
+    let (hash, name) = entry.split_at_checked(32).and_then(|(hash, rest)| Some((hash, rest.strip_prefix('-')?))).ok_or_else(context)?;
+    ensure!(hash.bytes().all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()) && !name.is_empty(), context());
+    Ok(format!("/nix/store/{entry}"))
+}
+
+/// Parses a store path printed by a command, checking that it is one: a
+/// store entry (see [`store_entry`]) with nothing beneath it.
 fn store_path(output: &str) -> Result<String> {
     let path = output.trim_end_matches('\n');
-    let name = path.strip_prefix("/nix/store/").ok_or_else(|| anyhow!("not a store path: {path:?}"))?;
-    ensure!(!name.is_empty() && !name.contains('/'), "not a store path: {path:?}");
-    Ok(path.to_string())
+    let entry = store_entry(path)?;
+    ensure!(entry == path, "not a store path: {path:?}");
+    Ok(entry)
+}
+
+/// The name of a store entry from [`store_entry`]: what follows its hash,
+/// like "linux-6.18.55", which usually carries the version.
+fn store_name(entry: &str) -> &str {
+    entry.split_once('-').map_or(entry, |(_, name)| name)
 }
 
 /// The release of `system`'s kernel (a toplevel store path), as `uname -r`
@@ -72,6 +92,28 @@ fn parse_kernel_built_at(version: &str) -> Option<Timestamp> {
     TimeZone::UTC.to_timestamp(datetime).ok()
 }
 
+/// The parts of a NixOS configuration that only a reboot puts into use, as
+/// store entries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BootParts {
+    pub kernel: String,
+    pub kernel_modules: String,
+    pub initrd: String,
+    pub systemd: String,
+}
+
+/// The parts of `system` (a toplevel store path) that only a reboot puts
+/// into use: what its kernel, kernel-modules, initrd and systemd links lead
+/// to.
+fn boot_parts(session: &mut Session, system: &str) -> Result<BootParts> {
+    let quoted = shell_quote(system);
+    let script = format!("readlink -- {quoted}/kernel {quoted}/kernel-modules {quoted}/initrd {quoted}/systemd");
+    let entries: Vec<String> = session.run_ok(&script, QUICK)?.lines().map(store_entry).collect::<Result<_>>()?;
+    let [kernel, kernel_modules, initrd, systemd] =
+        <[String; 4]>::try_from(entries).map_err(|entries| anyhow!("expected 4 links in {system}, found {entries:?}"))?;
+    Ok(BootParts { kernel, kernel_modules, initrd, systemd })
+}
+
 /// The NixOS configurations and kernels involved in a reboot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Systems {
@@ -89,10 +131,43 @@ pub struct Systems {
     pub default: String,
     /// The release of the default configuration's kernel.
     pub default_kernel: String,
+    /// The booted configuration's parts that only a reboot puts into use.
+    pub booted_parts: BootParts,
+    /// The default configuration's.
+    pub default_parts: BootParts,
+}
+
+impl Systems {
+    /// Why the machine needs a reboot, if it does: "new system" if the
+    /// default configuration isn't the current one (after `nixos-rebuild
+    /// boot`); then, for each of the booted configuration's parts that the
+    /// default's differs from, "new X" if the default's has another name
+    /// (so, usually, another version), or "rebuilt X" if only its hash
+    /// differs.  A kernel's modules and initrd come with it, so they're
+    /// only named when the kernel is the same, and the initrd only when the
+    /// modules are too.
+    pub fn reboot_reasons(&self) -> Vec<String> {
+        let (booted, default) = (&self.booted_parts, &self.default_parts);
+        let differs = |part: &str, booted: &str, default: &str| {
+            if booted == default {
+                None
+            } else if store_name(booted) == store_name(default) {
+                Some(format!("rebuilt {part}"))
+            } else {
+                Some(format!("new {part}"))
+            }
+        };
+        let system = (self.current != self.default).then(|| "new system".to_string());
+        let kernel = differs("kernel", &booted.kernel, &default.kernel)
+            .or_else(|| differs("kernel modules", &booted.kernel_modules, &default.kernel_modules))
+            .or_else(|| differs("initrd", &booted.initrd, &default.initrd));
+        let systemd = differs("systemd", &booted.systemd, &default.systemd);
+        [system, kernel, systemd].into_iter().flatten().collect()
+    }
 }
 
 /// Finds out which configurations and kernels the machine is running and
-/// would boot.
+/// would boot, and their parts that only a reboot puts into use.
 pub fn systems(session: &mut Session) -> Result<Systems> {
     let current = store_path(&session.run_ok("readlink /run/current-system", QUICK)?)?;
     let booted = store_path(&session.run_ok("readlink /run/booted-system", QUICK)?)?;
@@ -100,7 +175,9 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     let running_kernel_built_at = parse_kernel_built_at(&session.run_ok("uname -v", QUICK)?);
     let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
     let default_kernel = kernel_release(session, &default)?;
-    Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel })
+    let booted_parts = boot_parts(session, &booted)?;
+    let default_parts = boot_parts(session, &default)?;
+    Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel, booted_parts, default_parts })
 }
 
 /// Seconds since boot and each interface's (received, sent) byte counters.
@@ -335,6 +412,7 @@ pub fn inhibitors(session: &mut Session) -> Result<Vec<Inhibitor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preflight::idle_facts;
 
     #[test]
     fn parses_jobs() {
@@ -405,9 +483,44 @@ mod tests {
 
     #[test]
     fn store_paths() {
-        assert_eq!(store_path("/nix/store/abc-foo\n").unwrap(), "/nix/store/abc-foo");
-        assert!(store_path("/nix/store/abc-foo/bin").is_err());
+        let foo = format!("/nix/store/{}-foo", "a".repeat(32));
+        assert_eq!(store_path(&format!("{foo}\n")).unwrap(), foo);
+        assert!(store_path(&format!("{foo}/bin")).is_err());
         assert!(store_path("/run/current-system").is_err());
+        assert!(store_path("/nix/store/abc-foo").is_err());
+        assert_eq!(store_entry(&format!("{foo}/bin/sh\n")).unwrap(), foo);
+        assert!(store_entry(&format!("/nix/store/{}-", "a".repeat(32))).is_err());
+        assert!(store_entry(&format!("/nix/store/{}foo", "a".repeat(32))).is_err());
+        assert!(store_entry("/nix/store/").is_err());
+        assert_eq!(store_name(&foo), "foo");
+        assert_eq!(store_name("/nix/store/aaa-linux-6.18.55"), "linux-6.18.55");
+    }
+
+    #[test]
+    fn finds_reboot_reasons() {
+        let parts = |hash: &str, kernel: &str, systemd: &str| BootParts {
+            kernel: format!("/nix/store/{hash}-linux-{kernel}"),
+            kernel_modules: format!("/nix/store/{hash}-linux-{kernel}-modules"),
+            initrd: format!("/nix/store/{hash}-initrd-linux-{kernel}"),
+            systemd: format!("/nix/store/{hash}-systemd-{systemd}"),
+        };
+        let same = Systems { booted_parts: parts("aaa", "6.18.54", "260.5"), default_parts: parts("aaa", "6.18.54", "260.5"), ..idle_facts().systems };
+        assert_eq!(same.reboot_reasons(), Vec::<String>::new());
+        // After `nixos-rebuild boot` to a configuration with a newer kernel
+        let newer = BootParts { systemd: same.booted_parts.systemd.clone(), ..parts("bbb", "6.18.55", "260.5") };
+        let booted = Systems { default: "/nix/store/bbb-nixos-system-one-26.05".into(), default_parts: newer, ..same.clone() };
+        assert_eq!(booted.reboot_reasons(), ["new system", "new kernel"]);
+        // After `nixos-rebuild switch` to a rebuilt kernel and a newer systemd
+        let switched = Systems { current: booted.default.clone(), default: booted.default.clone(), default_parts: parts("bbb", "6.18.54", "260.6"), ..same.clone() };
+        assert_eq!(switched.reboot_reasons(), ["rebuilt kernel", "new systemd"]);
+        // Extra modules, which the initrd picks up; a changed initrd; a rebuilt systemd
+        let rebuilt = parts("bbb", "6.18.54", "260.5");
+        let modules = Systems { default_parts: BootParts { kernel_modules: rebuilt.kernel_modules.clone(), initrd: rebuilt.initrd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        assert_eq!(modules.reboot_reasons(), ["rebuilt kernel modules"]);
+        let initrd = Systems { default_parts: BootParts { initrd: rebuilt.initrd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        assert_eq!(initrd.reboot_reasons(), ["rebuilt initrd"]);
+        let systemd = Systems { default_parts: BootParts { systemd: rebuilt.systemd.clone(), ..same.booted_parts.clone() }, ..same.clone() };
+        assert_eq!(systemd.reboot_reasons(), ["rebuilt systemd"]);
     }
 
     #[test]

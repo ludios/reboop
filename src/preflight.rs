@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Finding out whether a machine is okay to reboot.
 
@@ -246,6 +247,12 @@ pub(crate) fn idle_facts() -> Facts {
         files: vec!["/boot/EFI/nixos/bzImage.efi".into(), "/boot/EFI/nixos/initrd.efi".into()],
         missing_files: vec![],
     };
+    let parts = facts::BootParts {
+        kernel: "/nix/store/aaa-linux-6.18.54".into(),
+        kernel_modules: "/nix/store/aaa-linux-6.18.54-modules".into(),
+        initrd: "/nix/store/aaa-initrd-linux-6.18.54".into(),
+        systemd: "/nix/store/aaa-systemd-260.5".into(),
+    };
     Facts {
         boot_id: "4f6f3fbb-4f0e-4ba0-9a8d-2f53f2c4f59e".into(),
         booted_at: "2026-09-30T08:27:56Z".parse().unwrap(),
@@ -256,6 +263,8 @@ pub(crate) fn idle_facts() -> Facts {
             running_kernel_built_at: Some("2026-09-25T14:35:54Z".parse().unwrap()),
             default: system,
             default_kernel: "6.18.54".into(),
+            booted_parts: parts.clone(),
+            default_parts: parts,
         },
         boot: vec![boot],
         firmware_overrides: vec![],

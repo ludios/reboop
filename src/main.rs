@@ -25,7 +25,8 @@ struct ColorOption {
 #[clap(name = "reboop", version)]
 /// Carefully reboots NixOS machines
 enum ReboopCommand {
-    /// Show whether machines are okay to reboot, and the facts behind that.
+    /// Show whether machines are okay to reboot, why they need one (if they
+    /// do), and the facts behind that.
     /// Exits 0 if all are, 2 if any isn't, or 1 if any couldn't be checked.
     #[clap(name = "check")]
     Check {

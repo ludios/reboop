@@ -1,7 +1,8 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
-//! `reboop check`: whether machines are okay to reboot, and the facts behind
-//! the answer.
+//! `reboop check`: whether machines are okay to reboot, why they need one,
+//! and the facts behind the answers.
 
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
@@ -30,7 +31,7 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 /// The activities that have columns of their own.
 const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Rsync];
 
-const HEADER: [&str; 13] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "KERNEL", "BUILT", "BOOTED"];
+const HEADER: [&str; 14] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "OTHER", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
@@ -64,9 +65,9 @@ fn other_reasons(facts: &Facts) -> Vec<String> {
 }
 
 /// The table row about `machine`: the facts that decide whether to reboot
-/// it, red where they block a reboot, the kernel it runs (and the one it
-/// would boot, if different), and when that kernel was built and booted, in
-/// `zone`.
+/// it, red where they block a reboot, why it needs a reboot (if it does),
+/// the kernel it runs (and the one it would boot, if different), and when
+/// that kernel was built and booted, in `zone`.
 fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell> {
     let Ok((facts, blockers)) = outcome else {
         let mut row = vec![Plain.cell(machine.hostname.clone()), Red.cell("error")];
@@ -94,6 +95,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         list(other_reasons(facts).iter().map(String::as_str).collect()),
+        Plain.cell(systems.reboot_reasons().join(", ")),
         Plain.cell(kernel),
         systems.running_kernel_built_at.map_or(Plain.cell("?"), |time| human::minute(time, zone)),
         human::minute(facts.booted_at, zone),
@@ -125,12 +127,13 @@ fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> Stri
     text
 }
 
-/// The JSON about a machine: its facts and the reasons not to reboot it
-/// (`blockers`, empty if it's okay), or why it couldn't be checked.
+/// The JSON about a machine: its facts, the reasons not to reboot it
+/// (`blockers`, empty if it's okay) and why it needs a reboot
+/// (`reboot_reasons`, empty if it doesn't), or why it couldn't be checked.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum JsonReport<'a> {
-    Checked { machine: &'a str, okay_to_reboot: bool, blockers: &'a [String], facts: &'a Facts },
+    Checked { machine: &'a str, okay_to_reboot: bool, blockers: &'a [String], needs_reboot: bool, reboot_reasons: Vec<String>, facts: &'a Facts },
     /// `okay_to_reboot` is always false.
     Failed { machine: &'a str, okay_to_reboot: bool, error: String },
 }
@@ -138,7 +141,10 @@ enum JsonReport<'a> {
 fn json_report<'a>(machine: &'a Machine, outcome: &'a Outcome) -> JsonReport<'a> {
     let machine = &machine.hostname;
     match outcome {
-        Ok((facts, blockers)) => JsonReport::Checked { machine, okay_to_reboot: blockers.is_empty(), blockers, facts },
+        Ok((facts, blockers)) => {
+            let reboot_reasons = facts.systems.reboot_reasons();
+            JsonReport::Checked { machine, okay_to_reboot: blockers.is_empty(), blockers, needs_reboot: !reboot_reasons.is_empty(), reboot_reasons, facts }
+        }
         Err(error) => JsonReport::Failed { machine, okay_to_reboot: false, error: format!("{error:#}") },
     }
 }
@@ -210,6 +216,8 @@ mod tests {
     fn blocked_outcome() -> Outcome {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
+        facts.systems.default_parts.kernel = "/nix/store/bbb-linux-6.18.55".into();
+        facts.systems.default_parts.systemd = "/nix/store/bbb-systemd-260.5".into();
         facts.systems.running_kernel_built_at = None;
         facts.btrfs[0].exclusive_operation = "balance".into();
         facts.btrfs[0].devices[0].missing = true;
@@ -247,9 +255,9 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false, &TimeZone::UTC),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 KERNEL             BUILT        BOOTED\n\
-             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  6.18.54 → 6.18.55  ?            09-30T08:27\n\
-             two      yes                              1.00 kB/s   0.50   45%                                                                       6.18.54            09-25T14:35  09-30T08:27\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT                                 OTHER                                 REBOOT                       KERNEL             BUILT        BOOTED\n\
+             one      no                    1         12.50 MB/s  12.50   98%  btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  new kernel, rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                              1.00 kB/s   0.50   45%                                                                                                    6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
              \n\
              one: btrfs on /: balance\n\
@@ -266,8 +274,8 @@ mod tests {
              three: failed to open a session: no route to host\n    second line\n"
         );
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain, Plain, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
@@ -298,8 +306,11 @@ mod tests {
         let json = |outcome: &Outcome| -> Value { serde_json::to_value(json_report(&machine, outcome)).unwrap() };
         let report = json(&blocked_outcome());
         let text = serde_json::to_string(&json_report(&machine, &Ok((idle_facts(), vec![])))).unwrap();
-        assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"facts":{"boot_id":"#), "{text}");
+        assert!(text.starts_with(r#"{"machine":"one","okay_to_reboot":true,"blockers":[],"needs_reboot":false,"reboot_reasons":[],"facts":{"boot_id":"#), "{text}");
         assert_eq!(report["okay_to_reboot"], false);
+        assert_eq!(report["needs_reboot"], true);
+        assert_eq!(report["reboot_reasons"], json!(["new kernel", "rebuilt systemd"]));
+        assert_eq!(report["facts"]["systems"]["default_parts"]["kernel"], "/nix/store/bbb-linux-6.18.55");
         assert_eq!(report["blockers"][0], "btrfs on /: balance");
         assert_eq!(report["blockers"].as_array().unwrap().len(), 10);
         assert_eq!(report["facts"]["lasting_jobs"][0]["type"], "start");
