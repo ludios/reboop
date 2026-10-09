@@ -63,6 +63,13 @@ When writing _any_ kind of code:
 - The "main" function goes at the end and depends on functions above, which depend on functions further above, etc.
 - Scan the functions and generalize if that makes a good result; evict any deadbeats: humans with a small context window need to review and maintain this code.
 - Abstraction boundaries are important. Comments should reflect the current abstraction and generally avoid talking about other things.
+- Classes should be used when:
+
+	1. You have anything like a state machine, or functions closing over the same state. \
+	   They help us organize and know which state is shared between related functions.
+	2. Integrating with an API properly, e.g. making an Error subclass.
+
+  Otherwise, plain functions are generally fine.
 
 Minutae:
 
