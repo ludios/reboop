@@ -17,6 +17,16 @@ pub fn hostname(session: &mut Session) -> Result<String> {
     Ok(session.run_ok("cat /proc/sys/kernel/hostname", QUICK)?.trim_end().to_string())
 }
 
+/// Makes sure the machine at the other end of `session` calls itself
+/// `hostname`, or the first label of `hostname` if that's a fully qualified
+/// name (NixOS host names have no dots).
+pub fn ensure_hostname(session: &mut Session, hostname: &str) -> Result<()> {
+    let actual = self::hostname(session)?;
+    let fqdn_of_actual = hostname.strip_prefix(actual.as_str()).is_some_and(|domain| domain.starts_with('.'));
+    ensure!(actual == hostname || fqdn_of_actual, "{} calls itself {actual:?}, not {hostname:?}", session.target());
+    Ok(())
+}
+
 /// A random ID the kernel picks at every boot, so if it changed, the machine
 /// rebooted.
 pub fn boot_id(session: &mut Session) -> Result<String> {

@@ -11,7 +11,7 @@ use crate::human;
 use crate::processes::{self, Activity, Process};
 use crate::smart::{self, Disk, Smart};
 use crate::ssh::Session;
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use jiff::Timestamp;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -90,14 +90,11 @@ fn disk_facts(session: &mut Session, filesystems: &[Filesystem]) -> Result<Optio
 }
 
 /// Collects the facts about the machine at the other end of `session`, after
-/// making sure it calls itself `hostname`, or the first label of `hostname`
-/// if that's a fully qualified name (NixOS host names have no dots).  Takes
+/// making sure it's `hostname` (see [`facts::ensure_hostname`]).  Takes
 /// [`NETWORK_SAMPLE`] or a bit longer, plus up to [`smart::PATIENCE`] if a
 /// disk is slow to answer smartctl.
 pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
-    let actual = facts::hostname(session)?;
-    let fqdn_of_actual = hostname.strip_prefix(actual.as_str()).is_some_and(|domain| domain.starts_with('.'));
-    ensure!(actual == hostname || fqdn_of_actual, "{} calls itself {actual:?}, not {hostname:?}", session.target());
+    facts::ensure_hostname(session, hostname)?;
 
     // The sample comes first, and then SMART, which can take a while too, so
     // that the rest is as fresh as can be.

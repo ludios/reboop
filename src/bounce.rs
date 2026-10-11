@@ -474,8 +474,8 @@ fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Resu
 
 /// Waits for `machine` to come back from a reboot, out of boot `old_boot_id`
 /// if that's known, unlocking its initrd with `password` (if any) if it
-/// waits there; shows how it did; and scrubs its scrub_mounts.  Returns the
-/// problems (none if all is well).
+/// waits there; makes sure it's `machine`; shows how it did; and scrubs its
+/// scrub_mounts.  Returns the problems (none if all is well).
 fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
     let (target, initrd_target) = (machine.target(), machine.initrd_target());
@@ -497,6 +497,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
             }
         }
     };
+    facts::ensure_hostname(&mut session, &machine.hostname)?;
     let mut problems = postflight(&mut session, printer)?;
 
     for mountpoint in &machine.scrub_mounts {

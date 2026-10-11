@@ -664,6 +664,12 @@ fn catch_when_up(vm: &Vm) -> Result<()> {
     let no_password = format!("There's no stored LUKS password for {}, so its initrd won't be unlocked\n", vm.manifest.hostname);
     assert!(printed.starts_with(&no_password), "{printed}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
+
+    let someone_else = Machine { hostname: "someone-else".into(), ..vm_machine(vm) };
+    let mut printed = Vec::new();
+    let error = bounce::catch(&vm.ssh, &someone_else, None, &mut Printer::new(&mut printed, false, None, None)).unwrap_err();
+    assert!(format!("{error:#}").contains(r#"not "someone-else""#), "{error:#}");
+    assert!(!String::from_utf8(printed)?.contains("Waiting for systemd"));
     Ok(())
 }
 
