@@ -72,7 +72,7 @@ struct BootctlEntry {
     initrd: Option<Vec<String>>,
     /// The entry's own command line, or a UKI's built-in one
     options: Option<String>,
-    /// The command line it boots: `options` and those of any UKI add-ons
+    /// `options` and those of its add-ons, which only a UKI's stub applies
     /// (older bootctl shows only `options`)
     cmdline: Option<String>,
 }
@@ -86,10 +86,13 @@ fn parse_bootctl(json: &str) -> Result<Option<DefaultBoot>> {
     let Some(entry) = defaults.into_iter().next() else { return Ok(None) };
     let root = entry.root.unwrap_or_default();
     let files = entry.linux.iter().chain(&entry.efi).chain(entry.initrd.iter().flatten()).map(|file| format!("{root}{file}")).collect();
+    // bootctl gives every entry the global add-ons, but a kernel that
+    // systemd-boot runs directly gets none.
+    let options = if entry.linux.is_some() { entry.options } else { entry.cmdline.or(entry.options) };
     Ok(Some(DefaultBoot {
         loader: "systemd-boot".into(),
         entry: entry.id,
-        options: entry.cmdline.or(entry.options).unwrap_or_default(),
+        options: options.unwrap_or_default(),
         files,
         missing_files: vec![],
     }))
@@ -466,7 +469,8 @@ mod tests {
 
     #[test]
     fn finds_systemd_boots_default() {
-        let json = r#"[{"type":"type1","id":"nixos-generation-24.conf","root":"/boot","options":"init=/nix/store/hcib-nixos-system-one/init console=ttyS0","linux":"/EFI/nixos/ls9x-bzImage.efi","initrd":["/EFI/nixos/y89c-initrd.efi"],"isDefault":true},
+        // The default's cmdline has a global add-on's, which its kernel won't get.
+        let json = r#"[{"type":"type1","id":"nixos-generation-24.conf","root":"/boot","options":"init=/nix/store/hcib-nixos-system-one/init console=ttyS0","cmdline":"init=/nix/store/hcib-nixos-system-one/init console=ttyS0 init=/nix/store/xr4m-nixos-system-two/init ip=10.0.0.9::10.0.0.1:255.255.255.0::eth0:none","linux":"/EFI/nixos/ls9x-bzImage.efi","initrd":["/EFI/nixos/y89c-initrd.efi"],"isDefault":true},
                        {"type":"type1","id":"nixos-generation-23.conf","root":"/boot","options":"init=/nix/store/jqki-nixos-system-one/init","linux":"/EFI/nixos/ls9x-bzImage.efi","initrd":null,"isDefault":false},
                        {"type":"auto","id":"auto-reboot-to-firmware-setup","isDefault":false}]"#;
         let boot = parse_bootctl(json).unwrap().unwrap();
