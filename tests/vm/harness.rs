@@ -348,6 +348,11 @@ for i in /var/tmp/reboop-test-*.img; do
     for l in $(losetup -j "$i" -n -O NAME); do losetup -d "$l"; done
 done
 rm -rf /var/tmp/reboop-test-*
+# The keyring token the LUKS password test adds, and its key
+if cryptsetup token export --token-id 0 /dev/vda2 2>/dev/null | grep -q '"reboop-test"'; then
+    cryptsetup token remove --token-id 0 /dev/vda2 || exit 1
+fi
+keyctl purge user reboop-test >/dev/null 2>&1
 btrfs scrub cancel / >/dev/null 2>&1
 exit 0
 "#;
