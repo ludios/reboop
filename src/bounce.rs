@@ -348,27 +348,14 @@ fn wait_for_return(
         if let Some(old_boot_id) = old_boot_id {
             ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
         }
-        // As when ssh_port is initrd_ssh_port
-        ensure!(!facts::in_initrd(&mut session)?, "it's at its initrd");
         ensure!(facts::system_state(&mut session)? != "stopping", "it's shutting down");
         Ok(session)
     };
     // Logs in through `opening` and unlocks the initrd with `password` at
     // once, killing the loser's ssh, since a connection to a machine that's
     // down can take ssh's ConnectTimeout to fail, which would hold up the
-    // other.  Through one port, though, the initrd is tried only once
-    // logging in fails: the password agent would otherwise run on the booted
-    // system, answering any prompt there with the password.  Returns both
-    // errors when neither wins.
+    // other.  Returns both errors when neither wins.
     let race = |opening: Opening, password: &str, deadline: Deadline| -> Result<Result<Found, (anyhow::Error, UnlockError)>> {
-        if target == initrd_target {
-            let error = match back(opening, deadline) {
-                Ok(session) => return Ok(Ok(Found::Back(session))),
-                Err(error) => error,
-            };
-            let unlock = initrd::unlock(ssh, &initrd_target, password, deadline);
-            return Ok(unlock.map(Found::Unlocked).map_err(|unlock_error| (error, unlock_error)));
-        }
         let agent = initrd::Agent::start(ssh, &initrd_target)?;
         let (kill_opening, kill_agent) = (opening.killer(), agent.killer());
         let (back, unlock) = thread::scope(|scope| {

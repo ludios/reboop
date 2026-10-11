@@ -136,6 +136,8 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
         ipv4: line.ipv4,
     };
     ensure!(machine.ssh_port != 0 && machine.initrd_ssh_port != 0, "port 0 for {}", machine.hostname);
+    // Whatever answers on initrd_ssh_port is taken to be the initrd.
+    ensure!(machine.ssh_port != machine.initrd_ssh_port, "ssh_port and initrd_ssh_port of {} are both {}", machine.hostname, machine.ssh_port);
     for mount in &machine.scrub_mounts {
         ensure!(mount.starts_with('/'), "scrub mount {mount:?} of {} isn't an absolute path", machine.hostname);
     }
@@ -279,6 +281,7 @@ mod tests {
         assert!(line(r#"{"hostname": "../one", "ipv4": "10.0.0.1"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_mounts": ["small"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "initrd_ssh_port": 22}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "root_full_percent": 0}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "root_full_percent": 101}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": [""]}"#).is_err());

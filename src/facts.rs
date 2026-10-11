@@ -275,12 +275,6 @@ pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<Str
     is_system_running(session, "--wait", timeout)
 }
 
-/// Whether `session` is in an initrd, rather than the system it boots, by
-/// the same test as systemd's.
-pub fn in_initrd(session: &mut Session) -> Result<bool> {
-    Ok(session.run("test -e /etc/initrd-release", QUICK)?.status == 0)
-}
-
 /// The names of units that have failed.
 pub fn failed_units(session: &mut Session) -> Result<Vec<String>> {
     #[derive(Deserialize)]
