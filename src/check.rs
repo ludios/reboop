@@ -330,7 +330,7 @@ mod tests {
         let disks = facts.disks.as_mut().unwrap();
         disks[0].smart = Smart::Read { passed: Some(false), warnings: BTreeMap::new(), incomplete: None };
         disks.push(disk("/dev/sdb", Smart::Read { passed: Some(true), warnings: BTreeMap::from([("media_errors".into(), 1)]), incomplete: None }));
-        disks.push(disk("/dev/sdc", Smart::NoAnswer { no_answer_within_secs: 20 }));
+        disks.push(disk("/dev/sdc", Smart::NoAnswer { no_answer_within_secs: 10 }));
         assert_eq!(cell(&facts), (Red, "sda,sdb,sdc".into()));
         facts.disks = Some(vec![]);
         assert_eq!(cell(&facts), (Plain, "".into()));

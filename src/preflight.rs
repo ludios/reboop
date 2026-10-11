@@ -384,7 +384,7 @@ mod tests {
         disks[0].smart = Smart::Read { passed: Some(true), warnings: BTreeMap::from([("Current_Pending_Sector".into(), 2)]), incomplete: None };
         disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some("no".into()) } });
         disks.push(DiskFacts { disk: Disk { path: "/dev/sdc".into(), model: None, serial: None }, smart: Smart::Read { passed: Some(false), warnings: BTreeMap::new(), incomplete: None } });
-        disks.push(DiskFacts { disk: Disk { path: "/dev/sdd".into(), model: None, serial: None }, smart: Smart::NoAnswer { no_answer_within_secs: 20 } });
+        disks.push(DiskFacts { disk: Disk { path: "/dev/sdd".into(), model: None, serial: None }, smart: Smart::NoAnswer { no_answer_within_secs: 10 } });
         facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
         let inhibitor = |mode: &str, why: &str| Inhibitor {
             what: "shutdown".into(),
@@ -411,7 +411,7 @@ mod tests {
                 "btrfs on /small: device 2 is missing",
                 "smart on /dev/sda (QEMU HARDDISK, serial QM00001): Current_Pending_Sector=2",
                 "smart on /dev/sdc: overall health FAILED",
-                "smart on /dev/sdd: didn't answer smartctl within 20s",
+                "smart on /dev/sdd: didn't answer smartctl within 10s",
                 "tmux: pid 1234 (at): tmux new -s work",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",

@@ -12,15 +12,19 @@ use std::fmt;
 use std::time::Duration;
 
 /// How long each smartctl gets before it's told to stop.
-const SMARTCTL_TIMEOUT: Duration = Duration::from_secs(20);
+const SMARTCTL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a smartctl told to stop has to do so before it's killed.
+const SMARTCTL_KILL_AFTER: Duration = Duration::from_secs(3);
 
 /// How long [`health`] waits for its smartctls at most: long enough past
-/// [`SMARTCTL_TIMEOUT`] for one that stops when told to count as timed out,
-/// and short enough under the session's [`QUICK`] to leave behind one that
-/// can't stop, being stuck in the kernel on a disk that doesn't answer.
-pub const PATIENCE: Duration = Duration::from_secs(25);
+/// [`SMARTCTL_TIMEOUT`] and [`SMARTCTL_KILL_AFTER`] for one that stops when
+/// told or killed to count as timed out, and short enough under the
+/// session's [`QUICK`] to leave behind one that can't be killed, being stuck
+/// in the kernel on a disk that doesn't answer.
+pub const PATIENCE: Duration = Duration::from_secs(15);
 
-const _: () = assert!(PATIENCE.as_secs() > SMARTCTL_TIMEOUT.as_secs() && PATIENCE.as_secs() + 3 < QUICK.as_secs());
+const _: () = assert!(PATIENCE.as_secs() > SMARTCTL_TIMEOUT.as_secs() + SMARTCTL_KILL_AFTER.as_secs() && PATIENCE.as_secs() + 3 < QUICK.as_secs());
 
 /// The IDs of the ATA SMART attributes whose raw values count sectors gone
 /// bad: reallocated (5), reported uncorrectable (187), pending reallocation
@@ -146,7 +150,8 @@ pub enum Smart {
         warnings: BTreeMap<String, u64>,
         /// Why smartctl couldn't read all of that, if it couldn't: a virtual
         /// disk has no SMART, smartctl doesn't know every USB bridge or RAID
-        /// controller, and a SAS disk reports its defects differently.
+        /// controller, a SAS disk reports its defects differently, and a
+        /// disk in standby isn't woken.
         incomplete: Option<String>,
     },
 }
@@ -218,15 +223,21 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
         media_errors: u64,
     }
     let unread = |incomplete: String| Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some(incomplete) };
-    // timeout exits 124 after stopping a smartctl that took too long, which
-    // then prints nothing.
-    if status == "124" {
+    // timeout exits 124 after stopping a smartctl that took too long, or 137
+    // after killing one that didn't stop, which then prints nothing.
+    if status == "124" || status == "137" {
         return Smart::NoAnswer { no_answer_within_secs: SMARTCTL_TIMEOUT.as_secs() };
     }
     let Ok(output) = serde_json::from_str::<Output>(stdout) else {
         let text = human::truncate(format!("{stdout} {stderr}").trim(), 200);
         return unread(format!("smartctl exited with status {status} without JSON output: {text}"));
     };
+    // smartctl leaves a disk in standby or asleep alone (`-n standby`),
+    // saying e.g. "Device is in STANDBY mode, exit(2)".
+    let low_power = output.smartctl.messages.iter().find_map(|message| message.string.strip_prefix("Device is in ")?.split_once(" mode, exit(").map(|(mode, _)| mode));
+    if let Some(mode) = low_power {
+        return unread(format!("not woken from {mode} mode"));
+    }
 
     let mut warnings = BTreeMap::new();
     let mut passed = output.smart_status.map(|status| status.passed);
@@ -252,8 +263,10 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
     }
 
     // smartctl's exit status has a bit each for not identifying or opening
-    // the device, and for a SMART command failing.
-    let messages: Vec<&str> = output.smartctl.messages.iter().filter(|message| message.severity != "info").map(|message| message.string.as_str()).collect();
+    // the device, and for a SMART command failing.  Its informational
+    // messages are about `-n standby`, e.g. that it couldn't tell whether
+    // the disk is in standby.
+    let messages: Vec<&str> = output.smartctl.messages.iter().filter(|message| message.severity != "information").map(|message| message.string.as_str()).collect();
     let why = if messages.is_empty() { format!("smartctl exited with status {}", output.smartctl.exit_status) } else { messages.join("; ") };
     let incomplete = match (passed.is_some(), ata || nvme) {
         (false, false) => Some(if messages.is_empty() { format!("no SMART data ({why})") } else { why }),
@@ -280,7 +293,8 @@ fn parse_health(text: &str, disks: &[Disk]) -> Result<Vec<Smart>> {
 
 /// What SMART says about each of `disks`, in order, asking smartctl about
 /// all of them at once: each takes a moment to answer, and a failing one
-/// can take long.  A disk in standby is woken up.
+/// can take long.  A disk in standby isn't read, as spinning it up can take
+/// longer than [`SMARTCTL_TIMEOUT`].
 pub fn health(session: &mut Session, disks: &[Disk]) -> Result<Vec<Smart>> {
     if disks.is_empty() {
         return Ok(vec![]);
@@ -294,7 +308,7 @@ pub fn health(session: &mut Session, disks: &[Disk]) -> Result<Vec<Smart>> {
         i=0
         for d in "$@"; do
             i=$((i + 1))
-            {{ timeout {} smartctl --json=c -H -A "$d" >"$t/$i.out" 2>"$t/$i.err"; echo $? >"$t/$i.status"; }} &
+            {{ timeout --kill-after={} {} smartctl --json=c -n standby -H -A "$d" >"$t/$i.out" 2>"$t/$i.err"; echo $? >"$t/$i.status"; }} &
         done
         # Not `wait`: one stuck in the kernel can't stop, and is left behind.
         n=0
@@ -310,6 +324,7 @@ pub fn health(session: &mut Session, disks: &[Disk]) -> Result<Vec<Smart>> {
             tr '\n' ' ' <"$t/$i.err"; echo
         done"#,
         quoted.join(" "),
+        SMARTCTL_KILL_AFTER.as_secs(),
         SMARTCTL_TIMEOUT.as_secs(),
         PATIENCE.as_secs()
     );
@@ -414,6 +429,8 @@ mod tests {
         assert_eq!(parse_smartctl("1", UNDETECTED, ""), read(None, &[], Some("/dev/vda: Unable to detect device type")));
         let nothing = parse_smartctl("4", r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"exit_status":4}}"#, "");
         assert_eq!(nothing, read(None, &[], Some("no SMART data (smartctl exited with status 4)")));
+        let standby = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"messages":[{"string":"Device is in STANDBY BY TIMER mode, exit(2)","severity":"information"}],"exit_status":2}}"#;
+        assert_eq!(parse_smartctl("2", standby, ""), read(None, &[], Some("not woken from STANDBY BY TIMER mode")));
         // The self-assessment failed to read, but the attributes did: they still count.
         let pending = [(197, "Current_Pending_Sector", 8)];
         let no_status = parse_smartctl("4", &ata_json("", true, &pending, 4), "");
@@ -422,7 +439,7 @@ mod tests {
         // The other way around, or a SAS disk
         let no_table = parse_smartctl("4", &ata_json(PASSED, false, &[], 4), "");
         assert_eq!(no_table, read(Some(true), &[], Some("no ATA attributes or NVMe health log")));
-        let with_message = ata_json(PASSED, false, &[], 4).replace(r#""exit_status":4"#, r#""exit_status":4,"messages":[{"string":"Read SMART Data failed: scsi error","severity":"error"}]"#);
+        let with_message = ata_json(PASSED, false, &[], 4).replace(r#""exit_status":4"#, r#""exit_status":4,"messages":[{"string":"CHECK POWER MODE not implemented, ignoring -n option","severity":"information"},{"string":"Read SMART Data failed: scsi error","severity":"error"}]"#);
         assert_eq!(parse_smartctl("4", &with_message, ""), read(Some(true), &[], Some("no ATA attributes or NVMe health log (Read SMART Data failed: scsi error)")));
         // Both read, but a command failed or a checksum was wrong
         let checksum = parse_smartctl("4", &ata_json(PASSED, true, &pending, 4), "");
@@ -435,9 +452,10 @@ mod tests {
 
     #[test]
     fn counts_no_answer_as_trouble() {
-        let no_answer = Smart::NoAnswer { no_answer_within_secs: 20 };
+        let no_answer = Smart::NoAnswer { no_answer_within_secs: 10 };
         assert_eq!(parse_smartctl("124", "", ""), no_answer);
-        assert_eq!(no_answer.trouble().unwrap(), "didn't answer smartctl within 20s");
+        assert_eq!(parse_smartctl("137", "", ""), no_answer);
+        assert_eq!(no_answer.trouble().unwrap(), "didn't answer smartctl within 10s");
     }
 
     #[test]
@@ -448,8 +466,8 @@ mod tests {
         let text = format!("0\n{healthy}\n\n124\n\n\nnone\n\n\n1\n{UNKNOWN_USB_BRIDGE}\n\n");
         let health = parse_health(&text, &disks).unwrap();
         assert_eq!(health[0], read(Some(true), &[], None));
-        assert_eq!(health[1], Smart::NoAnswer { no_answer_within_secs: 20 });
-        assert_eq!(health[2], Smart::NoAnswer { no_answer_within_secs: 20 });
+        assert_eq!(health[1], Smart::NoAnswer { no_answer_within_secs: 10 });
+        assert_eq!(health[2], Smart::NoAnswer { no_answer_within_secs: 10 });
         assert!(matches!(&health[3], Smart::Read { incomplete: Some(why), .. } if why.contains("Unknown USB bridge")));
         assert!(parse_health(&text, &disks[..3]).is_err());
         assert!(parse_health("0\n\n", &disks[..1]).is_err());
