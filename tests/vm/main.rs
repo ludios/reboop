@@ -117,9 +117,10 @@ fn unreachable_ports_fail_fast(vm: &Vm) -> Result<()> {
     assert!(wait_for_session(&vm.ssh, &vm.initrd_target, Duration::from_secs(1), deadline).is_err());
     assert!(started.elapsed() < Duration::from_secs(10));
 
-    // An unknown host key won't go away, so there's no retrying.
+    // An unknown host key isn't accepted, even where the user's ssh config
+    // says to, and won't go away, so there's no retrying.
     let mut ssh = vm.ssh.clone();
-    ssh.extra_args.extend(["-o".into(), "UserKnownHostsFile=/dev/null".into()]);
+    ssh.extra_args.extend(["-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=accept-new"].map(String::from));
     let started = Instant::now();
     let Err(error) = wait_for_session(&ssh, &vm.target, Duration::from_secs(1), Deadline::after(MINUTE)) else {
         bail!("connected despite the unknown host key");

@@ -16,7 +16,7 @@ Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:
 
 `reboop stop HOSTNAME` does steps 1 and 3 with a shutdown (`systemctl poweroff`) in place of the reboot, then waits for the machine to stop accepting SSH. It leaves out what's only for unlocking afterwards: step 2, and step 1's check of the initrd's address.
 
-LUKS passwords are stored in `~/.config/reboop/luks/`, encrypted with a key derived from an `ssh-keygen -Y sign` signature, so they're usable wherever your Ed25519 or RSA SSH key is. Machines and limits go in `~/.config/reboop/defaults.json` and `machines.jsonl`; see [doc/spec.md](doc/spec.md).
+LUKS passwords are stored in `~/.config/reboop/luks/`, encrypted with a key derived from an `ssh-keygen -Y sign` signature, so they're usable wherever your Ed25519 or RSA SSH key is. reboop connects only to hosts whose keys are already in known_hosts (both the machine's and, for LUKS, its initrd's), whatever your ssh config says. Machines and limits go in `~/.config/reboop/defaults.json` and `machines.jsonl`; see [doc/spec.md](doc/spec.md).
 
 ## Contributing
 

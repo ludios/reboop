@@ -1,8 +1,9 @@
 // Model-output: Claude Opus 5.5
 // Model-output: Claude Fable 5.1
 
-//! Logging in to machines as root with the ssh binary (so the user's ssh
-//! config, agent and known_hosts all apply), and running commands there.
+//! Logging in as root to machines whose host keys are already known, with
+//! the ssh binary (so the user's ssh config, agent and known_hosts all
+//! apply), and running commands there.
 
 use crate::child::{ChildProcess, Killer};
 use crate::deadline::{Deadline, Permanent, retry};
@@ -81,14 +82,16 @@ impl Ssh {
     /// An ssh command that logs in to `target` and has root's login shell
     /// run `remote_command`, with extra ssh `options`.
     ///
-    /// The options set here keep a dead connection from hanging around:
-    /// keepalives notice a network that disappeared without closing the
-    /// connection (as when an initrd switches root), and ControlPath=none
-    /// keeps a ControlMaster in the user's config from reusing a connection
-    /// that died with the previous boot.
+    /// The options set here outrank the user's ssh config.  Keepalives
+    /// notice a network that disappeared without closing the connection (as
+    /// when an initrd switches root), ControlPath=none keeps a ControlMaster
+    /// from reusing a connection that died with the previous boot, and
+    /// StrictHostKeyChecking=yes (even where the config says accept-new)
+    /// keeps a login from adding a host key that a later one, perhaps
+    /// sending a secret, would then trust.
     pub fn command(&self, target: &Target, options: &[&str], remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
-        for option in ["BatchMode=yes", "ConnectTimeout=15", "ServerAliveInterval=5", "ServerAliveCountMax=3", "ControlPath=none"] {
+        for option in ["BatchMode=yes", "StrictHostKeyChecking=yes", "ConnectTimeout=15", "ServerAliveInterval=5", "ServerAliveCountMax=3", "ControlPath=none"] {
             command.args(["-o", option]);
         }
         command

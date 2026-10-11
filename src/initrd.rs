@@ -99,13 +99,10 @@ exec cryptsetup luksOpen --test-passphrase --token-type=reboop-none --key-file=-
 /// Tests whether `password` opens the LUKS device beneath / on the booted
 /// machine at `target`, which is the device its initrd asks to unlock.
 /// Returns the device's path and whether the password opens it.
-///
-/// Only connects to hosts whose key is already in known_hosts, whatever the
-/// user's ssh config says, since we're sending a secret.
 pub fn test_luks_password(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<(String, bool)> {
     check_password(password)?;
     let script = format!("{FIND_LUKS_DEVICES}{TEST_LUKS_PASSWORD}");
-    let command = ssh.command(target, &["-T", "-o", "StrictHostKeyChecking=yes"], &sh_c(&script));
+    let command = ssh.command(target, &["-T"], &sh_c(&script));
     let output = child::run(command, password.as_bytes(), deadline)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let device = stdout.lines().find_map(|line| line.strip_prefix("reboop-luks-device "));
@@ -185,12 +182,9 @@ pub struct Agent<'a> {
 impl<'a> Agent<'a> {
     /// Checks `password` (see [`check_password`]) and starts connecting to
     /// the initrd's sshd at `target`.
-    ///
-    /// Only connects to hosts whose key is already in known_hosts, whatever
-    /// the user's ssh config says, since we're sending a secret.
     pub fn start(ssh: &Ssh, target: &Target, password: &'a str) -> Result<Agent<'a>, UnlockError> {
         check_password(password)?;
-        let command = ssh.command(target, &["-tt", "-o", "EscapeChar=none", "-o", "StrictHostKeyChecking=yes"], AGENT_COMMAND);
+        let command = ssh.command(target, &["-tt", "-o", "EscapeChar=none"], AGENT_COMMAND);
         Ok(Agent { ssh: ChildProcess::spawn(command)?, target: target.clone(), password })
     }
 
