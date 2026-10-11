@@ -277,7 +277,7 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let expected = format!(r#"calls itself "{}", not "someone-else""#, vm.manifest.hostname);
     assert!(format!("{error:#}").contains(&expected), "{error:#}");
     // A fully qualified name for the machine will do.
-    preflight::gather(&mut session, &format!("{}.example.com", vm.manifest.hostname))?;
+    facts::ensure_hostname(&mut session, &format!("{}.example.com", vm.manifest.hostname))?;
 
     let machine = vm_machine(vm);
     let facts = preflight::gather(&mut session, &machine.hostname)?;
@@ -669,7 +669,7 @@ fn catch_when_up(vm: &Vm) -> Result<()> {
     let mut printed = Vec::new();
     let error = bounce::catch(&vm.ssh, &someone_else, None, &mut Printer::new(&mut printed, false, None, None)).unwrap_err();
     assert!(format!("{error:#}").contains(r#"not "someone-else""#), "{error:#}");
-    assert!(!String::from_utf8(printed)?.contains("Waiting for systemd"));
+    assert!(!String::from_utf8(printed)?.contains("systemd says"));
     Ok(())
 }
 

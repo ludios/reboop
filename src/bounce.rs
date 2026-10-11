@@ -431,11 +431,13 @@ fn postflight_problems(systems: &Systems, state: &str, failed_units: &[String]) 
 }
 
 /// Waits for the machine at the other end of `session` to finish starting
-/// up, shows how it came back, and returns its problems (see
-/// [`postflight_problems`]).
-fn postflight(session: &mut Session, printer: &mut Printer) -> Result<Vec<String>> {
+/// up, makes sure it's `hostname`, shows how it came back, and returns its
+/// problems (see [`postflight_problems`]).
+fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> Result<Vec<String>> {
     printer.line("Waiting for systemd to finish starting up");
     let state = facts::wait_until_booted(session, STARTUP_TIMEOUT)?;
+    // Not before, since a hostname from DHCP can come late in startup
+    facts::ensure_hostname(session, hostname)?;
     let failed_units = facts::failed_units(session)?;
     let after = facts::systems(session)?;
     let kernel_errors = facts::kernel_errors(session)?;
@@ -497,8 +499,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
             }
         }
     };
-    facts::ensure_hostname(&mut session, &machine.hostname)?;
-    let mut problems = postflight(&mut session, printer)?;
+    let mut problems = postflight(&mut session, &machine.hostname, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
         let status = match scrub(&mut session, mountpoint, printer) {
@@ -572,9 +573,10 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
 
 /// Catches `machine` on its way back up from a reboot that wasn't a bounce,
 /// or whose bounce was cut short: waits for it, unlocking its initrd with
-/// `password` (if any) if it waits there; shows how it came back; and
-/// scrubs its scrub_mounts.  If it's up, that's taken to be the boot it
-/// came back in.  Returns the problems (none if all is well).
+/// `password` (if any) if it waits there; makes sure it's `machine`; shows
+/// how it came back; and scrubs its scrub_mounts.  If it's up, that's taken
+/// to be the boot it came back in.  Returns the problems (none if all is
+/// well).
 pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let hostname = &machine.hostname;
     if password.is_none() {
