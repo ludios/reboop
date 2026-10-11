@@ -17,13 +17,13 @@ use crate::initrd::{self, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Down, Stopped};
-use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, is_unreachable};
+use crate::ssh::{OPEN_TIMEOUT, Opening, QUICK, Session, Ssh, is_unreachable};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use jiff::Zoned;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::Duration;
 use tracing::debug;
 
@@ -341,8 +341,10 @@ fn wait_for_return(
     on_retry: impl FnMut(&anyhow::Error),
 ) -> Result<Found> {
     let (target, initrd_target) = (machine.target(), machine.initrd_target());
-    let back = |deadline: Deadline| -> Result<Session> {
-        let mut session = Session::open(ssh, &target, deadline.at_most(OPEN_TIMEOUT).remaining())?;
+    // Finishes logging in through `opening`, and checks that it's to the
+    // machine back from its reboot.
+    let back = |opening: Opening, deadline: Deadline| -> Result<Session> {
+        let mut session = opening.open(deadline.at_most(OPEN_TIMEOUT))?;
         if let Some(old_boot_id) = old_boot_id {
             ensure!(facts::boot_id(&mut session)? != old_boot_id, "it hasn't rebooted yet");
         }
@@ -351,25 +353,66 @@ fn wait_for_return(
         ensure!(facts::system_state(&mut session)? != "stopping", "it's shutting down");
         Ok(session)
     };
+    // Logs in through `opening` and unlocks the initrd with `password` at
+    // once, killing the loser's ssh, since a connection to a machine that's
+    // down can take ssh's ConnectTimeout to fail, which would hold up the
+    // other.  Through one port, though, the initrd is tried only once
+    // logging in fails: the password agent would otherwise run on the booted
+    // system, answering any prompt there with the password.  Returns both
+    // errors when neither wins.
+    let race = |opening: Opening, password: &str, deadline: Deadline| -> Result<Result<Found, (anyhow::Error, UnlockError)>> {
+        if target == initrd_target {
+            let error = match back(opening, deadline) {
+                Ok(session) => return Ok(Ok(Found::Back(session))),
+                Err(error) => error,
+            };
+            let unlock = initrd::unlock(ssh, &initrd_target, password, deadline);
+            return Ok(unlock.map(Found::Unlocked).map_err(|unlock_error| (error, unlock_error)));
+        }
+        let agent = initrd::Agent::start(ssh, &initrd_target)?;
+        let (kill_opening, kill_agent) = (opening.killer(), agent.killer());
+        let (back, unlock) = thread::scope(|scope| {
+            let unlocking = scope.spawn(|| {
+                let unlock = agent.unlock(password, deadline);
+                if unlock.is_ok() {
+                    kill_opening.kill();
+                }
+                unlock
+            });
+            let back = back(opening, deadline);
+            if back.is_ok() {
+                kill_agent.kill();
+            }
+            (back, unlocking.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        });
+        // The loser's result means nothing, since it may have been killed.
+        // Both can win, when the kill comes just after the session's checks,
+        // and then the session may be dead; the next try opens a fresh one.
+        Ok(match (back, unlock) {
+            (_, Ok(prompts)) => Ok(Found::Unlocked(prompts)),
+            (Ok(session), Err(_)) => Ok(Found::Back(session)),
+            (Err(error), Err(unlock_error)) => Err((error, unlock_error)),
+        })
+    };
     // Failures to unlock, other than an unreachable initrd, are returned
     // inside Ok so that retry doesn't try again.
     let attempt = |deadline: Deadline| -> Result<Result<Found, UnlockError>> {
-        let error = match back(deadline) {
-            Ok(session) => return Ok(Ok(Found::Back(session))),
-            Err(error) => error,
+        let opening = Opening::start(ssh, &target)?;
+        let Some(password) = password else { return Ok(Ok(Found::Back(back(opening, deadline)?))) };
+        let (error, unlock_error) = match race(opening, password, deadline)? {
+            Ok(found) => return Ok(Ok(found)),
+            Err(errors) => errors,
         };
-        let Some(password) = password else { return Err(error) };
-        match initrd::unlock(ssh, &initrd_target, password, deadline) {
-            Ok(prompts) => Ok(Ok(Found::Unlocked(prompts))),
+        match unlock_error {
             // Until it's unlocked, it's likelier to be at its initrd than up,
             // so it's the initrd's failure that's passed on (like its
             // refusing the user's key), unless ssh_port's is Permanent.
-            Err(UnlockError::Unreachable(stderr)) if error.downcast_ref::<Permanent>().is_none() => {
+            UnlockError::Unreachable(stderr) if error.downcast_ref::<Permanent>().is_none() => {
                 debug!("{target} isn't back: {error:#}");
                 Err(anyhow!(stderr.trim_end().to_string()).context(format!("couldn't reach the initrd at {initrd_target}")))
             }
-            Err(UnlockError::Unreachable(_)) => Err(error),
-            Err(fatal) => Ok(Err(fatal)),
+            UnlockError::Unreachable(_) => Err(error),
+            fatal => Ok(Err(fatal)),
         }
     };
     let found = retry(deadline, RETRY_INTERVAL, attempt, on_retry).with_context(|| format!("{} didn't come back", machine.hostname))?;

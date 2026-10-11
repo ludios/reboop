@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! Child processes whose output can be read as it arrives, without ever
 //! blocking past a deadline.
@@ -32,7 +33,8 @@ fn read_chunk(pipe: &mut impl Read, buffer: &mut [u8]) -> Option<usize> {
 /// threads read its stdout (delivered in chunks) and collect its stderr.  The
 /// process is killed when this is dropped.
 pub struct ChildProcess {
-    child: Child,
+    /// Shared with its [`Killer`]s.
+    child: Arc<Mutex<Child>>,
     program: String,
     /// Shared with the threads that write to it.
     stdin: Option<Arc<Mutex<ChildStdin>>>,
@@ -79,7 +81,12 @@ impl ChildProcess {
         });
 
         let stdin = child.stdin.take().map(|stdin| Arc::new(Mutex::new(stdin)));
-        Ok(ChildProcess { stdin, child, program, stdout: receiver, stderr, stderr_closed })
+        Ok(ChildProcess { stdin, child: Arc::new(Mutex::new(child)), program, stdout: receiver, stderr, stderr_closed })
+    }
+
+    /// A handle that kills the process from another thread.
+    pub fn killer(&self) -> Killer {
+        Killer(Arc::clone(&self.child))
     }
 
     /// Waits for the next chunk of stdout.  Returns `None` once stdout is
@@ -122,7 +129,7 @@ impl ChildProcess {
     /// `deadline`.
     pub fn wait(&mut self, deadline: Deadline) -> Result<ExitStatus> {
         loop {
-            if let Some(status) = self.child.try_wait()? {
+            if let Some(status) = self.child.lock().unwrap().try_wait()? {
                 return Ok(status);
             }
             if deadline.has_passed() {
@@ -143,9 +150,21 @@ impl ChildProcess {
     }
 
     pub fn kill(&mut self) {
+        let mut child = self.child.lock().unwrap();
         // Errors mean it already exited, which is what we want anyway.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Kills a [`ChildProcess`] from another thread, e.g. once whatever it was
+/// racing has won.  Its owner still reads the output it had and reaps it.
+pub struct Killer(Arc<Mutex<Child>>);
+
+impl Killer {
+    pub fn kill(&self) {
+        // Errors mean it already exited.
+        let _ = self.0.lock().unwrap().kill();
     }
 }
 
@@ -183,6 +202,18 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn killer_ends_the_process() {
+        let mut sleep = Command::new("sleep");
+        sleep.arg("10");
+        let mut child = ChildProcess::spawn(sleep).unwrap();
+        let killer = child.killer();
+        thread::spawn(move || killer.kill()).join().unwrap();
+        let (status, _) = child.finish(Deadline::after(Duration::from_secs(5))).unwrap();
+        assert!(!status.success());
+        assert_eq!(child.read_stdout(Deadline::after(Duration::from_secs(5))).unwrap(), None);
     }
 
     #[test]
