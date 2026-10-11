@@ -81,15 +81,20 @@ pub fn luks_devices(session: &mut Session) -> Result<Vec<String>> {
 
 /// After [`FIND_LUKS_DEVICES`], checks that there's one LUKS device, prints
 /// "reboop-luks-device DEVICE", and tests whether the password on stdin
-/// opens it.  (cryptsetup would try PIN-less tokens, like a TPM2's, before
-/// the password.)
+/// opens it.
+///
+/// cryptsetup first tries the device's tokens, which may open it without the
+/// password (a TPM2 token, or a keyring token whose key is loaded), and has
+/// no flag to skip them.  So it's kept from loading plugins for external
+/// tokens, and told to use only a type of token that isn't built in (those
+/// are "luks2-*"), which leaves it none it can use.
 const TEST_LUKS_PASSWORD: &str = r#"
 if [ $# -ne 1 ]; then
     echo "expected one LUKS device beneath / ($root), found $#: $*" >&2
     exit 1
 fi
 echo "reboop-luks-device $1"
-exec cryptsetup luksOpen --test-passphrase --disable-external-tokens --key-file=- "$1"
+exec cryptsetup luksOpen --test-passphrase --disable-external-tokens --token-type=reboop-none --key-file=- "$1"
 "#;
 
 /// Tests whether `password` opens the LUKS device beneath / on the booted

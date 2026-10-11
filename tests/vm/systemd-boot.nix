@@ -2,10 +2,13 @@
 #
 # The test machine that boots with systemd-boot from UEFI, with a
 # LUKS-encrypted btrfs root unlocked over SSH from the initrd on port 23.
-{ sshKeys, ... }:
+{ pkgs, sshKeys, ... }:
 
 {
   imports = [ ./common.nix ];
+
+  # keyctl, for the LUKS password test's keyring token
+  environment.systemPackages = [ pkgs.keyutils ];
 
   boot.loader = {
     systemd-boot.enable = true;

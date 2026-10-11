@@ -628,6 +628,23 @@ fn luks_password_is_tested(vm: &Vm) -> Result<()> {
     let test = |password| initrd::test_luks_password(&vm.ssh, &vm.target, password, Deadline::after(MINUTE));
     assert_eq!(test(vm.luks_password()?)?, ("/dev/vda2".into(), true));
     assert_eq!(test("not the password")?, ("/dev/vda2".into(), false));
+
+    // Even with a keyring token that opens the device by itself, as it does
+    // from another connection: ssh sessions share sshd's session keyring.
+    let mut session = vm.session()?;
+    sh(
+        &mut session,
+        &format!(
+            "cryptsetup token add --token-id 0 --key-description reboop-test /dev/vda2 && \
+             keyctl add user reboop-test {} @s >/dev/null",
+            shell_quote(vm.luks_password()?)
+        ),
+    )?;
+    let token_opens = sh(&mut vm.session()?, "cryptsetup open --test-passphrase --token-only /dev/vda2");
+    let wrong = test("not the password");
+    sh(&mut session, "keyctl purge user reboop-test >/dev/null && cryptsetup token remove --token-id 0 /dev/vda2")?;
+    token_opens?;
+    assert_eq!(wrong?, ("/dev/vda2".into(), false));
     Ok(())
 }
 
