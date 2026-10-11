@@ -1,4 +1,5 @@
 <!-- Model-output: Claude Fable 5.1 -->
+<!-- Model-output: Claude Opus 5.5 -->
 
 This is a special-purpose utility for carefully rebooting a NixOS machine, which works in stages.
 
@@ -6,7 +7,7 @@ This is a special-purpose utility for carefully rebooting a NixOS machine, which
 
 ### AI says:
 
-- Set these on every connection attempt: `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ConnectTimeout=15`, `ServerAliveInterval=5` and `ControlPath=none`
+- Set these on every connection attempt: `BatchMode=yes`, `StrictHostKeyChecking=yes`, `ConnectTimeout=15`, `ServerAliveInterval=5`, `ServerAliveCountMax=3` and `ControlPath=none`
     - `StrictHostKeyChecking=yes` matters if your ssh config says `accept-new`: a first login would otherwise add an impostor's key, which the login that sends the LUKS password would then trust.
     - `ControlPath=none` matters if your ssh config uses `ControlMaster`/`ControlPersist`: a post-reboot attempt can otherwise reuse the dead shared connection and hang.
     - The keepalive matters because the initrd can drop the network without cleanly closing the connection.

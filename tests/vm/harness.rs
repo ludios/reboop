@@ -292,7 +292,9 @@ fn launch(dir: &Path, bundle: &Path, manifest: &Manifest, ports: [u16; 2]) -> Re
 }
 
 /// Writes the client key, known_hosts and an ssh config that uses them (and
-/// nothing from the user's own ssh setup), returning the config's path.
+/// nothing from the user's own ssh setup), returning the config's path.  The
+/// config says StrictHostKeyChecking accept-new, as a user's might, which
+/// reboop has to override.
 fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<PathBuf> {
     let key = dir.join("client_key");
     let _ = fs::remove_file(&key);
@@ -312,7 +314,7 @@ fn write_ssh_files(dir: &Path, manifest: &Manifest, state: &State) -> Result<Pat
         &config,
         format!(
             "Host *\n  IdentityFile \"{}\"\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile \"{}\"\n  \
-             GlobalKnownHostsFile /dev/null\n  StrictHostKeyChecking yes\n  LogLevel ERROR\n",
+             GlobalKnownHostsFile /dev/null\n  StrictHostKeyChecking accept-new\n  LogLevel ERROR\n",
             key.display(),
             known_hosts.display()
         ),

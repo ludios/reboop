@@ -82,13 +82,15 @@ impl Ssh {
     /// An ssh command that logs in to `target` and has root's login shell
     /// run `remote_command`, with extra ssh `options`.
     ///
-    /// The options set here outrank the user's ssh config.  Keepalives
-    /// notice a network that disappeared without closing the connection (as
-    /// when an initrd switches root), ControlPath=none keeps a ControlMaster
-    /// from reusing a connection that died with the previous boot, and
-    /// StrictHostKeyChecking=yes (even where the config says accept-new)
-    /// keeps a login from adding a host key that a later one, perhaps
-    /// sending a secret, would then trust.
+    /// The options set here come first, so they outrank `options`,
+    /// `extra_args` and the user's ssh config (ssh takes an option's first
+    /// value).  Keepalives notice a network that disappeared without closing
+    /// the connection (as when an initrd switches root), ControlPath=none
+    /// keeps a ControlMaster from reusing a connection that died with the
+    /// previous boot, and StrictHostKeyChecking=yes (even where the config
+    /// says accept-new) refuses a host whose key isn't already known, rather
+    /// than saving its key for later logins, perhaps sending a secret, to
+    /// trust.
     pub fn command(&self, target: &Target, options: &[&str], remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
         for option in ["BatchMode=yes", "StrictHostKeyChecking=yes", "ConnectTimeout=15", "ServerAliveInterval=5", "ServerAliveCountMax=3", "ControlPath=none"] {
@@ -369,6 +371,7 @@ mod tests {
         let args: Vec<_> = command.get_args().map(|arg| arg.to_str().unwrap()).collect();
         let tail = ["-T", "-F", "config", "-o", "HostName=10.0.0.1", "-p", "22", "root@one", "--", "true"];
         assert_eq!(args[args.len() - tail.len()..], tail);
+        assert!(args[..args.len() - tail.len()].contains(&"StrictHostKeyChecking=yes"));
     }
 
     #[test]
