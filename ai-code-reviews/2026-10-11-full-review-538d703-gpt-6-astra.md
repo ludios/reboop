@@ -1,0 +1,27 @@
+HEAD 538d703 contains credential-trust, password-validation, and reboot-safety defects. No repository files were modified; verification used fileless reproductions and upstream/NixOS sources, without running the full test suite. A structured systemd password-agent exchange also offers an opportunity to remove fragile terminal-parsing code.
+
+Full review comments:
+
+- [P1] Require strict host-key checking before the first bounce login — /home/at/code/system/reboop/src/bounce.rs:259-260
+  **High.** With `StrictHostKeyChecking=accept-new` or `no` and an unknown host, this preliminary connection automatically stores the server's key. The subsequent password-test connection then passes `StrictHostKeyChecking=yes` because that key is now known. An impersonator that supplies successful preflight responses can therefore receive the stored LUKS password despite the intended strict-checking safeguard. Require established host-key trust before any preliminary bounce connection. The VM harness always uses strict checking, so it does not exercise this bypass.
+
+- [P1] Disable built-in tokens during passphrase verification — /home/at/code/system/reboop/src/initrd.rs:92-92
+  **High.** `--disable-external-tokens` disables plugins, not cryptsetup's built-in LUKS2 keyring token. With that token configured and its passphrase cached, this exact command returns success for an incorrect stdin password; this was reproduced with cryptsetup 2.8.6. Consequently, `set-luks-password` can save a mistyped password and `bounce` can approve it, although the cached key disappears on reboot. Force passphrase-only verification, for example by additionally excluding token types, and add a regression test with a populated keyring token.
+
+- [P1] Honor GRUB entry IDs when resolving the default — /home/at/code/system/reboop/src/boot.rs:203-207
+  **High.** GRUB resolves defaults against entry IDs as well as titles and indices, but this parser discards IDs and falls back to the first entry. For example, with NixOS first and an extra entry titled `Windows` with `--id windows`, `grub-reboot windows` makes GRUB boot Windows while reboop validates the first NixOS entry and approves the reboot. Preserve and resolve entry/submenu IDs using GRUB's matching rules. Existing tests cover titles and indices but not IDs.
+
+- [P1] Detect encrypted roots that use detached LUKS headers — /home/at/code/system/reboop/src/initrd.rs:69-72
+  **High.** NixOS supports detached headers through `boot.initrd.luks.devices.<name>.header`. In that configuration, the underlying data device has no `crypto_LUKS` filesystem signature, and the header is not an ancestor in lsblk's device tree. This filter therefore reports no LUKS devices; `password_for_initrd` skips unlocking and reboots a machine that will wait for its password indefinitely. Inspect encrypted mapping types and resolve their headers, or reject unsupported encrypted layouts before rebooting rather than treating them as unencrypted.
+
+- [P2] Prevent systemd from substituting kexec or soft reboot — /home/at/code/system/reboop/src/reboot.rs:70-70
+  **Medium.** `systemctl reboot` automatically performs kexec when a kernel is loaded, or a soft reboot when `/run/nextroot/` exists, as documented in systemctl(1). The former bypasses the boot-loader configuration that preflight validated; the latter preserves the kernel boot ID, so `wait_for_return` rejects the recovered machine until its 30-minute deadline. Set `SYSTEMCTL_SKIP_AUTO_KEXEC=1` and `SYSTEMCTL_SKIP_AUTO_SOFT_REBOOT=1` for this command, or explicitly detect and refuse these alternatives before stopping services.
+
+- [P2] Prefer bootctl's combined command line over base options — /home/at/code/system/reboop/src/boot.rs:90-90
+  **Medium.** For UKIs with command-line add-ons, bootctl reports both `options` containing the base arguments and `cmdline` containing the combined arguments. Choosing `options` first ignores the add-ons. An add-on that appends `init=/bin/sh`, or supplies an otherwise absent static `ip=`, can therefore evade the system-profile or initrd-address check. Prefer `cmdline` when present and fall back to `options`; add a fixture where both fields exist and differ.
+
+- [P2] Support systemd's silent password prompts — /home/at/code/system/reboop/src/initrd.rs:154-157
+  **Medium.** Setting `boot.initrd.luks.devices.root.crypttabExtraOpts = [ "password-echo=no" ];` makes systemd omit `(press TAB for no echo)`. This was confirmed against systemd's implementation and a local PTY reproduction. Password verification still succeeds before reboot, but this parser never recognizes the actual initrd prompt, leaving the machine locked until the return deadline. Support silent prompts safely or use systemd's structured password-agent protocol instead of recognizing display text, and cover this mode in a VM test.
+
+- [P2] Check configured GRUB mirrors even when directories disappear — /home/at/code/system/reboop/src/boot.rs:292-293
+  **Medium.** A mirror is checked only if its `grub` directory currently exists. If `/boot-fallback/grub` disappears, or that mirror is unmounted, it drops out of the results entirely; an intact primary `/boot` lets preflight approve the machine although firmware could select the broken or stale mirror. This contradicts the advertised check of every mirrored boot directory. Obtain the expected mirror paths independently of their current contents and report missing mirrors. The VM test removes only `grub.cfg`, leaving the discovery directory intact.
