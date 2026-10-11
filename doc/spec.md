@@ -65,7 +65,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - Is an rsync process running?
     - Is a btrfs send or receive running, or cryptsetup?
     - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?
-    - If the machine has smartctl: what SMART says about each whole disk beneath the btrfs filesystems' devices (`lsblk --inverse` from sysfs' devices/*, then `smartctl -n standby -H -A` on all the disks at once, each with a timeout, leaving any in standby asleep, as spinning up can take a minute): its overall health, and the counts of sectors gone bad (ATA attributes 5, 187, 197 and 198 when their names say so, as vendors put other counters there too; for NVMe, the critical warning except its temperature bit, and the media errors). Whatever smartctl could read counts, and what it couldn't is noted.
+    - If the machine has smartctl: what SMART says about each whole disk beneath the btrfs filesystems' devices (`lsblk --inverse` from sysfs' devices/*, then `smartctl -n standby -H -A` on all the disks at once, each with a timeout, leaving any in standby asleep, as spinning up can take a minute, and likewise any whose power mode smartctl can't read, which it takes to be asleep): its overall health, and the counts of sectors gone bad (ATA attributes 5, 187, 197 and 198 when their names say so, as vendors put other counters there too; for NVMe, the critical warning except its temperature bit, and the media errors). Whatever smartctl could read counts, and what it couldn't is noted.
     - Inhibitor locks (logind's ListInhibitors)
     - systemd jobs that last through the network sample
     - How full the root filesystem is (df)

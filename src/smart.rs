@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Model-output: Claude Fable 5.1
 
 //! What SMART says about a machine's disks, via smartctl: whether any is
@@ -17,14 +18,12 @@ const SMARTCTL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a smartctl told to stop has to do so before it's killed.
 const SMARTCTL_KILL_AFTER: Duration = Duration::from_secs(3);
 
-/// How long [`health`] waits for its smartctls at most: long enough past
-/// [`SMARTCTL_TIMEOUT`] and [`SMARTCTL_KILL_AFTER`] for one that stops when
-/// told or killed to count as timed out, and short enough under the
-/// session's [`QUICK`] to leave behind one that can't be killed, being stuck
-/// in the kernel on a disk that doesn't answer.
-pub const PATIENCE: Duration = Duration::from_secs(15);
+/// How long [`health`] takes at most: timeout kills itself along with a
+/// smartctl that doesn't stop when told, so it's done even if that one is
+/// stuck in the kernel on a disk that doesn't answer, and can't die.
+pub const PATIENCE: Duration = SMARTCTL_TIMEOUT.saturating_add(SMARTCTL_KILL_AFTER);
 
-const _: () = assert!(PATIENCE.as_secs() > SMARTCTL_TIMEOUT.as_secs() + SMARTCTL_KILL_AFTER.as_secs() && PATIENCE.as_secs() + 3 < QUICK.as_secs());
+const _: () = assert!(PATIENCE.as_secs() + 3 < QUICK.as_secs());
 
 /// The IDs of the ATA SMART attributes whose raw values count sectors gone
 /// bad: reallocated (5), reported uncorrectable (187), pending reallocation
@@ -163,8 +162,9 @@ impl Smart {
     /// cycle, which a disk with sectors gone bad often doesn't come back
     /// from.
     pub fn trouble(&self) -> Option<String> {
-        let Smart::Read { passed, warnings, .. } = self else {
-            return Some(format!("didn't answer smartctl within {}", human::seconds(SMARTCTL_TIMEOUT.as_secs())));
+        let (passed, warnings) = match self {
+            Smart::NoAnswer { no_answer_within_secs } => return Some(format!("didn't answer smartctl within {}", human::seconds(*no_answer_within_secs))),
+            Smart::Read { passed, warnings, .. } => (passed, warnings),
         };
         let mut signs = Vec::new();
         if *passed == Some(false) {
@@ -177,9 +177,9 @@ impl Smart {
     }
 }
 
-/// Interprets what `smartctl --json -H -A` printed, from its exit `status`,
-/// `stdout` and `stderr`.  Whatever it managed to read counts; what it
-/// didn't is noted as incomplete.
+/// Interprets what `smartctl --json -n standby -H -A` printed, from its
+/// exit `status`, `stdout` and `stderr`.  Whatever it managed to read
+/// counts; what it didn't is noted as incomplete.
 fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
     #[derive(Deserialize)]
     struct Output {
@@ -236,7 +236,9 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
     // saying e.g. "Device is in STANDBY mode, exit(2)".
     let low_power = output.smartctl.messages.iter().find_map(|message| message.string.strip_prefix("Device is in ")?.split_once(" mode, exit(").map(|(mode, _)| mode));
     if let Some(mode) = low_power {
-        return unread(format!("not woken from {mode} mode"));
+        // smartctl takes a disk whose power mode it can't read to be asleep.
+        let unsure = if mode == "SLEEP" { " (or its power mode couldn't be read)" } else { "" };
+        return unread(format!("not woken from {mode} mode{unsure}"));
     }
 
     let mut warnings = BTreeMap::new();
@@ -279,14 +281,14 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
 }
 
 /// Parses what [`health`]'s script prints about each of `disks`: a line with
-/// smartctl's exit status (or "none" if it hasn't finished), then one with
-/// its stdout, then one with its stderr.
+/// the exit status of smartctl's timeout, then one with smartctl's stdout,
+/// then one with its stderr.
 fn parse_health(text: &str, disks: &[Disk]) -> Result<Vec<Smart>> {
     let lines: Vec<&str> = text.lines().collect();
     ensure!(lines.len() == 3 * disks.len(), "expected 3 lines about each of {} disks from smartctl, got:\n{text}", disks.len());
     let smart = lines.chunks(3).map(|lines| {
         let [status, stdout, stderr] = lines else { unreachable!() };
-        if *status == "none" { Smart::NoAnswer { no_answer_within_secs: SMARTCTL_TIMEOUT.as_secs() } } else { parse_smartctl(status, stdout, stderr) }
+        parse_smartctl(status, stdout, stderr)
     });
     Ok(smart.collect())
 }
@@ -310,23 +312,18 @@ pub fn health(session: &mut Session, disks: &[Disk]) -> Result<Vec<Smart>> {
             i=$((i + 1))
             {{ timeout --kill-after={} {} smartctl --json=c -n standby -H -A "$d" >"$t/$i.out" 2>"$t/$i.err"; echo $? >"$t/$i.status"; }} &
         done
-        # Not `wait`: one stuck in the kernel can't stop, and is left behind.
-        n=0
-        while [ "$(ls "$t"/*.status 2>/dev/null | wc -l)" -lt $# ] && [ $n -lt {} ]; do
-            sleep 1
-            n=$((n + 1))
-        done
+        # A smartctl stuck in the kernel is left behind when its timeout ends.
+        wait
         i=0
         for d in "$@"; do
             i=$((i + 1))
-            cat "$t/$i.status" 2>/dev/null || echo none
+            cat "$t/$i.status"
             tr '\n' ' ' <"$t/$i.out"; echo
             tr '\n' ' ' <"$t/$i.err"; echo
         done"#,
         quoted.join(" "),
         SMARTCTL_KILL_AFTER.as_secs(),
-        SMARTCTL_TIMEOUT.as_secs(),
-        PATIENCE.as_secs()
+        SMARTCTL_TIMEOUT.as_secs()
     );
     parse_health(&session.run_ok(&script, QUICK)?, disks)
 }
@@ -429,8 +426,12 @@ mod tests {
         assert_eq!(parse_smartctl("1", UNDETECTED, ""), read(None, &[], Some("/dev/vda: Unable to detect device type")));
         let nothing = parse_smartctl("4", r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"exit_status":4}}"#, "");
         assert_eq!(nothing, read(None, &[], Some("no SMART data (smartctl exited with status 4)")));
-        let standby = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"messages":[{"string":"Device is in STANDBY BY TIMER mode, exit(2)","severity":"information"}],"exit_status":2}}"#;
-        assert_eq!(parse_smartctl("2", standby, ""), read(None, &[], Some("not woken from STANDBY BY TIMER mode")));
+        let standby = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,5],"messages":[{"string":"Device is in STANDBY mode, exit(2)","severity":"information"}],"exit_status":2},"device":{"name":"/dev/sda","type":"sat","protocol":"ATA"},"power_mode":{"ata_value":0,"name":"STANDBY"}}"#;
+        assert_eq!(parse_smartctl("2", standby, ""), read(None, &[], Some("not woken from STANDBY mode")));
+        let scsi_standby = standby.replace("STANDBY mode", "STANDBY BY TIMER mode");
+        assert_eq!(parse_smartctl("2", &scsi_standby, ""), read(None, &[], Some("not woken from STANDBY BY TIMER mode")));
+        let sleep = standby.replace("STANDBY", "SLEEP");
+        assert_eq!(parse_smartctl("2", &sleep, ""), read(None, &[], Some("not woken from SLEEP mode (or its power mode couldn't be read)")));
         // The self-assessment failed to read, but the attributes did: they still count.
         let pending = [(197, "Current_Pending_Sector", 8)];
         let no_status = parse_smartctl("4", &ata_json("", true, &pending, 4), "");
@@ -463,7 +464,7 @@ mod tests {
         let disks = [disk("/dev/sda"), disk("/dev/sdb"), disk("/dev/sdc"), disk("/dev/sdd")];
         // The script puts each smartctl's output on one line.
         let healthy = ata_json(PASSED, true, &[], 0).replace('\n', " ");
-        let text = format!("0\n{healthy}\n\n124\n\n\nnone\n\n\n1\n{UNKNOWN_USB_BRIDGE}\n\n");
+        let text = format!("0\n{healthy}\n\n124\n\n\n137\n\n\n1\n{UNKNOWN_USB_BRIDGE}\n\n");
         let health = parse_health(&text, &disks).unwrap();
         assert_eq!(health[0], read(Some(true), &[], None));
         assert_eq!(health[1], Smart::NoAnswer { no_answer_within_secs: 10 });
