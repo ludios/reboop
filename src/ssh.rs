@@ -162,45 +162,6 @@ fn parse_response(line: &[u8]) -> Result<CommandOutput> {
     })
 }
 
-/// A [`Session`] whose ssh has started but isn't known to be ready to run
-/// commands yet.
-pub struct Opening(Session);
-
-impl Opening {
-    /// Starts logging in to `target`.
-    pub fn start(ssh: &Ssh, target: &Target) -> Result<Opening> {
-        let child = ChildProcess::spawn(ssh.command(target, &["-T"], &sh_c(SESSION_SHELL)))?;
-        Ok(Opening(Session { ssh: child, target: target.clone(), pending: Vec::new(), scanned: 0, broken: false }))
-    }
-
-    /// A handle that kills the ssh from another thread, which makes
-    /// [`Opening::open`] fail.
-    pub fn killer(&self) -> Killer {
-        self.0.ssh.killer()
-    }
-
-    /// Waits until `deadline` for the session to be ready to run commands.
-    /// Failures that trying again won't fix are [`Permanent`].
-    pub fn open(self, deadline: Deadline) -> Result<Session> {
-        let Opening(mut session) = self;
-        loop {
-            // Skip anything that root's shell startup files print.
-            match session.read_line(deadline).with_context(|| format!("failed to open a session to {}", session.target))? {
-                Some(line) if line == SESSION_READY => return Ok(session),
-                Some(_) => {}
-                None => {
-                    let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-                    let target = &session.target;
-                    if is_permanent_failure(&stderr) {
-                        return Err(Permanent(format!("failed to open a session to {target}: {stderr}")).into());
-                    }
-                    return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
-                }
-            }
-        }
-    }
-}
-
 /// A root shell on a remote machine that runs commands one at a time over a
 /// single SSH connection.  (Some users' keys need a touch per connection.)
 ///
@@ -233,14 +194,6 @@ impl Session {
                 None => return Ok(None),
             }
         }
-    }
-
-    /// Logs in to `target` and waits until it's ready to run commands,
-    /// giving up after `timeout`.  Failures that trying again won't fix are
-    /// [`Permanent`].  (See [`Opening`] for a login that another thread may
-    /// cut short.)
-    pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
-        Opening::start(ssh, target)?.open(Deadline::after(timeout))
     }
 
     pub fn target(&self) -> &Target {
@@ -297,6 +250,56 @@ impl Session {
     }
 }
 
+/// A [`Session`] whose ssh has started but isn't known to be ready to run
+/// commands yet.
+pub struct Opening(Session);
+
+impl Opening {
+    /// Starts logging in to `target`.
+    pub fn start(ssh: &Ssh, target: &Target) -> Result<Opening> {
+        let child = ChildProcess::spawn(ssh.command(target, &["-T"], &sh_c(SESSION_SHELL)))?;
+        Ok(Opening(Session { ssh: child, target: target.clone(), pending: Vec::new(), scanned: 0, broken: false }))
+    }
+
+    /// A handle that kills the ssh from another thread, which makes
+    /// [`Opening::open`] fail (or, if the shell was ready just before,
+    /// return a dead session).
+    pub fn killer(&self) -> Killer {
+        self.0.ssh.killer()
+    }
+
+    /// Waits until `deadline` for the session to be ready to run commands.
+    /// Failures that trying again won't fix are [`Permanent`].
+    pub fn open(self, deadline: Deadline) -> Result<Session> {
+        let Opening(mut session) = self;
+        loop {
+            // Skip anything that root's shell startup files print.
+            match session.read_line(deadline).with_context(|| format!("failed to open a session to {}", session.target))? {
+                Some(line) if line == SESSION_READY => return Ok(session),
+                Some(_) => {}
+                None => {
+                    let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
+                    let target = &session.target;
+                    if is_permanent_failure(&stderr) {
+                        return Err(Permanent(format!("failed to open a session to {target}: {stderr}")).into());
+                    }
+                    return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
+                }
+            }
+        }
+    }
+}
+
+impl Session {
+    /// Logs in to `target` and waits until it's ready to run commands,
+    /// giving up after `timeout`.  Failures that trying again won't fix are
+    /// [`Permanent`].  (See [`Opening`] for a login that another thread may
+    /// cut short.)
+    pub fn open(ssh: &Ssh, target: &Target, timeout: Duration) -> Result<Session> {
+        Opening::start(ssh, target)?.open(Deadline::after(timeout))
+    }
+}
+
 /// Tries to open a session to `target` once per `interval` until one
 /// succeeds, `deadline` passes, or a failure is [`Permanent`].
 pub fn wait_for_session(ssh: &Ssh, target: &Target, interval: Duration, deadline: Deadline) -> Result<Session> {
@@ -307,6 +310,27 @@ pub fn wait_for_session(ssh: &Ssh, target: &Target, interval: Duration, deadline
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    #[test]
+    fn killing_an_opening_ends_it() {
+        // Accepts connections but never speaks SSH, so ssh waits for a
+        // banner until its ConnectTimeout.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = Target { name: "reboop-test".into(), address: "127.0.0.1".into(), port: listener.local_addr().unwrap().port() };
+        let opening = Opening::start(&Ssh::default(), &target).unwrap();
+        let killer = opening.killer();
+        let started = Instant::now();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            killer.kill();
+        });
+        let Err(error) = opening.open(Deadline::after(Duration::from_secs(30))) else { panic!("opened a session to nothing") };
+        assert!(started.elapsed() < Duration::from_secs(10), "{error:#}");
+        assert!(error.downcast_ref::<Permanent>().is_none(), "{error:#}");
+    }
 
     #[test]
     fn shell_quote_survives_sh() {

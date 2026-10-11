@@ -163,27 +163,31 @@ fn redact(screen: &[u8], password: &str) -> String {
     String::from_utf8_lossy(screen).replace(password, "<password>")
 }
 
+/// What to run over SSH to the initrd: systemd's password agent, but only
+/// in an initrd (which has /etc/initrd-release), so that whatever else
+/// might answer on the initrd's port, like the booted system, isn't given
+/// the password.  --watch rather than the default --query, which exits if
+/// the initrd hasn't asked for a passphrase yet.
+const AGENT_COMMAND: &str = "test -e /etc/initrd-release || { echo 'not an initrd'; exit 1; }; exec systemd-tty-ask-password-agent --watch";
+
 /// An ssh to the initrd's sshd that runs systemd's password agent there,
 /// which [`Agent::unlock`] answers the passphrase prompts through.
-pub struct Agent {
+pub struct Agent<'a> {
     ssh: ChildProcess,
     target: Target,
+    password: &'a str,
 }
 
-impl Agent {
-    /// Starts connecting to the initrd's sshd at `target`.
+impl<'a> Agent<'a> {
+    /// Checks `password` (see [`check_password`]) and starts connecting to
+    /// the initrd's sshd at `target`.
     ///
     /// Only connects to hosts whose key is already in known_hosts, whatever
     /// the user's ssh config says, since we're sending a secret.
-    pub fn start(ssh: &Ssh, target: &Target) -> Result<Agent> {
-        // --watch rather than the default --query, which exits if the initrd
-        // hasn't asked for a passphrase yet.
-        let command = ssh.command(
-            target,
-            &["-tt", "-o", "EscapeChar=none", "-o", "StrictHostKeyChecking=yes"],
-            "systemd-tty-ask-password-agent --watch",
-        );
-        Ok(Agent { ssh: ChildProcess::spawn(command)?, target: target.clone() })
+    pub fn start(ssh: &Ssh, target: &Target, password: &'a str) -> Result<Agent<'a>, UnlockError> {
+        check_password(password)?;
+        let command = ssh.command(target, &["-tt", "-o", "EscapeChar=none", "-o", "StrictHostKeyChecking=yes"], AGENT_COMMAND);
+        Ok(Agent { ssh: ChildProcess::spawn(command)?, target: target.clone(), password })
     }
 
     /// A handle that kills the ssh from another thread, which ends
@@ -193,15 +197,14 @@ impl Agent {
         self.ssh.killer()
     }
 
-    /// Answers each passphrase prompt with `password`.
+    /// Answers each passphrase prompt with the password.
     ///
     /// Returns the prompts it answered once the connection closes, or once
     /// [`SETTLE`] (or `deadline`) passes after the last answer with no new
-    /// prompt.  Fails if a prompt comes back, since that means `password` is
-    /// wrong.
-    pub fn unlock(self, password: &str, deadline: Deadline) -> Result<Vec<String>, UnlockError> {
-        check_password(password)?;
-        let Agent { ssh: mut child, target } = self;
+    /// prompt.  Fails if a prompt comes back, since that means the password
+    /// is wrong.
+    pub fn unlock(self, deadline: Deadline) -> Result<Vec<String>, UnlockError> {
+        let Agent { ssh: mut child, target, password } = self;
         // Output since the last answer
         let mut screen = Vec::new();
         let mut received_output = false;
@@ -254,7 +257,7 @@ impl Agent {
 /// Connects to the initrd's sshd at `target` and answers its passphrase
 /// prompts with `password` (see [`Agent::unlock`]).
 pub fn unlock(ssh: &Ssh, target: &Target, password: &str, deadline: Deadline) -> Result<Vec<String>, UnlockError> {
-    Agent::start(ssh, target)?.unlock(password, deadline)
+    Agent::start(ssh, target, password)?.unlock(deadline)
 }
 
 #[cfg(test)]

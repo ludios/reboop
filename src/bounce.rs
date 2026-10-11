@@ -13,7 +13,7 @@ use crate::config::{self, Machine};
 use crate::deadline::{Deadline, Permanent, retry};
 use crate::facts::{self, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
-use crate::initrd::{self, UnlockError};
+use crate::initrd::{self, Agent, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Down, Stopped};
@@ -351,42 +351,45 @@ fn wait_for_return(
         ensure!(facts::system_state(&mut session)? != "stopping", "it's shutting down");
         Ok(session)
     };
-    // Logs in through `opening` and unlocks the initrd with `password` at
+    // Logs in through `opening` and unlocks the initrd through `agent` at
     // once, killing the loser's ssh, since a connection to a machine that's
     // down can take ssh's ConnectTimeout to fail, which would hold up the
     // other.  Returns both errors when neither wins.
-    let race = |opening: Opening, password: &str, deadline: Deadline| -> Result<Result<Found, (anyhow::Error, UnlockError)>> {
-        let agent = initrd::Agent::start(ssh, &initrd_target)?;
+    let race = |opening: Opening, agent: Agent<'_>, deadline: Deadline| -> Result<Found, (anyhow::Error, UnlockError)> {
         let (kill_opening, kill_agent) = (opening.killer(), agent.killer());
-        let (back, unlock) = thread::scope(|scope| {
+        let (came_back, unlocked) = thread::scope(|scope| {
             let unlocking = scope.spawn(|| {
-                let unlock = agent.unlock(password, deadline);
-                if unlock.is_ok() {
+                let unlocked = agent.unlock(deadline);
+                if unlocked.is_ok() {
                     kill_opening.kill();
                 }
-                unlock
+                unlocked
             });
-            let back = back(opening, deadline);
-            if back.is_ok() {
+            let came_back = back(opening, deadline);
+            if came_back.is_ok() {
                 kill_agent.kill();
             }
-            (back, unlocking.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            (came_back, unlocking.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
         });
         // The loser's result means nothing, since it may have been killed.
         // Both can win, when the kill comes just after the session's checks,
         // and then the session may be dead; the next try opens a fresh one.
-        Ok(match (back, unlock) {
+        match (came_back, unlocked) {
             (_, Ok(prompts)) => Ok(Found::Unlocked(prompts)),
             (Ok(session), Err(_)) => Ok(Found::Back(session)),
             (Err(error), Err(unlock_error)) => Err((error, unlock_error)),
-        })
+        }
     };
     // Failures to unlock, other than an unreachable initrd, are returned
     // inside Ok so that retry doesn't try again.
     let attempt = |deadline: Deadline| -> Result<Result<Found, UnlockError>> {
         let opening = Opening::start(ssh, &target)?;
         let Some(password) = password else { return Ok(Ok(Found::Back(back(opening, deadline)?))) };
-        let (error, unlock_error) = match race(opening, password, deadline)? {
+        let agent = match Agent::start(ssh, &initrd_target, password) {
+            Ok(agent) => agent,
+            Err(fatal) => return Ok(Err(fatal)),
+        };
+        let (error, unlock_error) = match race(opening, agent, deadline) {
             Ok(found) => return Ok(Ok(found)),
             Err(errors) => errors,
         };
