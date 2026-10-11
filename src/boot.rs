@@ -70,8 +70,10 @@ struct BootctlEntry {
     /// A UKI or other EFI program, with its command line built in
     efi: Option<String>,
     initrd: Option<Vec<String>>,
+    /// The entry's own command line, or a UKI's built-in one
     options: Option<String>,
-    /// The whole command line, including a UKI's
+    /// The command line it boots: `options` and those of any UKI add-ons
+    /// (older bootctl shows only `options`)
     cmdline: Option<String>,
 }
 
@@ -87,7 +89,7 @@ fn parse_bootctl(json: &str) -> Result<Option<DefaultBoot>> {
     Ok(Some(DefaultBoot {
         loader: "systemd-boot".into(),
         entry: entry.id,
-        options: entry.options.or(entry.cmdline).unwrap_or_default(),
+        options: entry.cmdline.or(entry.options).unwrap_or_default(),
         files,
         missing_files: vec![],
     }))
@@ -474,10 +476,10 @@ mod tests {
         assert!(parse_bootctl("[]").unwrap().is_none());
         assert!(parse_bootctl(&json.replace("false", "true")).is_err());
 
-        // A UKI, with its command line built in
-        let uki = r#"[{"type":"type2","id":"nixos-30.efi","root":"/boot","efi":"/EFI/Linux/nixos-30.efi","cmdline":"init=/nix/store/abc-nixos-system/init","isDefault":true}]"#;
+        // A UKI, with its command line built in, and an add-on's after it
+        let uki = r#"[{"type":"type2","id":"nixos-30.efi","root":"/boot","efi":"/EFI/Linux/nixos-30.efi","options":"init=/nix/store/abc-nixos-system/init","cmdline":"init=/nix/store/abc-nixos-system/init init=/nix/store/def-nixos-system/init","isDefault":true}]"#;
         let boot = parse_bootctl(uki).unwrap().unwrap();
-        assert_eq!((boot.system(), &boot.files[..]), (Some("/nix/store/abc-nixos-system"), &["/boot/EFI/Linux/nixos-30.efi".to_string()][..]));
+        assert_eq!((boot.system(), &boot.files[..]), (Some("/nix/store/def-nixos-system"), &["/boot/EFI/Linux/nixos-30.efi".to_string()][..]));
     }
 
     #[test]
