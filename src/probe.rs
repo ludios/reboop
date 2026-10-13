@@ -1,7 +1,7 @@
 // Model-output: Claude Opus 5.5
 // Model-output: Claude Fable 5.1
 
-//! `reboop check`: whether machines are okay to reboot, why they need one,
+//! `reboop probe`: whether machines are okay to reboot, why they need one,
 //! and the facts behind the answers.
 
 use crate::btrfs::{Device, ScrubState};

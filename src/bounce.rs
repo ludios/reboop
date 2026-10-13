@@ -246,14 +246,14 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
     Ok((stopped, problems))
 }
 
-/// What a check of a machine found: what was wanted if it's okay to take
+/// What a probe of a machine found: what was wanted if it's okay to take
 /// down, or else the reasons not to.
-type Checked<T> = Result<T, Vec<String>>;
+type Probed<T> = Result<T, Vec<String>>;
 
 /// Opens a session to `machine` and checks whether it's okay to take
 /// `down`, telling the user.  Returns the session and the facts if so, or
 /// else the reasons not to.
-fn check(ssh: &Ssh, machine: &Machine, down: Down, printer: &mut Printer) -> Result<Checked<(Session, Facts)>> {
+fn probe(ssh: &Ssh, machine: &Machine, down: Down, printer: &mut Printer) -> Result<Probed<(Session, Facts)>> {
     let hostname = &machine.hostname;
     printer.line(&format!("Checking whether {hostname} is okay to {}", down.verb()));
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
@@ -287,7 +287,7 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
 /// which `luks` is for), telling the user.  Returns the facts and the
 /// problems so far (services that didn't stop cleanly) if so; or else the
 /// reasons not to, leaving the stop_services stopped and saying so.
-fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Checked<(Facts, Vec<String>)>> {
+fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Probed<(Facts, Vec<String>)>> {
     let hostname = &machine.hostname;
     let (stopped, problems) = stop_services(machine, session, printer)?;
     let still_stopped = |printer: &mut Printer| {
@@ -547,7 +547,7 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<String>, printer: &mut Printer) -> Result<Outcome> {
     let hostname = &machine.hostname;
     let not_rebooted = || format!("didn't reboot {hostname}");
-    let (mut session, facts) = match check(ssh, machine, Down::Reboot, printer).with_context(not_rebooted)? {
+    let (mut session, facts) = match probe(ssh, machine, Down::Reboot, printer).with_context(not_rebooted)? {
         Ok(okay) => okay,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
@@ -624,7 +624,7 @@ fn wait_for_down(ssh: &Ssh, machine: &Machine, deadline: Deadline, on_retry: imp
 pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Outcome> {
     let hostname = &machine.hostname;
     let not_stopped = || format!("didn't shut down {hostname}");
-    let (mut session, facts) = match check(ssh, machine, Down::Shutdown, printer).with_context(not_stopped)? {
+    let (mut session, facts) = match probe(ssh, machine, Down::Shutdown, printer).with_context(not_stopped)? {
         Ok(okay) => okay,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };

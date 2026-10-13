@@ -5,7 +5,7 @@ use anstream::AutoStream;
 use anstream::stream::RawStream;
 use clap::{ColorChoice, Parser};
 use mimalloc::MiMalloc;
-use reboop::{bounce, check, luks_password};
+use reboop::{bounce, probe, luks_password};
 use std::process::ExitCode;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
@@ -28,8 +28,8 @@ enum ReboopCommand {
     /// Show whether machines are okay to reboot, why they need one (if they
     /// do), and the facts behind that.
     /// Exits 0 if all are, 2 if any isn't, or 1 if any couldn't be checked.
-    #[clap(name = "check")]
-    Check {
+    #[clap(name = "probe")]
+    Probe {
         /// Machines from machines.jsonl (default: all of them)
         hostnames: Vec<String>,
         /// Print JSON instead of a table
@@ -38,7 +38,7 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
-    /// Reboot a machine if it's okay to (see check), unlock its LUKS device
+    /// Reboot a machine if it's okay to (see probe), unlock its LUKS device
     /// from the initrd if it has one, show how it came back, and scrub its
     /// btrfs filesystems.
     /// Exits 0 if it came back fine, 2 if it wasn't okay to reboot, or 1 if
@@ -63,7 +63,7 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
-    /// Shut down a machine if it's okay to (see check), and wait for it to
+    /// Shut down a machine if it's okay to (see probe), and wait for it to
     /// stop accepting SSH.
     /// Exits 0 if it went down fine, 2 if it wasn't okay to shut down, or 1
     /// if it went down with problems or something failed.
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        ReboopCommand::Check { hostnames, json, color: ColorOption { color } } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
+        ReboopCommand::Probe { hostnames, json, color: ColorOption { color } } => probe::run(&hostnames, json, styles(&std::io::stdout(), color)),
         ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Catch { hostname, color: ColorOption { color } } => bounce::run_catch(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Stop { hostname, color: ColorOption { color } } => bounce::run_stop(&hostname, styles(&std::io::stdout(), color)),
@@ -146,14 +146,14 @@ mod tests {
     #[test]
     fn parses_arguments() {
         ReboopCommand::command().debug_assert();
-        let color = |args: &[&str]| match ReboopCommand::try_parse_from([&["reboop", "check"], args].concat()).unwrap() {
-            ReboopCommand::Check { color: ColorOption { color }, .. } => color,
+        let color = |args: &[&str]| match ReboopCommand::try_parse_from([&["reboop", "probe"], args].concat()).unwrap() {
+            ReboopCommand::Probe { color: ColorOption { color }, .. } => color,
             command => panic!("parsed as {command:?}"),
         };
         assert_eq!(color(&["one"]), ColorChoice::Auto);
         assert_eq!(color(&["--color", "never", "one"]), ColorChoice::Never);
         assert_eq!(color(&["--color=always", "--color=never"]), ColorChoice::Never);
-        assert!(ReboopCommand::try_parse_from(["reboop", "check", "--color", "one"]).is_err());
+        assert!(ReboopCommand::try_parse_from(["reboop", "probe", "--color", "one"]).is_err());
 
         match ReboopCommand::try_parse_from(["reboop", "bounce", "--color=never", "one"]).unwrap() {
             ReboopCommand::Bounce { hostname, color: ColorOption { color } } => assert_eq!((hostname.as_str(), color), ("one", ColorChoice::Never)),

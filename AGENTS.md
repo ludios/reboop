@@ -8,7 +8,7 @@ checks      = ["cargo"]
 
 [extra]
 checks = """
-That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop check`'s table), only compile them, and run just the unit tests:
+That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop probe`'s table), only compile them, and run just the unit tests:
 
 	cargo test --no-run && cargo test --lib --bins"""
 -->
@@ -96,7 +96,7 @@ At the workspace root:
 
 	cargo test
 
-That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop check`'s table), only compile them, and run just the unit tests:
+That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop probe`'s table), only compile them, and run just the unit tests:
 
 	cargo test --no-run && cargo test --lib --bins
 

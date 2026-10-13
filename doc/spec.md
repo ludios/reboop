@@ -75,7 +75,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - The Linux kernel we're currenty on
     - The NixOS configuration and kernel we expect to boot into by default
     - What the boot loader will boot by default: systemd-boot's default entry (`bootctl list`, which includes one-shot entries), or GRUB's in each /boot with a grub/grub.cfg (mirroredBoots), including grub-reboot's next_entry
-    - The kernel, kernel modules and initrd the machine booted with, the systemd PID 1 runs (switching re-executes it), and the system profile's, so `reboop check` can say why a reboot is needed: "new system" if the profile isn't the current configuration, and "new X" or "rebuilt X" for each part the profile has another version or build of (a kernel's modules and initrd come with it)
+    - The kernel, kernel modules and initrd the machine booted with, the systemd PID 1 runs (switching re-executes it), and the system profile's, so `reboop probe` can say why a reboot is needed: "new system" if the profile isn't the current configuration, and "new X" or "rebuilt X" for each part the profile has another version or build of (a kernel's modules and initrd come with it)
 
 2. Decide whether the machine is okay to reboot.
 
@@ -87,7 +87,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - If any rsync process running, no.
     - If a btrfs send or receive, or cryptsetup, is running, no.
     - If a btrfs device is missing (the filesystem wouldn't mount at boot without the degraded option) or has had errors, no.
-    - If a disk's SMART self-assessment failed, or any of those counts is above zero, or smartctl got no answer from the disk within its timeout, no. (A disk whose SMART smartctl can't read, like a virtual one or one in standby, doesn't count, but `reboop check` marks it.)
+    - If a disk's SMART self-assessment failed, or any of those counts is above zero, or smartctl got no answer from the disk within its timeout, no. (A disk whose SMART smartctl can't read, like a virtual one or one in standby, doesn't count, but `reboop probe` marks it.)
     - If an inhibitor lock asks for no shutdown (mode block or block-weak), no.
     - If a systemd job has lasted 5 seconds, no.
     - If the root filesystem is root_full_percent (97%) used or more, no.
