@@ -265,6 +265,7 @@ pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
 pub(crate) fn idle_facts() -> Facts {
     let system = "/nix/store/aaa-nixos-system-one-26.05".to_string();
     let scrub = ScrubStatus {
+        uuid: "4c8a".into(),
         state: ScrubState::Finished,
         started: Some("Mon Sep 28 10:00:00 2026".into()),
         total_bytes: Some(1_000_000),

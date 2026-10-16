@@ -149,7 +149,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
     Whether we booted into the Linux kernel we expected
 
-4. Unless `/var/lib/reboop/last-clean-scrub/UUID` (the filesystem's) exists and was modified less than scrub_every_days days ago by the machine's clock, run:
+4. Unless `btrfs scrub status` says the latest scrub finished without errors, and `/var/lib/reboop/last-clean-scrub/UUID` (the filesystem's) exists and was modified less than scrub_every_days days ago by the machine's clock, run:
 
     `btrfs scrub start /`
 
@@ -161,7 +161,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
     If any errors are found, print a very loud warning and return non-0 exit status.
 
-    If the scrub finished without errors, `touch` that file (and make its directory if need be); otherwise remove it, so that the next reboot brings a scrub.
+    If the scrub finished without errors, `touch` that file (and make its directory if need be); otherwise remove it, so that the next reboot brings a scrub. Show the scrub's result first, and report a failure to record it as a problem of its own.
 
 ## Catch
 

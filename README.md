@@ -10,7 +10,7 @@ Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:
 3. Stops the machine's `stop_services` (e.g. PostgreSQL), checks again that it's okay to reboot (apart from load and network traffic, which stopping services changes), and reboots. If it's no longer okay, it leaves the services stopped and says so.
 4. Unlocks LUKS (if any) by SSHing into the systemd initrd.
 5. Once booted, shows kernel errors, failed units, and whether the expected NixOS system and kernel came up.
-6. Scrubs btrfs, failing loudly on errors, unless a scrub found the filesystem clean less than `scrub_every_days` (14 by default) days ago. It remembers that in `/var/lib/reboop/last-clean-scrub/` on the machine, in a file named by the filesystem's UUID whose modification time is when the scrub ended; a scrub that finds errors removes it. Delete the file to get a scrub at the next bounce, or touch it to put one off.
+6. Scrubs btrfs, failing loudly on errors, unless a scrub found the filesystem clean less than `scrub_every_days` (14 by default) days ago, and `btrfs scrub status` agrees that the latest scrub finished clean. It remembers the scrubs it saw in `/var/lib/reboop/last-clean-scrub/` on the machine, in a file named by the filesystem's UUID whose modification time is when one last finished clean; one that doesn't removes it. Delete the file to get a scrub at the next bounce, or touch it to put one off.
 
 `reboop catch HOSTNAME` does steps 4 to 6 for a machine that was rebooted some other way, like by hand or by a power cut, or whose bounce was cut short. If the machine is already up, it checks the boot it's in.
 

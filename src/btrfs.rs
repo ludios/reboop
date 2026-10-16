@@ -56,17 +56,6 @@ pub fn filesystems(session: &mut Session) -> Result<Vec<Filesystem>> {
     parse_findmnt(&output.stdout_text())
 }
 
-/// The UUID of the btrfs filesystem mounted at `mountpoint`.
-pub fn uuid(session: &mut Session, mountpoint: &str) -> Result<String> {
-    let output = session.run(&format!("findmnt --noheadings --types btrfs --output UUID --mountpoint {}", shell_quote(mountpoint)), QUICK)?;
-    // findmnt exits 1 without output when nothing matches.
-    ensure!(output.status == 0 || (output.status == 1 && output.stdout.is_empty()), "findmnt exited with status {}: {}", output.status, output.stderr_text());
-    let uuid = output.stdout_text().trim().to_string();
-    ensure!(!uuid.is_empty(), "no btrfs filesystem is mounted at {mountpoint}");
-    ensure!(uuid.len() == 36 && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "findmnt says the UUID of {mountpoint} is {uuid:?}");
-    Ok(uuid)
-}
-
 /// The exclusive operation (balance, device replace, add, remove, resize…)
 /// in progress on `filesystem`, or "none".  Includes "balance paused".
 pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Result<String> {
@@ -196,6 +185,8 @@ pub enum ScrubState {
 /// The state of the latest scrub of a filesystem.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScrubStatus {
+    /// The filesystem's UUID.
+    pub uuid: String,
     pub state: ScrubState,
     /// When the scrub started or was last resumed, as btrfs-progs prints it.
     pub started: Option<String>,
@@ -263,6 +254,10 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
         None if raw.contains("no stats available") => ScrubState::NeverRan,
         other => bail!("unknown scrub state {other:?}\n{}", context()),
     };
+    let uuid = fields.get("UUID").ok_or_else(|| anyhow!("no UUID\n{}", context()))?;
+    // It names the filesystem's file in LAST_CLEAN_SCRUB_DIR, so it had
+    // better look like one.
+    ensure!(!uuid.is_empty() && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "odd UUID {uuid:?}\n{}", context());
     let errors = nonzero_counters(ERROR_COUNTERS, counter).with_context(context)?;
     // Counters only grow, so errors in the earlier summary must show up in
     // the later counters, or we're missing a counter.
@@ -274,6 +269,7 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     };
 
     Ok(ScrubStatus {
+        uuid: uuid.clone(),
         state,
         started: fields.get("Scrub started").or(fields.get("Scrub resumed")).cloned(),
         total_bytes: estimate("Total to scrub", " ").with_context(context)?,
@@ -366,50 +362,6 @@ pub fn wait_for_scrub(
     }
 }
 
-/// Where a machine remembers when reboop last saw a scrub of each of its
-/// btrfs filesystems finish without errors: a file named by the
-/// filesystem's UUID, with that time as its modification time.  Deleting
-/// one brings a scrub at the next bounce, and touching one puts it off.
-pub const LAST_CLEAN_SCRUB_DIR: &str = "/var/lib/reboop/last-clean-scrub";
-
-/// Parses what the script in [`last_clean_scrub`] prints: nothing if there's
-/// no record, or else its age in seconds, which is negative if the clock has
-/// been set back since.
-fn parse_age(text: &str) -> Result<Option<Duration>> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let seconds: i64 = text.parse().with_context(|| format!("unexpected age of the last clean scrub: {text:?}"))?;
-    // A record from the future means that the clock was wrong when it was
-    // made or is now, so how long ago the scrub was is anyone's guess.
-    Ok(u64::try_from(seconds).ok().map(Duration::from_secs))
-}
-
-/// How long ago, by the machine's clock, reboop last saw a scrub of the
-/// filesystem with `uuid` finish without errors, if it has (see
-/// [`note_scrub`]) and the clock doesn't put that in the future.
-pub fn last_clean_scrub(session: &mut Session, uuid: &str) -> Result<Option<Duration>> {
-    let marker = shell_quote(&format!("{LAST_CLEAN_SCRUB_DIR}/{uuid}"));
-    let script = format!("if [ -e {marker} ]; then echo $(( $(date +%s) - $(stat -c %Y -- {marker}) )); fi");
-    parse_age(&session.run_ok(&script, QUICK)?)
-}
-
-/// Records how a scrub of the filesystem with `uuid` ended, for
-/// [`last_clean_scrub`]: a clean one as the latest, and any other by
-/// forgetting the latest, so that the next bounce scrubs again.
-pub fn note_scrub(session: &mut Session, uuid: &str, status: &ScrubStatus) -> Result<()> {
-    assert!(status.state != ScrubState::Running, "a scrub that's still running hasn't ended");
-    let marker = shell_quote(&format!("{LAST_CLEAN_SCRUB_DIR}/{uuid}"));
-    let script = if status.is_clean() {
-        format!("mkdir -p -- {} && touch -- {marker}", shell_quote(LAST_CLEAN_SCRUB_DIR))
-    } else {
-        format!("rm -f -- {marker}")
-    };
-    session.run_ok(&script, QUICK)?;
-    Ok(())
-}
-
 impl ScrubStatus {
     /// Whether the scrub finished and found no errors.
     pub fn is_clean(&self) -> bool {
@@ -441,6 +393,54 @@ impl ScrubStatus {
     }
 }
 
+/// Where a machine remembers when reboop last saw a scrub of each of its
+/// btrfs filesystems finish without errors: a file named by the
+/// filesystem's UUID, with that time as its modification time.
+pub const LAST_CLEAN_SCRUB_DIR: &str = "/var/lib/reboop/last-clean-scrub";
+
+/// The file in [`LAST_CLEAN_SCRUB_DIR`] for the filesystem with `uuid`.
+fn last_clean_scrub_marker(uuid: &str) -> String {
+    format!("{LAST_CLEAN_SCRUB_DIR}/{uuid}")
+}
+
+/// Parses what the script in [`last_clean_scrub`] prints: nothing if there's
+/// no record, or else its age in seconds, which is negative if the clock has
+/// been set back since.
+fn parse_age(text: &str) -> Result<Option<Duration>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let seconds: i64 = text.parse().with_context(|| format!("unexpected age of the last clean scrub: {text:?}"))?;
+    // A record from the future means that the clock was wrong when it was
+    // made or is now, so how long ago the scrub was is anyone's guess.
+    Ok(u64::try_from(seconds).ok().map(Duration::from_secs))
+}
+
+/// How long ago, by the machine's clock, reboop last saw a scrub of the
+/// filesystem with `uuid` finish without errors, if it has (see
+/// [`note_scrub`]) and the clock doesn't put that in the future.
+pub fn last_clean_scrub(session: &mut Session, uuid: &str) -> Result<Option<Duration>> {
+    let marker = shell_quote(&last_clean_scrub_marker(uuid));
+    let script = format!("if [ -e {marker} ]; then echo $(( $(date +%s) - $(stat -c %Y -- {marker}) )); fi");
+    parse_age(&session.run_ok(&script, QUICK)?)
+}
+
+/// Records how the scrub that ended with `status` went, for
+/// [`last_clean_scrub`]: a clean one as the latest, and any other by
+/// forgetting the latest.
+pub fn note_scrub(session: &mut Session, status: &ScrubStatus) -> Result<()> {
+    assert!(status.state != ScrubState::Running, "a scrub that's still running hasn't ended");
+    let marker = shell_quote(&last_clean_scrub_marker(&status.uuid));
+    let script = if status.is_clean() {
+        format!("mkdir -p -- {} && touch -- {marker}", shell_quote(LAST_CLEAN_SCRUB_DIR))
+    } else {
+        format!("rm -f -- {marker}")
+    };
+    session.run_ok(&script, QUICK)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +465,7 @@ mod tests {
         assert_eq!(
             status,
             ScrubStatus {
+                uuid: "4c8a".into(),
                 state: ScrubState::Running,
                 started: Some("Mon Sep 28 10:00:00 2026".into()),
                 total_bytes: Some(391_560_000_000),
@@ -513,6 +514,8 @@ mod tests {
         let without_csum = RAW_COUNTERS.replace("\tcsum_errors: 0\n", "");
         assert!(parse_scrub_status(summary, &raw("x", "finished", &without_csum)).is_err());
         assert!(parse_scrub_status(summary, &raw("x", "exploded", RAW_COUNTERS)).is_err());
+        assert!(parse_scrub_status(summary, &raw("x", "finished", RAW_COUNTERS).replace("UUID:             4c8a\n", "")).is_err());
+        assert!(parse_scrub_status(summary, &raw("x", "finished", RAW_COUNTERS).replace("4c8a", "../4c8a")).is_err());
         // Errors that the counters we know don't account for
         let with_errors = summary.replace("no errors found", "novel=1");
         assert!(parse_scrub_status(&with_errors, &raw("x", "finished", RAW_COUNTERS)).is_err());

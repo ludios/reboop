@@ -40,7 +40,7 @@ enum ReboopCommand {
     },
     /// Reboot a machine if it's okay to (see probe), unlock its LUKS device
     /// from the initrd if it has one, show how it came back, and scrub its
-    /// btrfs filesystems.
+    /// btrfs filesystems, unless a scrub found them clean lately.
     /// Exits 0 if it came back fine, 2 if it wasn't okay to reboot, or 1 if
     /// it came back with problems or something failed.
     #[clap(name = "bounce")]
@@ -53,7 +53,7 @@ enum ReboopCommand {
     /// Do what bounce does after the reboot, for a machine that was rebooted
     /// some other way, or whose bounce was cut short: unlock its LUKS device
     /// from the initrd if it's waiting there, show how it came back, and
-    /// scrub its btrfs filesystems.
+    /// scrub its btrfs filesystems, unless a scrub found them clean lately.
     /// Exits 0 if it came back fine, or 1 if it came back with problems or
     /// something failed.
     #[clap(name = "catch")]

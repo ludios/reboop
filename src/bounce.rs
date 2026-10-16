@@ -3,12 +3,13 @@
 
 //! `reboop bounce`: reboots a machine that's okay to reboot, unlocks its
 //! LUKS device from the initrd if it has one, shows how it came back, and
-//! scrubs its btrfs filesystems; `reboop catch`, which does what comes
-//! after the reboot, for a machine that was rebooted some other way; and
-//! `reboop stop`, which shuts down a machine that's okay to shut down.
+//! scrubs its btrfs filesystems, unless a scrub found them clean lately;
+//! `reboop catch`, which does what comes after the reboot, for a machine
+//! that was rebooted some other way; and `reboop stop`, which shuts down a
+//! machine that's okay to shut down.
 
 use crate::boot::DefaultBoot;
-use crate::btrfs::{self, ScrubState, ScrubStatus};
+use crate::btrfs::{self, ScrubState};
 use crate::config::{self, Machine};
 use crate::deadline::{Deadline, Permanent, retry};
 use crate::facts::{self, Systems};
@@ -459,21 +460,24 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
 }
 
 /// Scrubs the btrfs filesystem mounted at `mountpoint`, or waits for the
-/// scrub that's already running there, showing its progress, and records
-/// how it ended for next time.  Returns its final status; or, if a scrub
-/// found the filesystem clean less than `every_days` days ago, says so and
-/// returns `None` without scrubbing.
-fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut Printer) -> Result<Option<ScrubStatus>> {
-    let uuid = btrfs::uuid(session, mountpoint)?;
-    if let Some(ago) = btrfs::last_clean_scrub(session, &uuid)?
+/// scrub that's already running there, showing its progress; shows how it
+/// ended; and records that for next time.  Unless the latest scrub found
+/// the filesystem clean less than `every_days` days ago by that record, and
+/// btrfs-progs' own record agrees that it ended clean: then just says so.
+/// Returns the problems: a scrub that didn't end clean, or a failure to
+/// record how it went (none if all is well).
+fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut Printer) -> Result<Vec<String>> {
+    let latest = btrfs::scrub_status(session, mountpoint)?;
+    if latest.is_clean()
+        && let Some(ago) = btrfs::last_clean_scrub(session, &latest.uuid)?
         && ago < Duration::from_secs(u64::from(every_days) * 24 * 60 * 60)
     {
         let ago = human::seconds(ago.as_secs());
         printer.line(&format!("Not scrubbing btrfs on {}, which a scrub found clean {ago} ago (scrub_every_days is {every_days})", printer.bold(mountpoint)));
-        return Ok(None);
+        return Ok(vec![]);
     }
     // Such as one started by a timer that came due while the machine was down
-    if btrfs::scrub_status(session, mountpoint)?.state == ScrubState::Running {
+    if latest.state == ScrubState::Running {
         printer.line(&format!("Waiting for the scrub that's already running on {}", printer.bold(mountpoint)));
     } else {
         printer.line(&format!("Scrubbing btrfs on {}", printer.bold(mountpoint)));
@@ -482,8 +486,23 @@ fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut
     let status = btrfs::wait_for_scrub(session, mountpoint, SCRUB_INTERVAL, Deadline::after(SCRUB_TIMEOUT), |status| {
         printer.progress(&format!("btrfs on {mountpoint}: {}", status.summary()));
     })?;
-    btrfs::note_scrub(session, &uuid, &status)?;
-    Ok(Some(status))
+    let summary = format!("btrfs on {mountpoint}: {}", status.summary());
+    if status.errors.is_empty() {
+        printer.line(&summary);
+    } else {
+        printer.alarm(&summary);
+    }
+    let mut problems = Vec::new();
+    if !status.is_clean() {
+        problems.push(summary);
+    }
+    // Shown and judged first, so that trouble recording it can't hide it
+    if let Err(error) = btrfs::note_scrub(session, &status) {
+        let problem = format!("btrfs on {mountpoint}: couldn't record how the scrub went: {error:#}");
+        printer.styled_line(Red, &problem);
+        problems.push(problem);
+    }
+    Ok(problems)
 }
 
 /// Waits for `machine` to come back from a reboot, out of boot `old_boot_id`
@@ -515,24 +534,13 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
     let mut problems = postflight(&mut session, &machine.hostname, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
-        let status = match scrub(&mut session, mountpoint, machine.scrub_every_days, printer) {
-            Ok(Some(status)) => status,
-            Ok(None) => continue,
+        match scrub(&mut session, mountpoint, machine.scrub_every_days, printer) {
+            Ok(found) => problems.extend(found),
             Err(error) => {
                 let problem = format!("btrfs on {mountpoint}: couldn't scrub: {error:#}");
                 printer.styled_line(Red, &problem);
                 problems.push(problem);
-                continue;
             }
-        };
-        let summary = format!("btrfs on {mountpoint}: {}", status.summary());
-        if status.errors.is_empty() {
-            printer.line(&summary);
-        } else {
-            printer.alarm(&summary);
-        }
-        if !status.is_clean() {
-            problems.push(summary);
         }
     }
     Ok(problems)
@@ -554,7 +562,8 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 /// apart from load and network traffic (leaving the stop_services stopped if
 /// it's no longer okay); reboots it; answers its initrd's password prompt;
 /// waits for it to come back; shows how it did; and scrubs its
-/// scrub_mounts.  Problems along the way are collected for the end.
+/// scrub_mounts, unless a scrub found them clean lately (see [`scrub`]).
+/// Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
 /// reboot; after, it may be down, e.g. waiting at its initrd.
@@ -588,9 +597,9 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
 /// Catches `machine` on its way back up from a reboot that wasn't a bounce,
 /// or whose bounce was cut short: waits for it, unlocking its initrd with
 /// `password` (if any) if it waits there; makes sure it's `machine`; shows
-/// how it came back; and scrubs its scrub_mounts.  If it's up, that's taken
-/// to be the boot it came back in.  Returns the problems (none if all is
-/// well).
+/// how it came back; and scrubs its scrub_mounts, unless a scrub found them
+/// clean lately (see [`scrub`]).  If it's up, that's taken to be the boot it
+/// came back in.  Returns the problems (none if all is well).
 pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let hostname = &machine.hostname;
     if password.is_none() {
