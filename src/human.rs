@@ -35,13 +35,14 @@ pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", kilobytes_or_more(bytes_per_sec))
 }
 
-/// Formats seconds like "1h 2m 3s", leaving out leading zero units.
+/// Formats seconds like "1d 2h 3m 4s", leaving out leading zero units.
 pub fn seconds(seconds: u64) -> String {
-    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    match (hours, minutes) {
-        (0, 0) => format!("{seconds}s"),
-        (0, _) => format!("{minutes}m {seconds}s"),
-        _ => format!("{hours}h {minutes}m {seconds}s"),
+    let (days, hours, minutes, seconds) = (seconds / 86400, seconds / 3600 % 24, seconds / 60 % 60, seconds % 60);
+    match (days, hours, minutes) {
+        (0, 0, 0) => format!("{seconds}s"),
+        (0, 0, _) => format!("{minutes}m {seconds}s"),
+        (0, _, _) => format!("{hours}h {minutes}m {seconds}s"),
+        _ => format!("{days}d {hours}h {minutes}m {seconds}s"),
     }
 }
 
@@ -187,6 +188,7 @@ mod tests {
         assert_eq!(seconds(5), "5s");
         assert_eq!(seconds(210), "3m 30s");
         assert_eq!(seconds(3723), "1h 2m 3s");
+        assert_eq!(seconds(90061), "1d 1h 1m 1s");
         assert_eq!(truncate("tmux", 4), "tmux");
         assert_eq!(truncate("tmux new", 4), "tmu…");
     }

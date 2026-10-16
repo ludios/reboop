@@ -56,6 +56,17 @@ pub fn filesystems(session: &mut Session) -> Result<Vec<Filesystem>> {
     parse_findmnt(&output.stdout_text())
 }
 
+/// The UUID of the btrfs filesystem mounted at `mountpoint`.
+pub fn uuid(session: &mut Session, mountpoint: &str) -> Result<String> {
+    let output = session.run(&format!("findmnt --noheadings --types btrfs --output UUID --mountpoint {}", shell_quote(mountpoint)), QUICK)?;
+    // findmnt exits 1 without output when nothing matches.
+    ensure!(output.status == 0 || (output.status == 1 && output.stdout.is_empty()), "findmnt exited with status {}: {}", output.status, output.stderr_text());
+    let uuid = output.stdout_text().trim().to_string();
+    ensure!(!uuid.is_empty(), "no btrfs filesystem is mounted at {mountpoint}");
+    ensure!(uuid.len() == 36 && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "findmnt says the UUID of {mountpoint} is {uuid:?}");
+    Ok(uuid)
+}
+
 /// The exclusive operation (balance, device replace, add, remove, resize…)
 /// in progress on `filesystem`, or "none".  Includes "balance paused".
 pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Result<String> {
@@ -355,7 +366,56 @@ pub fn wait_for_scrub(
     }
 }
 
+/// Where a machine remembers when reboop last saw a scrub of each of its
+/// btrfs filesystems finish without errors: a file named by the
+/// filesystem's UUID, with that time as its modification time.  Deleting
+/// one brings a scrub at the next bounce, and touching one puts it off.
+pub const LAST_CLEAN_SCRUB_DIR: &str = "/var/lib/reboop/last-clean-scrub";
+
+/// Parses what the script in [`last_clean_scrub`] prints: nothing if there's
+/// no record, or else its age in seconds, which is negative if the clock has
+/// been set back since.
+fn parse_age(text: &str) -> Result<Option<Duration>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let seconds: i64 = text.parse().with_context(|| format!("unexpected age of the last clean scrub: {text:?}"))?;
+    // A record from the future means that the clock was wrong when it was
+    // made or is now, so how long ago the scrub was is anyone's guess.
+    Ok(u64::try_from(seconds).ok().map(Duration::from_secs))
+}
+
+/// How long ago, by the machine's clock, reboop last saw a scrub of the
+/// filesystem with `uuid` finish without errors, if it has (see
+/// [`note_scrub`]) and the clock doesn't put that in the future.
+pub fn last_clean_scrub(session: &mut Session, uuid: &str) -> Result<Option<Duration>> {
+    let marker = shell_quote(&format!("{LAST_CLEAN_SCRUB_DIR}/{uuid}"));
+    let script = format!("if [ -e {marker} ]; then echo $(( $(date +%s) - $(stat -c %Y -- {marker}) )); fi");
+    parse_age(&session.run_ok(&script, QUICK)?)
+}
+
+/// Records how a scrub of the filesystem with `uuid` ended, for
+/// [`last_clean_scrub`]: a clean one as the latest, and any other by
+/// forgetting the latest, so that the next bounce scrubs again.
+pub fn note_scrub(session: &mut Session, uuid: &str, status: &ScrubStatus) -> Result<()> {
+    assert!(status.state != ScrubState::Running, "a scrub that's still running hasn't ended");
+    let marker = shell_quote(&format!("{LAST_CLEAN_SCRUB_DIR}/{uuid}"));
+    let script = if status.is_clean() {
+        format!("mkdir -p -- {} && touch -- {marker}", shell_quote(LAST_CLEAN_SCRUB_DIR))
+    } else {
+        format!("rm -f -- {marker}")
+    };
+    session.run_ok(&script, QUICK)?;
+    Ok(())
+}
+
 impl ScrubStatus {
+    /// Whether the scrub finished and found no errors.
+    pub fn is_clean(&self) -> bool {
+        self.state == ScrubState::Finished && self.errors.is_empty()
+    }
+
     /// One line for people, e.g. "scrub has 3m 30s left, 130.50 GB of
     /// 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found".
     pub fn summary(&self) -> String {
@@ -427,7 +487,16 @@ mod tests {
         assert_eq!(status.state, ScrubState::Finished);
         assert_eq!(status.seconds_left, None);
         assert_eq!(status.errors, BTreeMap::from([("csum_errors".into(), 3), ("uncorrectable_errors".into(), 3)]));
+        assert!(!status.is_clean());
         assert_eq!(status.summary(), "scrub finished, 130.50 GB scrubbed, ERRORS FOUND: csum_errors=3 uncorrectable_errors=3");
+    }
+
+    #[test]
+    fn parses_the_age_of_the_last_clean_scrub() {
+        assert_eq!(parse_age("").unwrap(), None);
+        assert_eq!(parse_age("86400\n").unwrap(), Some(Duration::from_secs(86400)));
+        assert_eq!(parse_age("-5\n").unwrap(), None);
+        assert!(parse_age("soon\n").is_err());
     }
 
     #[test]

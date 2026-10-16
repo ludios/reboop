@@ -38,6 +38,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     "ssh_port": 22,
     "initrd_ssh_port": 23,
     "scrub_mounts": ["/"],
+    "scrub_every_days": 14,
     "max_network_transfer_bytes_per_sec": 1000000,
     "max_load_average_1min": 2,
     "root_full_percent": 97,
@@ -148,7 +149,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
 
     Whether we booted into the Linux kernel we expected
 
-4. Run:
+4. Unless `/var/lib/reboop/last-clean-scrub/UUID` (the filesystem's) exists and was modified less than scrub_every_days days ago by the machine's clock, run:
 
     `btrfs scrub start /`
 
@@ -159,6 +160,8 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     `scrub has 3m 30s left, 130.50 GB of 391.56 GB (33.33%) scrubbed at 1.39 GB/s, no errors found`
 
     If any errors are found, print a very loud warning and return non-0 exit status.
+
+    If the scrub finished without errors, `touch` that file (and make its directory if need be); otherwise remove it, so that the next reboot brings a scrub.
 
 ## Catch
 

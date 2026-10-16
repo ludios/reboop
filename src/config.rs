@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 //! reboop's configuration, in ~/.config/reboop: defaults.json (JSON5, so
 //! comments and trailing commas are fine) with settings for all machines,
@@ -37,6 +38,9 @@ pub struct Machine {
     pub initrd_ssh_port: u16,
     /// Mountpoints of the btrfs filesystems to scrub after rebooting.
     pub scrub_mounts: Vec<String>,
+    /// For how many days after a scrub finds one of them clean a reboot
+    /// doesn't bring another; 0 to scrub after every reboot.
+    pub scrub_every_days: u32,
     pub max_network_transfer_bytes_per_sec: u64,
     pub max_load_average_1min: f64,
     /// The percentage of / that's used (as df(1) shows it) at which / counts
@@ -67,6 +71,7 @@ struct Defaults {
     ssh_port: Option<u16>,
     initrd_ssh_port: Option<u16>,
     scrub_mounts: Option<Vec<String>>,
+    scrub_every_days: Option<u32>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
     root_full_percent: Option<u8>,
@@ -84,12 +89,16 @@ struct MachineLine {
     ssh_port: Option<u16>,
     initrd_ssh_port: Option<u16>,
     scrub_mounts: Option<Vec<String>>,
+    scrub_every_days: Option<u32>,
     max_network_transfer_bytes_per_sec: Option<u64>,
     max_load_average_1min: Option<f64>,
     root_full_percent: Option<u8>,
     luks_signing_key: Option<String>,
     stop_services: Option<Vec<String>>,
 }
+
+/// The scrub_every_days of machines that aren't configured with one.
+const DEFAULT_SCRUB_EVERY_DAYS: u32 = 14;
 
 /// The root_full_percent of machines that aren't configured with one.
 const DEFAULT_ROOT_FULL_PERCENT: u8 = 97;
@@ -117,6 +126,7 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
         ssh_port: line.ssh_port.or(defaults.ssh_port).ok_or_else(|| missing("ssh_port"))?,
         initrd_ssh_port: line.initrd_ssh_port.or(defaults.initrd_ssh_port).ok_or_else(|| missing("initrd_ssh_port"))?,
         scrub_mounts: line.scrub_mounts.clone().or(defaults.scrub_mounts.clone()).ok_or_else(|| missing("scrub_mounts"))?,
+        scrub_every_days: line.scrub_every_days.or(defaults.scrub_every_days).unwrap_or(DEFAULT_SCRUB_EVERY_DAYS),
         max_network_transfer_bytes_per_sec: line
             .max_network_transfer_bytes_per_sec
             .or(defaults.max_network_transfer_bytes_per_sec)
@@ -226,6 +236,7 @@ mod tests {
         "ssh_port": 22,
         "initrd_ssh_port": 23,
         "scrub_mounts": ["/"],
+        "scrub_every_days": 7,
         "max_network_transfer_bytes_per_sec": 1000000,
         "max_load_average_1min": 2,
         "root_full_percent": 95,
@@ -238,7 +249,7 @@ mod tests {
     #[test]
     fn machines_override_defaults() {
         let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 2222}\n\n\
-                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": []}\n";
+                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"scrub_every_days\": 0, \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": []}\n";
         let machines = parse(Some(DEFAULTS), machines, Path::new(HOME)).unwrap();
         assert_eq!(
             machines[0],
@@ -248,6 +259,7 @@ mod tests {
                 ssh_port: 2222,
                 initrd_ssh_port: 23,
                 scrub_mounts: vec!["/".into()],
+                scrub_every_days: 7,
                 max_network_transfer_bytes_per_sec: 1_000_000,
                 max_load_average_1min: 2.0,
                 root_full_percent: 95,
@@ -257,6 +269,7 @@ mod tests {
         );
         assert_eq!(machines[1].ssh_port, 22);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
+        assert_eq!(machines[1].scrub_every_days, 0);
         assert_eq!(machines[1].luks_signing_key, Path::new("/keys/two.pub"));
         assert_eq!(machines[1].stop_services, Vec::<String>::new());
         assert_eq!(machines[1].target(), Target { name: "two".into(), address: "10.0.0.2".into(), port: 22 });
@@ -271,6 +284,7 @@ mod tests {
         assert_eq!(machines[0].luks_signing_key, Path::new("/home/user/.ssh/id_ed25519.pub"));
         assert_eq!(machines[0].stop_services, Vec::<String>::new());
         assert_eq!(machines[0].root_full_percent, 97);
+        assert_eq!(machines[0].scrub_every_days, 14);
     }
 
     #[test]
@@ -280,6 +294,7 @@ mod tests {
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.256"}"#).is_err());
         assert!(line(r#"{"hostname": "../one", "ipv4": "10.0.0.1"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_mounts": ["small"]}"#).is_err());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "scrub_every_days": -1}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "luks_signing_key": ".ssh/id_ed25519.pub"}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "initrd_ssh_port": 22}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "root_full_percent": 0}"#).is_err());

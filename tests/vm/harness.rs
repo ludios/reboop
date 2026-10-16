@@ -356,6 +356,8 @@ if cryptsetup token export --token-id 0 /dev/vda2 2>/dev/null | grep -q '"reboop
 fi
 keyctl purge user reboop-test >/dev/null 2>&1
 btrfs scrub cancel / >/dev/null 2>&1
+# reboop's memory of clean scrubs, which the scrub, bounce and catch tests make
+rm -rf /var/lib/reboop/last-clean-scrub
 exit 0
 "#;
 

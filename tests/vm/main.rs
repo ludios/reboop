@@ -263,6 +263,7 @@ fn vm_machine(vm: &Vm) -> Machine {
         ssh_port: vm.target.port,
         initrd_ssh_port: vm.initrd_target.port,
         scrub_mounts: vec!["/".into()],
+        scrub_every_days: 14,
         max_network_transfer_bytes_per_sec: 1_000_000,
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
@@ -326,6 +327,9 @@ fn btrfs_root_is_idle(vm: &Vm) -> Result<()> {
     assert_eq!(filesystems[0].mountpoint, "/");
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystems[0])?, "none");
     assert_ne!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Running);
+    assert_eq!(btrfs::uuid(&mut session, "/")?, filesystems[0].uuid);
+    assert!(btrfs::uuid(&mut session, "/nonexistent").is_err());
+    assert_eq!(btrfs::last_clean_scrub(&mut session, &filesystems[0].uuid)?, None);
     // The root spans every disk.
     let devices = (1..=vm.manifest.disk_images.len() as u64).map(|devid| Device { devid, missing: false, errors: Some(BTreeMap::new()) });
     assert_eq!(btrfs::devices(&mut session, &filesystems[0])?, devices.collect::<Vec<_>>());
@@ -459,6 +463,10 @@ fn scrub_of_root_finishes_clean(vm: &Vm) -> Result<()> {
     assert!(status.errors.is_empty(), "{status:?}");
     assert!(status.scrubbed_bytes > 500_000_000, "{status:?}");
     assert!(status.summary().ends_with("no errors found"), "{}", status.summary());
+    // Which is worth remembering
+    let uuid = btrfs::uuid(&mut session, "/")?;
+    btrfs::note_scrub(&mut session, &uuid, &status)?;
+    assert!(btrfs::last_clean_scrub(&mut session, &uuid)?.is_some_and(|ago| ago < MINUTE));
     Ok(())
 }
 
@@ -485,8 +493,16 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
     assert!(status.errors.get("csum_errors").is_some_and(|&n| n > 0), "{status:?}");
     assert!(status.summary().contains("ERRORS FOUND"), "{}", status.summary());
 
+    // Which ends the memory of a clean scrub
+    let uuid = btrfs::uuid(&mut session, &mountpoint)?;
+    sh(&mut session, &format!("mkdir -p {dir} && touch {dir}/{uuid}", dir = btrfs::LAST_CLEAN_SCRUB_DIR))?;
+    assert!(btrfs::last_clean_scrub(&mut session, &uuid)?.is_some());
+    btrfs::note_scrub(&mut session, &uuid, &status)?;
+    assert_eq!(btrfs::last_clean_scrub(&mut session, &uuid)?, None);
+
     // The device remembers the corruption.
     let filesystem = btrfs::filesystems(&mut session)?.into_iter().find(|fs| fs.mountpoint == mountpoint).unwrap();
+    assert_eq!(filesystem.uuid, uuid);
     let devices = btrfs::devices(&mut session, &filesystem)?;
     let corruption = devices[0].errors.as_ref().and_then(|errors| errors.get("corruption_errs"));
     assert!(corruption.is_some_and(|&n| n > 0), "{devices:?}");
@@ -665,6 +681,23 @@ fn catch_when_up(vm: &Vm) -> Result<()> {
     let no_password = format!("There's no stored LUKS password for {}, so its initrd won't be unlocked\n", vm.manifest.hostname);
     assert!(printed.starts_with(&no_password), "{printed}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    assert!(printed.contains("\nScrubbing btrfs on /\n"), "{printed}");
+
+    // Having just found / clean, the next catch spares it, until that was
+    // long enough ago.
+    let uuid = btrfs::uuid(&mut session, "/")?;
+    assert!(btrfs::last_clean_scrub(&mut session, &uuid)?.is_some_and(|ago| ago < MINUTE));
+    let started = btrfs::scrub_status(&mut session, "/")?.started;
+    let (problems, printed) = catch_vm(vm, None)?;
+    assert_eq!(problems, Vec::<String>::new());
+    let spared = printed.contains("\nNot scrubbing btrfs on /, which a scrub found clean ") && printed.contains(" ago (scrub_every_days is 14)\n");
+    assert!(spared, "{printed}");
+    assert_eq!(btrfs::scrub_status(&mut session, "/")?.started, started);
+    sh(&mut session, &format!("touch -d '15 days ago' {}/{uuid}", btrfs::LAST_CLEAN_SCRUB_DIR))?;
+    let (problems, printed) = catch_vm(vm, None)?;
+    assert_eq!(problems, Vec::<String>::new());
+    assert!(printed.contains("\nScrubbing btrfs on /\n"), "{printed}");
+    assert!(btrfs::last_clean_scrub(&mut session, &uuid)?.is_some_and(|ago| ago < MINUTE));
 
     let someone_else = Machine { hostname: "someone-else".into(), ..vm_machine(vm) };
     let mut printed = Vec::new();

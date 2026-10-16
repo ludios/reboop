@@ -459,9 +459,19 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
 }
 
 /// Scrubs the btrfs filesystem mounted at `mountpoint`, or waits for the
-/// scrub that's already running there, showing its progress.  Returns its
-/// final status.
-fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Result<ScrubStatus> {
+/// scrub that's already running there, showing its progress, and records
+/// how it ended for next time.  Returns its final status; or, if a scrub
+/// found the filesystem clean less than `every_days` days ago, says so and
+/// returns `None` without scrubbing.
+fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut Printer) -> Result<Option<ScrubStatus>> {
+    let uuid = btrfs::uuid(session, mountpoint)?;
+    if let Some(ago) = btrfs::last_clean_scrub(session, &uuid)?
+        && ago < Duration::from_secs(u64::from(every_days) * 24 * 60 * 60)
+    {
+        let ago = human::seconds(ago.as_secs());
+        printer.line(&format!("Not scrubbing btrfs on {}, which a scrub found clean {ago} ago (scrub_every_days is {every_days})", printer.bold(mountpoint)));
+        return Ok(None);
+    }
     // Such as one started by a timer that came due while the machine was down
     if btrfs::scrub_status(session, mountpoint)?.state == ScrubState::Running {
         printer.line(&format!("Waiting for the scrub that's already running on {}", printer.bold(mountpoint)));
@@ -469,15 +479,18 @@ fn scrub(session: &mut Session, mountpoint: &str, printer: &mut Printer) -> Resu
         printer.line(&format!("Scrubbing btrfs on {}", printer.bold(mountpoint)));
         btrfs::start_scrub(session, mountpoint, QUICK)?;
     }
-    btrfs::wait_for_scrub(session, mountpoint, SCRUB_INTERVAL, Deadline::after(SCRUB_TIMEOUT), |status| {
+    let status = btrfs::wait_for_scrub(session, mountpoint, SCRUB_INTERVAL, Deadline::after(SCRUB_TIMEOUT), |status| {
         printer.progress(&format!("btrfs on {mountpoint}: {}", status.summary()));
-    })
+    })?;
+    btrfs::note_scrub(session, &uuid, &status)?;
+    Ok(Some(status))
 }
 
 /// Waits for `machine` to come back from a reboot, out of boot `old_boot_id`
 /// if that's known, unlocking its initrd with `password` (if any) if it
-/// waits there; makes sure it's `machine`; shows how it did; and scrubs its
-/// scrub_mounts.  Returns the problems (none if all is well).
+/// waits there; makes sure it's `machine`; shows how it did; and scrubs
+/// those of its scrub_mounts that no scrub found clean within its
+/// scrub_every_days.  Returns the problems (none if all is well).
 fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
     let (target, initrd_target) = (machine.target(), machine.initrd_target());
@@ -502,8 +515,9 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
     let mut problems = postflight(&mut session, &machine.hostname, printer)?;
 
     for mountpoint in &machine.scrub_mounts {
-        let status = match scrub(&mut session, mountpoint, printer) {
-            Ok(status) => status,
+        let status = match scrub(&mut session, mountpoint, machine.scrub_every_days, printer) {
+            Ok(Some(status)) => status,
+            Ok(None) => continue,
             Err(error) => {
                 let problem = format!("btrfs on {mountpoint}: couldn't scrub: {error:#}");
                 printer.styled_line(Red, &problem);
@@ -517,7 +531,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
         } else {
             printer.alarm(&summary);
         }
-        if !status.errors.is_empty() || status.state != ScrubState::Finished {
+        if !status.is_clean() {
             problems.push(summary);
         }
     }

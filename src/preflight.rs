@@ -330,6 +330,7 @@ pub(crate) fn test_machine() -> Machine {
         ssh_port: 22,
         initrd_ssh_port: 23,
         scrub_mounts: vec!["/".into()],
+        scrub_every_days: 14,
         max_network_transfer_bytes_per_sec: 1_000_000,
         max_load_average_1min: 2.0,
         root_full_percent: 97,
