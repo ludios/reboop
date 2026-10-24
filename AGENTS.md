@@ -3,14 +3,7 @@
 # Don't edit the generated sections here: change the options below or the template, then run `clank-right update .` in this repo.
 # Only the options below and the sections between "Thoughts for when there is programming involved" and "After making changes" are this project's own; every other section is overwritten.
 
-languages   = ["rust"]
-checks      = ["cargo"]
-
-[extra]
-checks = """
-That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop probe`'s table), only compile them, and run just the unit tests:
-
-	cargo test --no-run && cargo test --lib --bins"""
+languages = ["rust"]
 -->
 
 # Environment
@@ -91,6 +84,16 @@ Try writing a function in different ways and see which version is better.
 Sometimes a program can log or assert to generate interesting observations which feed into further development of the program. We do our own science on the outputs later to improve the program.
 
 When there are multiple good ways to implement something, especially involving state or the definition of a type: please ask the user. User loves AskUserQuestion.
+
+# Before committing
+
+At the workspace root:
+
+	cargo test
+
+That includes the VM tests in tests/vm, which take minutes.  If the change can't affect anything they exercise (e.g. it's only to `reboop probe`'s table), only compile them, and run just the unit tests:
+
+	cargo test --no-run && cargo test --lib --bins
 
 # After making changes
 
