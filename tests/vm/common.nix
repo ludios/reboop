@@ -32,8 +32,6 @@
 
   boot.kernelParams = [ "console=ttyS0" ];
 
-  boot.initrd.systemd.enable = true;
-
   networking = {
     useNetworkd = true;
     useDHCP = true;
