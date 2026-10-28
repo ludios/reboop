@@ -28,7 +28,7 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
     // After the facts, which the evaluation would skew, e.g. the load
-    let rebuild = machine.check_rebuild.then(|| facts::rebuild(&mut session, &facts.systems.default)).transpose()?;
+    let rebuild = machine.check_rebuild.then(|| facts::rebuild(&mut session, &facts.systems.default));
     Ok((facts, blockers, rebuild))
 }
 
@@ -304,7 +304,7 @@ mod tests {
         let machines = [test_machine(), named("two"), named("three"), named("four"), named("five")];
         let fresh = Rebuild::Fresh { toplevel: idle_facts().systems.default, nix_path: "nixpkgs=/var/nixpkgs".into() };
         let error = "error:\n       … while evaluating the attribute 'config'\n\n       error: attribute 'boot' missing\n       at /etc/nixos/configuration.nix:3:5:";
-        let failed = Rebuild::Failed { error: error.into(), nix_path: "nixpkgs=/var/nixpkgs".into() };
+        let failed = Rebuild::Failed { error: error.into(), nix_path: Some("nixpkgs=/var/nixpkgs".into()) };
         let outcomes = [
             (&machines[0], blocked_outcome()),
             (&machines[1], idle_outcome(Some(fresh))),

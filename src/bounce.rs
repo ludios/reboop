@@ -580,7 +580,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
     if machine.check_rebuild {
         printer.progress(&format!("Evaluating {hostname}'s configuration"));
-        let rebuild = facts::rebuild(&mut session, &systems.default).with_context(not_rebooted)?;
+        let rebuild = facts::rebuild(&mut session, &systems.default);
         if let Some(trouble) = rebuild.trouble(&systems.default) {
             printer.styled_line(Bold, &format!("{hostname}: {}", trouble.replace('\n', "\n    ")));
         }

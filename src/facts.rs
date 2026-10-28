@@ -204,7 +204,7 @@ const EVAL_KILL_AFTER: Duration = Duration::from_secs(5);
 
 /// Whether `nixos-rebuild switch` or `boot` would change the system
 /// profile, found by evaluating the configuration without building it.
-/// Each variant has the NIX_PATH that the evaluation used.
+/// Each variant has the NIX_PATH that the evaluation used, if known.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Rebuild {
@@ -213,9 +213,10 @@ pub enum Rebuild {
     /// It evaluates to another toplevel, which a rebuild would switch to.
     Stale { toplevel: String, nix_path: String },
     /// Why it couldn't be evaluated: nix-instantiate's stderr, that it was
-    /// killed or took too long, that NIX_PATH is empty, or that the machine
-    /// is configured in a way that isn't supported.
-    Failed { error: String, nix_path: String },
+    /// killed or took too long, that NIX_PATH is empty, that the machine is
+    /// configured in a way that isn't supported, or that the session failed
+    /// (then `nix_path` is unknown).
+    Failed { error: String, nix_path: Option<String> },
 }
 
 impl Rebuild {
@@ -251,17 +252,17 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
     let context = || format!("unexpected output from the evaluation script: {stdout:?}");
     let (nix_path, rest) = stdout.split_once('\n').ok_or_else(|| anyhow!(context()))?;
     let nix_path = nix_path.to_string();
+    let failed = |error: String| Rebuild::Failed { error, nix_path: Some(nix_path.clone()) };
     if let Some(entry) = rest.strip_prefix("unsupported ") {
-        let error = format!("not supported: nixos-rebuild would build {} rather than <nixpkgs/nixos>", entry.trim_end());
-        return Ok(Rebuild::Failed { error, nix_path });
+        return Ok(failed(format!("not supported: nixos-rebuild would build {} rather than <nixpkgs/nixos>", entry.trim_end())));
     }
     if let Some(entry) = rest.strip_prefix("unsure ") {
         let error = format!("couldn't tell whether nixos-rebuild would build {}: looking for it failed, or took over {} s", entry.trim_end(), QUICK.as_secs());
-        return Ok(Rebuild::Failed { error, nix_path });
+        return Ok(failed(error));
     }
     if nix_path.is_empty() {
         ensure!(rest.is_empty(), context());
-        return Ok(Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path });
+        return Ok(failed("NIX_PATH is empty".into()));
     }
     let (line, output) = rest.split_once('\n').ok_or_else(|| anyhow!(context()))?;
     let numbers = line.strip_prefix("exit ").ok_or_else(|| anyhow!(context()))?.split(' ');
@@ -278,7 +279,7 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
     Ok(match evaluated {
         Ok(toplevel) if toplevel == profile => Rebuild::Fresh { toplevel, nix_path },
         Ok(toplevel) => Rebuild::Stale { toplevel, nix_path },
-        Err(error) => Rebuild::Failed { error, nix_path },
+        Err(error) => failed(error),
     })
 }
 
@@ -288,9 +289,9 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
 /// derivation, which an eval would build if its .drv exists.  Only the
 /// default way of building is supported: `<nixpkgs/nixos>`, with
 /// nixos-config from NIX_PATH.  The evaluation is niced, and the OOM
-/// killer's first pick.  Fails only if the session or the script does:
-/// whatever goes wrong with the evaluation is [`Rebuild::Failed`].
-pub fn rebuild(session: &mut Session, profile: &str) -> Result<Rebuild> {
+/// killer's first pick.  Whatever goes wrong, even with the session, is
+/// [`Rebuild::Failed`], so that it can't cost the other facts.
+pub fn rebuild(session: &mut Session, profile: &str) -> Rebuild {
     // Prints NIX_PATH on a line, then "unsupported X" if nixos-rebuild would
     // build X (in nixos-rebuild-ng's order of preference), or "unsure X" if
     // looking for X failed (other than by not finding it, which is status 1;
@@ -319,9 +320,11 @@ fi"#,
     );
     // Past the lookup's and the evaluation's timeouts and kills, since a
     // command that outlives the session's timeout breaks the session.
-    let output = session.run(&script, QUICK + EVAL_TIMEOUT + 2 * EVAL_KILL_AFTER + QUICK)?;
-    ensure!(output.status == 0, "the evaluation script exited with status {}: {}", output.status, output.stderr_text());
-    parse_rebuild(&output.stdout_text(), &output.stderr_text(), profile)
+    let rebuild = session.run(&script, QUICK + EVAL_TIMEOUT + 2 * EVAL_KILL_AFTER + QUICK).and_then(|output| {
+        ensure!(output.status == 0, "the evaluation script exited with status {}: {}", output.status, output.stderr_text());
+        parse_rebuild(&output.stdout_text(), &output.stderr_text(), profile)
+    });
+    rebuild.unwrap_or_else(|error| Rebuild::Failed { error: format!("{error:#}"), nix_path: None })
 }
 
 /// Seconds since boot and each interface's (received, sent) byte counters.
@@ -671,7 +674,7 @@ mod tests {
         let nix_path = "nixpkgs=/var/nixpkgs:nixos-config=/etc/nixos/configuration.nix";
         let parse = |stdout: &str, stderr: &str| parse_rebuild(stdout, stderr, &profile).unwrap();
         let garbage = |stdout: &str| parse_rebuild(stdout, "", &profile).is_err();
-        let failed = |error: &str| Rebuild::Failed { error: error.into(), nix_path: nix_path.into() };
+        let failed = |error: &str| Rebuild::Failed { error: error.into(), nix_path: Some(nix_path.into()) };
         assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{profile}"), "warning: x"), Rebuild::Fresh { toplevel: profile.clone(), nix_path: nix_path.into() });
         assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{other}"), ""), Rebuild::Stale { toplevel: other.clone(), nix_path: nix_path.into() });
         assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{other}/bin"), ""), failed(&format!("not a store path: \"{other}/bin\"")));
@@ -687,7 +690,7 @@ mod tests {
             parse(&format!("{nix_path}\nunsure <nixos-system>\n"), ""),
             failed("couldn't tell whether nixos-rebuild would build <nixos-system>: looking for it failed, or took over 30 s")
         );
-        assert_eq!(parse("\n", ""), Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: "".into() });
+        assert_eq!(parse("\n", ""), Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: Some("".into()) });
         assert!(garbage("\nexit 0 2\n"));
         assert!(garbage(&format!("{nix_path}\nexit 0\n{profile}")));
         assert!(garbage(&format!("{nix_path}\n")));
@@ -708,8 +711,10 @@ mod tests {
         let stale = Rebuild::Stale { toplevel: "/nix/store/bbb-nixos-system-one-26.05".into(), nix_path: "nixpkgs=/var/nixpkgs".into() };
         let json = serde_json::json!({"state": "stale", "toplevel": "/nix/store/bbb-nixos-system-one-26.05", "nix_path": "nixpkgs=/var/nixpkgs"});
         assert_eq!(serde_json::to_value(stale).unwrap(), json);
-        let failed = Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: "".into() };
+        let failed = Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: Some("".into()) };
         assert_eq!(serde_json::to_value(failed).unwrap(), serde_json::json!({"state": "failed", "error": "NIX_PATH is empty", "nix_path": ""}));
+        let unknown = Rebuild::Failed { error: "the session broke".into(), nix_path: None };
+        assert_eq!(serde_json::to_value(unknown).unwrap(), serde_json::json!({"state": "failed", "error": "the session broke", "nix_path": null}));
     }
 
     #[test]

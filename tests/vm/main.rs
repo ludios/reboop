@@ -181,16 +181,16 @@ fn rebuild_is_evaluated(vm: &Vm) -> Result<()> {
     let other = if profile == systems.base { &systems.alt } else { &systems.base };
 
     // NIX_PATH reaches the session, and the stub has nothing to evaluate to yet.
-    let Rebuild::Failed { error, nix_path } = facts::rebuild(&mut session, &profile)? else {
+    let Rebuild::Failed { error, nix_path } = facts::rebuild(&mut session, &profile) else {
         bail!("evaluated without a toplevel to evaluate to");
     };
-    assert_eq!(nix_path, NIX_PATH);
+    assert_eq!(nix_path.as_deref(), Some(NIX_PATH));
     assert_eq!(facts::nix_error_gist(&error).lines().next(), Some("path '/var/tmp/reboop-test-toplevel' does not exist"), "{error}");
 
     set_evaluated_toplevel(&mut session, &profile)?;
-    assert_eq!(facts::rebuild(&mut session, &profile)?, Rebuild::Fresh { toplevel: profile.clone(), nix_path: NIX_PATH.into() });
+    assert_eq!(facts::rebuild(&mut session, &profile), Rebuild::Fresh { toplevel: profile.clone(), nix_path: NIX_PATH.into() });
     set_evaluated_toplevel(&mut session, other)?;
-    assert_eq!(facts::rebuild(&mut session, &profile)?, Rebuild::Stale { toplevel: other.clone(), nix_path: NIX_PATH.into() });
+    assert_eq!(facts::rebuild(&mut session, &profile), Rebuild::Stale { toplevel: other.clone(), nix_path: NIX_PATH.into() });
     clean_up(&mut session)
 }
 
