@@ -202,6 +202,23 @@ const EVAL_TIMEOUT: Duration = Duration::from_secs(180);
 /// before SIGKILL.
 const EVAL_KILL_AFTER: Duration = Duration::from_secs(5);
 
+/// What went wrong according to an `error` that Nix printed: what follows
+/// "error:" on its last line that starts with that (none if nothing does,
+/// as for a failed assertion), and the lines after it, like more of the
+/// message or where in a file, without their shared indentation; but not
+/// the trace before.  All of `error` if no line starts with "error:".
+pub fn nix_error_gist(error: &str) -> String {
+    let lines: Vec<&str> = error.lines().collect();
+    let is_error = |line: &&str| line.trim_start() == "error:" || line.trim_start().starts_with("error: ");
+    let Some(start) = lines.iter().rposition(is_error) else { return error.to_string() };
+    let message = lines[start].trim_start()["error:".len()..].trim_start();
+    let rest = &lines[start + 1..];
+    let indent = rest.iter().filter(|line| !line.trim().is_empty()).map(|line| line.len() - line.trim_start().len()).min().unwrap_or(0);
+    let rest = rest.iter().map(|line| line.get(indent..).unwrap_or(line.trim_start()));
+    let gist: Vec<&str> = Some(message).filter(|message| !message.is_empty()).into_iter().chain(rest).collect();
+    gist.join("\n")
+}
+
 /// Whether `nixos-rebuild switch` or `boot` would change the system
 /// profile, found by evaluating the configuration without building it.
 /// Each variant has the NIX_PATH that the evaluation used, if known.
@@ -230,19 +247,6 @@ impl Rebuild {
             Rebuild::Failed { error, .. } => Some(format!("couldn't evaluate the configuration: {}", nix_error_gist(error))),
         }
     }
-}
-
-/// What went wrong according to an `error` that Nix printed: its last line
-/// that starts with "error: " and the lines after it (like where in a file),
-/// without that prefix, the trace before it, or their shared indentation.
-/// All of `error` if no line starts that way.
-pub fn nix_error_gist(error: &str) -> String {
-    let lines: Vec<&str> = error.lines().collect();
-    let Some(start) = lines.iter().rposition(|line| line.trim_start().starts_with("error: ")) else { return error.to_string() };
-    let first = lines[start].trim_start();
-    let indent = &lines[start][..lines[start].len() - first.len()];
-    let rest = lines[start + 1..].iter().map(|line| line.strip_prefix(indent).unwrap_or(line));
-    std::iter::once(&first["error: ".len()..]).chain(rest).collect::<Vec<_>>().join("\n")
 }
 
 /// Parses the output of [`rebuild`]'s script (`stdout` and `stderr`), given
@@ -702,6 +706,10 @@ mod tests {
         let error = "error:\n       … while calling the 'readFile' builtin\n         at /etc/x/default.nix:1:42:\n            1| { a = builtins.readFile /x; }\n             |                                          ^\n\n       \
                      (stack trace truncated; use '--show-trace' to show the full, detailed trace)\n\n       error: path '/x' does not exist\n       at /etc/y.nix:2:3:\n            2| x";
         assert_eq!(nix_error_gist(error), "path '/x' does not exist\nat /etc/y.nix:2:3:\n     2| x");
+        let untraced = "error: undefined variable 'x'\n       at /etc/y.nix:1:15:\n            1| let y = 1; in x\n             |               ^";
+        assert_eq!(nix_error_gist(untraced), "undefined variable 'x'\nat /etc/y.nix:1:15:\n     1| let y = 1; in x\n      |               ^");
+        let assertion = "error:\n       … while calling the 'throw' builtin\n         at /etc/y.nix:1:12:\n\n       error:\n       Failed assertions:\n       - The fileSystems option does not specify your root file system.";
+        assert_eq!(nix_error_gist(assertion), "Failed assertions:\n- The fileSystems option does not specify your root file system.");
         assert_eq!(nix_error_gist("error: file 'nixpkgs/nixos' was not found in the Nix search path"), "file 'nixpkgs/nixos' was not found in the Nix search path");
         assert_eq!(nix_error_gist("took longer than 180 s"), "took longer than 180 s");
     }
