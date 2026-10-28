@@ -17,6 +17,7 @@
   imports = [
     "${modulesPath}/profiles/qemu-guest.nix"
     "${modulesPath}/profiles/minimal.nix"
+    ./btrfs-ready-recheck.nix
   ];
 
   system.stateVersion = "26.05";

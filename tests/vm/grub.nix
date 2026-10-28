@@ -8,19 +8,6 @@
 {
   imports = [ ./common.nix ];
 
-  # systemd's 64-btrfs.rules marks each member of a multi-device btrfs not
-  # ready until the kernel has seen them all, and the member that completes
-  # the filesystem then retriggers those that udev's database lists as not
-  # ready.  A member whose worker hasn't written the database yet is missed
-  # and stays not ready, and as the member processed last, it can hold
-  # /dev/disk/by-label/root, so that the initrd waits for the root until it
-  # gives up, in roughly 1 boot of 300 here (see
-  # https://github.com/systemd/systemd/issues/41552).  So leave the link to
-  # a ready member, until systemd's rules do.
-  boot.initrd.services.udev.rules = ''
-    ENV{ID_BTRFS_READY}=="0", OPTIONS+="link_priority=-100"
-  '';
-
   # With a separate /boot, NixOS copies the kernels there.
   boot.loader.grub = {
     enable = true;
