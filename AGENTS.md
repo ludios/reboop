@@ -142,7 +142,7 @@ Automatically commit your changes with this commit template:
 
 # Code review after each commit
 
-After each commit made, `git clone` the repo into some /tmp/ folder and get it reviewed by Codex and by Claude, all at xhigh reasoning:
+After each commit made, `git clone --shared` the repo into some /tmp/ folder and get it reviewed by Codex and by Claude, all at xhigh reasoning:
 
 	codex review --commit <sha> -c model="gpt-6-astra" -c model_reasoning_effort="xhigh"
 	codex review --commit <sha> -c model="gpt-6.1-sol" -c model_reasoning_effort="xhigh"
@@ -150,7 +150,7 @@ After each commit made, `git clone` the repo into some /tmp/ folder and get it r
 	claude -p --model claude-mythos-5-1 --effort xhigh "/code-review xhigh commit <sha>"
 	claude -p --model claude-opus-5-5 --effort xhigh "/code-review xhigh commit <sha>"
 
-Ensure that the output of each review gets written or copied to ~/.ai-code-reviews/{model}/{commit} or /{commit-range}
+Ensure that the output of each review gets written or copied to ~/.ai-code-reviews/{model}/{commit} or /{commit-range}, then delete the clone.
 
 Notes:
 
