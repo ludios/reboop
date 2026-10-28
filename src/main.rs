@@ -28,7 +28,8 @@ enum ReboopCommand {
     /// Show whether machines are okay to reboot, why they need one (if they
     /// do), whether a nixos-rebuild would change them, and the facts behind
     /// that.
-    /// Exits 0 if all are, 2 if any isn't, or 1 if any couldn't be checked.
+    /// Exits 0 if all are okay to reboot, 2 if any isn't, or 1 if any
+    /// couldn't be checked.
     #[clap(name = "check")]
     Check {
         /// Machines from machines.jsonl (default: all of them)
