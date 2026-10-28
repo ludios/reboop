@@ -557,7 +557,9 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 }
 
 /// Bounces `machine`, telling the user about it with `printer`: checks that
-/// it's okay to reboot; if it has a LUKS device beneath /, gets the password
+/// it's okay to reboot; warns if a nixos-rebuild would change it, or if that
+/// couldn't be evaluated (if its check_rebuild is on); if it has a LUKS
+/// device beneath /, gets the password
 /// from `password` and tests it; stops its stop_services; checks again,
 /// apart from load and network traffic (leaving the stop_services stopped if
 /// it's no longer okay); reboots it; answers its initrd's password prompt;
@@ -576,6 +578,13 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     };
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
+    if machine.check_rebuild {
+        printer.progress(&format!("Evaluating {hostname}'s configuration"));
+        let rebuild = facts::rebuild(&mut session, &systems.default).with_context(not_rebooted)?;
+        if let Some(trouble) = rebuild.trouble(&systems.default) {
+            printer.styled_line(Bold, &format!("{hostname}: {}", trouble.replace('\n', "\n    ")));
+        }
+    }
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
     let (facts, mut problems) = match stop_and_check_again(machine, &mut session, Down::Reboot, password.is_some(), printer).with_context(not_rebooted)? {
         Ok(stopped) => stopped,

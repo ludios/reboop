@@ -822,10 +822,14 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_eq!((&expected.current, &expected.default), (&before.current, next));
     assert_eq!(expected.reboot_reasons(), ["new system"], "{expected:?}");
 
-    // One of the stop_services is running, and one doesn't exist.
+    // One of the stop_services is running, and one doesn't exist.  The
+    // configuration on disk is the old one, which only gets a warning.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    set_evaluated_toplevel(&mut session, &before.current)?;
     let (outcome, printed) = bounce_vm()?;
     assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
+    let warning = format!("\n{hostname}: nixos-rebuild would change the system: {next} → {}\n", before.current);
+    assert!(printed.contains(&warning), "{printed}");
     let stopping = format!(
         "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
          Checking again whether {hostname} is okay to reboot\nAsking {hostname} to reboot\n"
