@@ -280,7 +280,8 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
 
 /// Whether `nixos-rebuild switch` or `boot` would change the system
 /// profile, whose toplevel is `profile`: evaluates the toplevel of the
-/// configuration without building it or writing to the store.  Only the
+/// configuration without building it, nor what it imports from a
+/// derivation, which an eval would build if its .drv exists.  Only the
 /// default way of building is supported: `<nixpkgs/nixos>`, with
 /// nixos-config from NIX_PATH.  The evaluation is niced, and the OOM
 /// killer's first pick.  Fails only if the session or the script does:
@@ -300,7 +301,7 @@ elif test -e /etc/nixos/system.nix; then
     echo 'unsupported /etc/nixos/system.nix'
 elif test -n "$NIX_PATH"; then
     start=$(date +%s)
-    toplevel=$(choom -n 1000 -- nice -n 19 timeout --kill-after={} {} nix-instantiate --eval --raw -A config.system.build.toplevel.outPath '<nixpkgs/nixos>')
+    toplevel=$(choom -n 1000 -- nice -n 19 timeout --kill-after={} {} nix-instantiate --eval --raw --option allow-import-from-derivation false -A config.system.build.toplevel.outPath '<nixpkgs/nixos>')
     status=$?
     printf 'exit %d %d\n%s' "$status" "$(($(date +%s) - start))" "$toplevel"
 fi"#,
