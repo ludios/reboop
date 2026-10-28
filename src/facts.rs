@@ -255,6 +255,10 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
         let error = format!("not supported: nixos-rebuild would build {} rather than <nixpkgs/nixos>", entry.trim_end());
         return Ok(Rebuild::Failed { error, nix_path });
     }
+    if let Some(entry) = rest.strip_prefix("unsure ") {
+        let error = format!("couldn't tell whether nixos-rebuild would build {}: looking for it failed, or took over {} s", entry.trim_end(), QUICK.as_secs());
+        return Ok(Rebuild::Failed { error, nix_path });
+    }
     if nix_path.is_empty() {
         ensure!(rest.is_empty(), context());
         return Ok(Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path });
@@ -288,29 +292,34 @@ fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
 /// whatever goes wrong with the evaluation is [`Rebuild::Failed`].
 pub fn rebuild(session: &mut Session, profile: &str) -> Result<Rebuild> {
     // Prints NIX_PATH on a line, then "unsupported X" if nixos-rebuild would
-    // build X (in nixos-rebuild-ng's order of preference); or nothing more
-    // if NIX_PATH is empty; or else "exit STATUS SECONDS" and what the
-    // evaluation printed, which is the toplevel if it worked.
+    // build X (in nixos-rebuild-ng's order of preference), or "unsure X" if
+    // looking for X failed (other than by not finding it, which is status 1;
+    // a URL in NIX_PATH gets fetched); or nothing more if NIX_PATH is empty;
+    // or else "exit STATUS SECONDS" and what the evaluation printed, which is
+    // the toplevel if it worked.
     let script = format!(
         r#"printf '%s\n' "$NIX_PATH"
 if test -e /etc/nixos/flake.nix; then
     echo 'unsupported /etc/nixos/flake.nix'
-elif nixos_system=$(nix-instantiate --find-file nixos-system 2>/dev/null); then
+elif nixos_system=$(timeout --kill-after={kill_after} {quick} nix-instantiate --eval --find-file nixos-system 2>/dev/null); then
     echo "unsupported <nixos-system> ($nixos_system)"
+elif test $? != 1; then
+    echo 'unsure <nixos-system>'
 elif test -e /etc/nixos/system.nix; then
     echo 'unsupported /etc/nixos/system.nix'
 elif test -n "$NIX_PATH"; then
     start=$(date +%s)
-    toplevel=$(choom -n 1000 -- nice -n 19 timeout --kill-after={} {} nix-instantiate --eval --raw --option allow-import-from-derivation false -A config.system.build.toplevel.outPath '<nixpkgs/nixos>')
+    toplevel=$(choom -n 1000 -- nice -n 19 timeout --kill-after={kill_after} {eval} nix-instantiate --eval --raw --option allow-import-from-derivation false -A config.system.build.toplevel.outPath '<nixpkgs/nixos>')
     status=$?
     printf 'exit %d %d\n%s' "$status" "$(($(date +%s) - start))" "$toplevel"
 fi"#,
-        EVAL_KILL_AFTER.as_secs(),
-        EVAL_TIMEOUT.as_secs()
+        kill_after = EVAL_KILL_AFTER.as_secs(),
+        quick = QUICK.as_secs(),
+        eval = EVAL_TIMEOUT.as_secs()
     );
-    // Past the evaluation's timeout and kill, since a command that outlives
-    // the session's timeout breaks the session.
-    let output = session.run(&script, EVAL_TIMEOUT + EVAL_KILL_AFTER + QUICK)?;
+    // Past the lookup's and the evaluation's timeouts and kills, since a
+    // command that outlives the session's timeout breaks the session.
+    let output = session.run(&script, QUICK + EVAL_TIMEOUT + 2 * EVAL_KILL_AFTER + QUICK)?;
     ensure!(output.status == 0, "the evaluation script exited with status {}: {}", output.status, output.stderr_text());
     parse_rebuild(&output.stdout_text(), &output.stderr_text(), profile)
 }
@@ -673,6 +682,10 @@ mod tests {
         assert_eq!(
             parse(&format!("{nix_path}\nunsupported <nixos-system> (/etc/nixos-system)\n"), ""),
             failed("not supported: nixos-rebuild would build <nixos-system> (/etc/nixos-system) rather than <nixpkgs/nixos>")
+        );
+        assert_eq!(
+            parse(&format!("{nix_path}\nunsure <nixos-system>\n"), ""),
+            failed("couldn't tell whether nixos-rebuild would build <nixos-system>: looking for it failed, or took over 30 s")
         );
         assert_eq!(parse("\n", ""), Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: "".into() });
         assert!(garbage("\nexit 0 2\n"));
