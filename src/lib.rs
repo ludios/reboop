@@ -6,7 +6,7 @@
 pub mod boot;
 pub mod bounce;
 pub mod btrfs;
-pub mod probe;
+pub mod check;
 pub mod child;
 pub mod config;
 pub mod deadline;
