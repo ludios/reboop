@@ -4,13 +4,6 @@
 # Only the options below and the sections between "Thoughts for when there is programming involved" and "Committing" are this project's own; every other section is overwritten.
 
 languages = ["rust"]
-checks    = ["cargo"]
-
-[extra]
-checks = """
-That includes the VM tests in tests/vm, which take minutes. If the change can't affect anything they exercise (e.g. it's only to `reboop check`'s table), only compile them, and run just the unit tests:
-
-	cargo test --no-run && cargo test --lib --bins"""
 -->
 
 # Before starting
