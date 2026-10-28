@@ -297,6 +297,7 @@ fn vm_machine(vm: &Vm) -> Machine {
         // The VM's load depends on whatever else its host is doing.
         max_load_average_1min: 100.0,
         root_full_percent: 97,
+        check_rebuild: true,
         luks_signing_key: "/nonexistent".into(),
         stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-nonexistent.service".into()],
     }
