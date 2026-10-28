@@ -557,14 +557,14 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 }
 
 /// Bounces `machine`, telling the user about it with `printer`: checks that
-/// it's okay to reboot; warns if a nixos-rebuild would change it, or if that
-/// couldn't be evaluated (if its check_rebuild is on); if it has a LUKS
-/// device beneath /, gets the password
-/// from `password` and tests it; stops its stop_services; checks again,
-/// apart from load and network traffic (leaving the stop_services stopped if
-/// it's no longer okay); reboots it; answers its initrd's password prompt;
-/// waits for it to come back; shows how it did; and scrubs its
-/// scrub_mounts, unless a scrub found them clean lately (see [`scrub`]).
+/// it's okay to reboot; says whether a nixos-rebuild would change it (if its
+/// check_rebuild is on), warning if so or if that couldn't be evaluated; if
+/// it has a LUKS device beneath /, gets the password from `password` and
+/// tests it; stops its stop_services; checks again, apart from load and
+/// network traffic (leaving the stop_services stopped if it's no longer
+/// okay); reboots it; answers its initrd's password prompt; waits for it to
+/// come back; shows how it did; and scrubs its scrub_mounts, unless a scrub
+/// found them clean lately (see [`scrub`]).
 /// Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
@@ -580,9 +580,9 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
     printer.line(&format!("{hostname} is okay to reboot, into {} with kernel {}", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
     if machine.check_rebuild {
         printer.progress(&format!("Evaluating {hostname}'s configuration"));
-        let rebuild = facts::rebuild(&mut session, &systems.default);
-        if let Some(trouble) = rebuild.trouble(&systems.default) {
-            printer.styled_line(Bold, &format!("{hostname}: {}", trouble.replace('\n', "\n    ")));
+        match facts::rebuild(&mut session, &systems.default).trouble(&systems.default) {
+            Some(trouble) => printer.styled_line(Bold, &format!("{hostname}: {}", trouble.replace('\n', "\n    "))),
+            None => printer.line(&format!("{hostname}: nixos-rebuild wouldn't change the system")),
         }
     }
     let password = password_for_initrd(ssh, machine, &mut session, &facts.boot, password, printer).with_context(not_rebooted)?;
