@@ -107,9 +107,11 @@ That includes the VM tests in tests/vm, which take minutes.  If the change can't
 
 # Committing
 
-Commit one logical change at a time whenever possible! Commit early and often! Rework the commits if that makes them better, otherwise just keep going!
+**Other sessions may be at work** and their commits must not be lost. On HEAD / master / main / prime: rebase, amend, reset, stash, etc. **are never allowed**, unless other sessions are idle and not waiting on anything!
 
-Only when small commits are impossible (e.g. with build still working), should larger commits be made.
+Smaller changes are usually easier to think about. Commit one logical change at a time whenever possible! Commit early and often!
+
+When small commits are too hard with e.g. the build still working, larger commits are fine.
 
 **Use the imperative mood in the subject line**. Do not end the subject line with a period. Wrap the body at 72 characters, generally.
 
