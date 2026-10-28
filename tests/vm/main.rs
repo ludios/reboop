@@ -20,7 +20,7 @@ use reboop::bounce::{self, Outcome, Printer};
 use reboop::btrfs::{self, Device, ScrubState};
 use reboop::config::Machine;
 use reboop::deadline::{Deadline, Permanent};
-use reboop::facts;
+use reboop::facts::{self, Rebuild};
 use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
 use reboop::processes::{self, Activity};
@@ -163,6 +163,35 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     let load = facts::load_average_1min(&mut session)?;
     assert!((0.0..100.0).contains(&load), "{load}");
     Ok(())
+}
+
+/// The VMs' NIX_PATH, from nix.nixPath in common.nix.
+const NIX_PATH: &str = "nixpkgs=/etc/reboop-test-nixpkgs:nixos-config=/etc/nixos/configuration.nix";
+
+/// Makes the configuration of the VM at the other end of `session` evaluate
+/// to `toplevel`, by way of the stub nixpkgs in common.nix.
+fn set_evaluated_toplevel(session: &mut Session, toplevel: &str) -> Result<()> {
+    sh(session, &format!("printf %s {} >/var/tmp/reboop-test-toplevel", shell_quote(toplevel))).map(drop)
+}
+
+fn rebuild_is_evaluated(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    let profile = facts::systems(&mut session)?.default;
+    let systems = &vm.manifest.systems;
+    let other = if profile == systems.base { &systems.alt } else { &systems.base };
+
+    // NIX_PATH reaches the session, and the stub has nothing to evaluate to yet.
+    let Rebuild::Failed { error, nix_path } = facts::rebuild(&mut session, &profile)? else {
+        bail!("evaluated without a toplevel to evaluate to");
+    };
+    assert_eq!(nix_path, NIX_PATH);
+    assert_eq!(facts::nix_error_gist(&error).lines().next(), Some("path '/var/tmp/reboop-test-toplevel' does not exist"), "{error}");
+
+    set_evaluated_toplevel(&mut session, &profile)?;
+    assert_eq!(facts::rebuild(&mut session, &profile)?, Rebuild::Fresh { toplevel: profile.clone(), nix_path: NIX_PATH.into() });
+    set_evaluated_toplevel(&mut session, other)?;
+    assert_eq!(facts::rebuild(&mut session, &profile)?, Rebuild::Stale { toplevel: other.clone(), nix_path: NIX_PATH.into() });
+    clean_up(&mut session)
 }
 
 fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
@@ -882,6 +911,7 @@ fn main() {
         ("session_breaks_on_timeout", session_breaks_on_timeout),
         ("unreachable_ports_fail_fast", unreachable_ports_fail_fast),
         ("identity_and_systems", identity_and_systems),
+        ("rebuild_is_evaluated", rebuild_is_evaluated),
         ("network_sample_sees_traffic", network_sample_sees_traffic),
         ("activities_are_detected", activities_are_detected),
         ("preflight_finds_blockers", preflight_finds_blockers),
@@ -902,6 +932,7 @@ fn main() {
     ];
     let grub: &[(&str, Test)] = &[
         ("identity_and_systems", identity_and_systems),
+        ("rebuild_is_evaluated", rebuild_is_evaluated),
         ("preflight_finds_blockers", preflight_finds_blockers),
         ("btrfs_root_is_idle", btrfs_root_is_idle),
         ("smart_is_read_from_disks", smart_is_read_from_disks),

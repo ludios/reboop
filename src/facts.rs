@@ -193,6 +193,127 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel, running_parts, default_parts })
 }
 
+/// How long evaluating a configuration may take: seconds for most, but
+/// reading nixpkgs with a cold page cache on a slow disk, or a big
+/// configuration, can take minutes.
+const EVAL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long an evaluation gets to exit after [`EVAL_TIMEOUT`]'s SIGTERM,
+/// before SIGKILL.
+const EVAL_KILL_AFTER: Duration = Duration::from_secs(5);
+
+/// Whether `nixos-rebuild switch` or `boot` would change the system
+/// profile, found by evaluating the configuration without building it.
+/// Each variant has the NIX_PATH that the evaluation used.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Rebuild {
+    /// The configuration evaluates to the profile's toplevel.
+    Fresh { toplevel: String, nix_path: String },
+    /// It evaluates to another toplevel, which a rebuild would switch to.
+    Stale { toplevel: String, nix_path: String },
+    /// Why it couldn't be evaluated: nix-instantiate's stderr, that it was
+    /// killed or took too long, that NIX_PATH is empty, or that the machine
+    /// is configured in a way that isn't supported.
+    Failed { error: String, nix_path: String },
+}
+
+impl Rebuild {
+    /// What a rebuild would change, for people, given the system profile's
+    /// toplevel `profile`, or why that's unknown (just the gist of a Nix
+    /// error: see [`nix_error_gist`]); `None` if it would change nothing.
+    pub fn trouble(&self, profile: &str) -> Option<String> {
+        match self {
+            Rebuild::Fresh { .. } => None,
+            Rebuild::Stale { toplevel, .. } => Some(format!("nixos-rebuild would change the system: {profile} → {toplevel}")),
+            Rebuild::Failed { error, .. } => Some(format!("couldn't evaluate the configuration: {}", nix_error_gist(error))),
+        }
+    }
+}
+
+/// What went wrong according to an `error` that Nix printed: its last line
+/// that starts with "error: " and the lines after it (like where in a file),
+/// without that prefix, the trace before it, or their shared indentation.
+/// All of `error` if no line starts that way.
+pub fn nix_error_gist(error: &str) -> String {
+    let lines: Vec<&str> = error.lines().collect();
+    let Some(start) = lines.iter().rposition(|line| line.trim_start().starts_with("error: ")) else { return error.to_string() };
+    let first = lines[start].trim_start();
+    let indent = &lines[start][..lines[start].len() - first.len()];
+    let rest = lines[start + 1..].iter().map(|line| line.strip_prefix(indent).unwrap_or(line));
+    std::iter::once(&first["error: ".len()..]).chain(rest).collect::<Vec<_>>().join("\n")
+}
+
+/// Parses the output of [`rebuild`]'s script (`stdout` and `stderr`), given
+/// the system profile's toplevel, `profile`.  Fails only on output that the
+/// script doesn't print.
+fn parse_rebuild(stdout: &str, stderr: &str, profile: &str) -> Result<Rebuild> {
+    let context = || format!("unexpected output from the evaluation script: {stdout:?}");
+    let (nix_path, rest) = stdout.split_once('\n').ok_or_else(|| anyhow!(context()))?;
+    let nix_path = nix_path.to_string();
+    if let Some(entry) = rest.strip_prefix("unsupported ") {
+        let error = format!("not supported: nixos-rebuild would build {} rather than <nixpkgs/nixos>", entry.trim_end());
+        return Ok(Rebuild::Failed { error, nix_path });
+    }
+    if nix_path.is_empty() {
+        ensure!(rest.is_empty(), context());
+        return Ok(Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path });
+    }
+    let (line, output) = rest.split_once('\n').ok_or_else(|| anyhow!(context()))?;
+    let numbers = line.strip_prefix("exit ").ok_or_else(|| anyhow!(context()))?.split(' ');
+    let numbers: Vec<i64> = numbers.map(str::parse).collect::<Result<_, _>>().with_context(context)?;
+    let [status, seconds] = numbers[..] else { bail!(context()) };
+    let evaluated = match status {
+        0 => store_path(output).map_err(|error| format!("{error:#}")),
+        124 => Err(format!("took longer than {} s", EVAL_TIMEOUT.as_secs())),
+        // From timeout's SIGKILL or the OOM killer's
+        137 => Err(format!("killed after {seconds} s (out of memory, or stuck past the timeout)")),
+        _ if !stderr.is_empty() => Err(stderr.to_string()),
+        _ => Err(format!("nix-instantiate exited with status {status}")),
+    };
+    Ok(match evaluated {
+        Ok(toplevel) if toplevel == profile => Rebuild::Fresh { toplevel, nix_path },
+        Ok(toplevel) => Rebuild::Stale { toplevel, nix_path },
+        Err(error) => Rebuild::Failed { error, nix_path },
+    })
+}
+
+/// Whether `nixos-rebuild switch` or `boot` would change the system
+/// profile, whose toplevel is `profile`: evaluates the toplevel of the
+/// configuration without building it or writing to the store.  Only the
+/// default way of building is supported: `<nixpkgs/nixos>`, with
+/// nixos-config from NIX_PATH.  The evaluation is niced, and the OOM
+/// killer's first pick.  Fails only if the session or the script does:
+/// whatever goes wrong with the evaluation is [`Rebuild::Failed`].
+pub fn rebuild(session: &mut Session, profile: &str) -> Result<Rebuild> {
+    // Prints NIX_PATH on a line, then "unsupported X" if nixos-rebuild would
+    // build X (in nixos-rebuild-ng's order of preference); or nothing more
+    // if NIX_PATH is empty; or else "exit STATUS SECONDS" and what the
+    // evaluation printed, which is the toplevel if it worked.
+    let script = format!(
+        r#"printf '%s\n' "$NIX_PATH"
+if test -e /etc/nixos/flake.nix; then
+    echo 'unsupported /etc/nixos/flake.nix'
+elif nixos_system=$(nix-instantiate --find-file nixos-system 2>/dev/null); then
+    echo "unsupported <nixos-system> ($nixos_system)"
+elif test -e /etc/nixos/system.nix; then
+    echo 'unsupported /etc/nixos/system.nix'
+elif test -n "$NIX_PATH"; then
+    start=$(date +%s)
+    toplevel=$(choom -n 1000 -- nice -n 19 timeout --kill-after={} {} nix-instantiate --eval --raw -A config.system.build.toplevel.outPath '<nixpkgs/nixos>')
+    status=$?
+    printf 'exit %d %d\n%s' "$status" "$(($(date +%s) - start))" "$toplevel"
+fi"#,
+        EVAL_KILL_AFTER.as_secs(),
+        EVAL_TIMEOUT.as_secs()
+    );
+    // Past the evaluation's timeout and kill, since a command that outlives
+    // the session's timeout breaks the session.
+    let output = session.run(&script, EVAL_TIMEOUT + EVAL_KILL_AFTER + QUICK)?;
+    ensure!(output.status == 0, "the evaluation script exited with status {}: {}", output.status, output.stderr_text());
+    parse_rebuild(&output.stdout_text(), &output.stderr_text(), profile)
+}
+
 /// Seconds since boot and each interface's (received, sent) byte counters.
 type NetSnapshot = (f64, BTreeMap<String, (u64, u64)>);
 
@@ -531,6 +652,50 @@ mod tests {
         assert_eq!(no_initrd.reboot_reasons(), ["new initrd"]);
         let systemd = Systems { default_parts: BootParts { systemd: rebuilt.systemd.clone(), ..same.running_parts.clone() }, ..same.clone() };
         assert_eq!(systemd.reboot_reasons(), ["rebuilt systemd"]);
+    }
+
+    #[test]
+    fn parses_rebuilds() {
+        let profile = format!("/nix/store/{}-nixos-system-one-26.05", "a".repeat(32));
+        let other = format!("/nix/store/{}-nixos-system-one-26.05", "b".repeat(32));
+        let nix_path = "nixpkgs=/var/nixpkgs:nixos-config=/etc/nixos/configuration.nix";
+        let parse = |stdout: &str, stderr: &str| parse_rebuild(stdout, stderr, &profile).unwrap();
+        let garbage = |stdout: &str| parse_rebuild(stdout, "", &profile).is_err();
+        let failed = |error: &str| Rebuild::Failed { error: error.into(), nix_path: nix_path.into() };
+        assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{profile}"), "warning: x"), Rebuild::Fresh { toplevel: profile.clone(), nix_path: nix_path.into() });
+        assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{other}"), ""), Rebuild::Stale { toplevel: other.clone(), nix_path: nix_path.into() });
+        assert_eq!(parse(&format!("{nix_path}\nexit 0 2\n{other}/bin"), ""), failed(&format!("not a store path: \"{other}/bin\"")));
+        assert_eq!(parse(&format!("{nix_path}\nexit 1 2\n"), "error: attribute 'config' missing"), failed("error: attribute 'config' missing"));
+        assert_eq!(parse(&format!("{nix_path}\nexit 127 0\n"), ""), failed("nix-instantiate exited with status 127"));
+        assert_eq!(parse(&format!("{nix_path}\nexit 124 180\n"), "x"), failed("took longer than 180 s"));
+        assert_eq!(parse(&format!("{nix_path}\nexit 137 41\n"), ""), failed("killed after 41 s (out of memory, or stuck past the timeout)"));
+        assert_eq!(
+            parse(&format!("{nix_path}\nunsupported <nixos-system> (/etc/nixos-system)\n"), ""),
+            failed("not supported: nixos-rebuild would build <nixos-system> (/etc/nixos-system) rather than <nixpkgs/nixos>")
+        );
+        assert_eq!(parse("\n", ""), Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: "".into() });
+        assert!(garbage("\nexit 0 2\n"));
+        assert!(garbage(&format!("{nix_path}\nexit 0\n{profile}")));
+        assert!(garbage(&format!("{nix_path}\n")));
+        assert!(garbage(""));
+    }
+
+    #[test]
+    fn finds_the_gist_of_nix_errors() {
+        let error = "error:\n       … while calling the 'readFile' builtin\n         at /etc/x/default.nix:1:42:\n            1| { a = builtins.readFile /x; }\n             |                                          ^\n\n       \
+                     (stack trace truncated; use '--show-trace' to show the full, detailed trace)\n\n       error: path '/x' does not exist\n       at /etc/y.nix:2:3:\n            2| x";
+        assert_eq!(nix_error_gist(error), "path '/x' does not exist\nat /etc/y.nix:2:3:\n     2| x");
+        assert_eq!(nix_error_gist("error: file 'nixpkgs/nixos' was not found in the Nix search path"), "file 'nixpkgs/nixos' was not found in the Nix search path");
+        assert_eq!(nix_error_gist("took longer than 180 s"), "took longer than 180 s");
+    }
+
+    #[test]
+    fn serializes_rebuilds() {
+        let stale = Rebuild::Stale { toplevel: "/nix/store/bbb-nixos-system-one-26.05".into(), nix_path: "nixpkgs=/var/nixpkgs".into() };
+        let json = serde_json::json!({"state": "stale", "toplevel": "/nix/store/bbb-nixos-system-one-26.05", "nix_path": "nixpkgs=/var/nixpkgs"});
+        assert_eq!(serde_json::to_value(stale).unwrap(), json);
+        let failed = Rebuild::Failed { error: "NIX_PATH is empty".into(), nix_path: "".into() };
+        assert_eq!(serde_json::to_value(failed).unwrap(), serde_json::json!({"state": "failed", "error": "NIX_PATH is empty", "nix_path": ""}));
     }
 
     #[test]

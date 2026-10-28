@@ -69,6 +69,15 @@
     smartmontools
   ];
 
+  # A stub nixpkgs, so that evaluating the configuration (see facts::rebuild)
+  # is cheap, and gives whatever toplevel a test writes to the file (without
+  # a trailing newline).  NIX_PATH reaches reboop's session the way it does
+  # on the real machines, which set nix.nixPath too.
+  nix.nixPath = [ "nixpkgs=/etc/reboop-test-nixpkgs" "nixos-config=/etc/nixos/configuration.nix" ];
+  environment.etc."reboop-test-nixpkgs/nixos/default.nix".text = ''
+    { config.system.build.toplevel.outPath = builtins.readFile /var/tmp/reboop-test-toplevel; }
+  '';
+
   services.timesyncd.enable = false;
   services.logrotate.enable = false;
   nix.settings.substituters = lib.mkForce [ ];
