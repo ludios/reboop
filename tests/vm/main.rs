@@ -147,7 +147,8 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     // The parts a reboot would replace are the running kernel's packages,
     // its initrd, and systemd; nothing needs a reboot while the system
     // profile is what booted.
-    let (parts, release) = (&systems.running_parts, &systems.running_kernel);
+    let parts = &systems.running_parts;
+    let release = &systems.running_kernel;
     assert!(parts.kernel.ends_with(&format!("-linux-{release}")), "{parts:?}");
     assert!(parts.kernel_modules.ends_with(&format!("-linux-{release}-modules")), "{parts:?}");
     assert!(parts.initrd.as_ref().is_some_and(|initrd| initrd.ends_with(&format!("-initrd-linux-{release}"))), "{parts:?}");
@@ -630,7 +631,8 @@ fn grubs_defaults_are_checked(vm: &Vm) -> Result<()> {
 
     // Set aside `file`, and have clean_up put it back.
     let set_aside = |name: &str, file: &str| {
-        let (backup, file) = (format!("/var/tmp/reboop-test-{name}"), shell_quote(file));
+        let backup = format!("/var/tmp/reboop-test-{name}");
+        let file = shell_quote(file);
         format!("cp {file} {backup} && printf %s {file} >{backup}-path")
     };
     let machine = vm_machine(vm);

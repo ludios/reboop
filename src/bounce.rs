@@ -189,7 +189,9 @@ fn check_initrd_addresses(machine: &Machine, boots: &[DefaultBoot]) -> Result<()
         let addresses = boot.initrd_addresses();
         let elsewhere = !addresses.is_empty() && !addresses.contains(&machine.ipv4);
         let addresses: Vec<_> = addresses.iter().map(Ipv4Addr::to_string).collect();
-        let (loader, entry, ipv4) = (&boot.loader, &boot.entry, machine.ipv4);
+        let loader = &boot.loader;
+        let entry = &boot.entry;
+        let ipv4 = machine.ipv4;
         ensure!(!elsewhere, "{loader}'s default, {entry:?}, has the initrd take {} (ip=), not {ipv4}", addresses.join(" and "));
     }
     Ok(())
@@ -341,7 +343,8 @@ fn wait_for_return(
     deadline: Deadline,
     on_retry: impl FnMut(&anyhow::Error),
 ) -> Result<Found> {
-    let (target, initrd_target) = (machine.target(), machine.initrd_target());
+    let target = machine.target();
+    let initrd_target = machine.initrd_target();
     // Finishes logging in through `opening`, and checks that it's to the
     // machine back from its reboot.
     let back = |opening: Opening, deadline: Deadline| -> Result<Session> {
@@ -357,7 +360,8 @@ fn wait_for_return(
     // down can take ssh's ConnectTimeout to fail, which would hold up the
     // other.  Returns both errors when neither wins.
     let race = |opening: Opening, agent: Agent<'_>, deadline: Deadline| -> Result<Found, (anyhow::Error, UnlockError)> {
-        let (kill_opening, kill_agent) = (opening.killer(), agent.killer());
+        let kill_opening = opening.killer();
+        let kill_agent = agent.killer();
         let (came_back, unlocked) = thread::scope(|scope| {
             let unlocking = scope.spawn(|| {
                 let unlocked = agent.unlock(deadline);
@@ -512,7 +516,8 @@ fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut
 /// scrub_every_days.  Returns the problems (none if all is well).
 fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
-    let (target, initrd_target) = (machine.target(), machine.initrd_target());
+    let target = machine.target();
+    let initrd_target = machine.initrd_target();
     printer.line(&match password {
         Some(_) => format!("Waiting for {target}, or for the initrd at {initrd_target}"),
         None => format!("Waiting for {target}"),

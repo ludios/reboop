@@ -37,7 +37,10 @@ pub fn rate(bytes_per_sec: f64) -> String {
 
 /// Formats seconds like "1d 2h 3m 4s", leaving out leading zero units.
 pub fn seconds(seconds: u64) -> String {
-    let (days, hours, minutes, seconds) = (seconds / 86400, seconds / 3600 % 24, seconds / 60 % 60, seconds % 60);
+    let days    = seconds / 86400;
+    let hours   = seconds / 3600 % 24;
+    let minutes = seconds / 60 % 60;
+    let seconds = seconds % 60;
     match (days, hours, minutes) {
         (0, 0, 0) => format!("{seconds}s"),
         (0, 0, _) => format!("{minutes}m {seconds}s"),
@@ -132,7 +135,8 @@ impl Cell {
 /// "12-31T23:59", the "T" dim to set apart the date and the time of day.
 pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
     let zoned = time.to_zoned(zone.clone());
-    let (date, time_of_day) = (zoned.strftime("%m-%d").to_string(), zoned.strftime("%H:%M").to_string());
+    let date = zoned.strftime("%m-%d").to_string();
+    let time_of_day = zoned.strftime("%H:%M").to_string();
     Style::Plain.cell(date).then(Style::Dim, "T").then(Style::Plain, time_of_day)
 }
 
