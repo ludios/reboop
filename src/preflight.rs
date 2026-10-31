@@ -252,7 +252,7 @@ pub fn blockers_ignoring_load_and_network(machine: &Machine, facts: &Facts) -> V
 pub fn blockers(machine: &Machine, facts: &Facts) -> Vec<String> {
     let mut blockers = blockers_ignoring_load_and_network(machine, facts);
     if network_over_limit(machine, facts) {
-        let rate = human::rate(facts.network_bytes_per_sec);
+        let rate  = human::rate(facts.network_bytes_per_sec);
         let limit = human::rate(machine.max_network_transfer_bytes_per_sec as f64);
         blockers.push(format!("network: {rate} is over the limit of {limit}"));
     }

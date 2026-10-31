@@ -79,7 +79,7 @@ fn parse_ps(output: &str) -> Result<Vec<Process>> {
                 rest = after.trim_start();
                 value
             };
-            let pid = field();
+            let pid  = field();
             let ppid = field();
             let user = field();
             Ok(Process { pid: pid.parse()?, ppid: ppid.parse()?, user: user.to_string(), args: rest.to_string() })

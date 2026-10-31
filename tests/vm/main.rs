@@ -147,7 +147,7 @@ fn identity_and_systems(vm: &Vm) -> Result<()> {
     // The parts a reboot would replace are the running kernel's packages,
     // its initrd, and systemd; nothing needs a reboot while the system
     // profile is what booted.
-    let parts = &systems.running_parts;
+    let parts   = &systems.running_parts;
     let release = &systems.running_kernel;
     assert!(parts.kernel.ends_with(&format!("-linux-{release}")), "{parts:?}");
     assert!(parts.kernel_modules.ends_with(&format!("-linux-{release}-modules")), "{parts:?}");

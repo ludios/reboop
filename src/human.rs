@@ -136,7 +136,7 @@ impl Cell {
 /// "12-31T23:59", the "T" dim to set apart the date and the time of day.
 pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
     let zoned = time.to_zoned(zone.clone());
-    let date = zoned.strftime("%m-%d").to_string();
+    let date        = zoned.strftime("%m-%d").to_string();
     let time_of_day = zoned.strftime("%H:%M").to_string();
     Style::Plain.cell(date).then(Style::Dim, "T").then(Style::Plain, time_of_day)
 }
