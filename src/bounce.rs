@@ -481,7 +481,7 @@ fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut
         printer.line(&format!("Waiting for the scrub that's already running on {}", printer.bold(mountpoint)));
     } else {
         printer.line(&format!("Scrubbing btrfs on {}", printer.bold(mountpoint)));
-        btrfs::start_scrub(session, mountpoint, QUICK)?;
+        btrfs::start_scrub(session, mountpoint)?;
     }
     let status = btrfs::wait_for_scrub(session, mountpoint, SCRUB_INTERVAL, Deadline::after(SCRUB_TIMEOUT), |status| {
         printer.progress(&format!("btrfs on {mountpoint}: {}", status.summary()));

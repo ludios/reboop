@@ -460,13 +460,13 @@ fn btrfs_running_scrub_and_balance_are_detected(vm: &Vm) -> Result<()> {
 
     // Throttle scrubbing so that it's still running when we look.
     sh(&mut session, &format!("echo 1m >/sys/fs/btrfs/{}/devinfo/1/scrub_speed_max", filesystem.uuid))?;
-    btrfs::start_scrub(&mut session, &mountpoint, MINUTE)?;
+    btrfs::start_scrub(&mut session, &mountpoint)?;
     let status = btrfs::scrub_status(&mut session, &mountpoint)?;
     assert_eq!(status.state, ScrubState::Running);
     assert!(status.summary().starts_with("scrub has "), "{}", status.summary());
     // A scrub isn't an exclusive operation.
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystem)?, "none");
-    assert!(btrfs::start_scrub(&mut session, &mountpoint, MINUTE).is_err());
+    assert!(btrfs::start_scrub(&mut session, &mountpoint).is_err());
     sh(&mut session, &format!("btrfs scrub cancel {mountpoint}"))?;
     assert_eq!(btrfs::scrub_status(&mut session, &mountpoint)?.state, ScrubState::Aborted);
 
@@ -483,7 +483,7 @@ fn btrfs_running_scrub_and_balance_are_detected(vm: &Vm) -> Result<()> {
 
 fn scrub_of_root_finishes_clean(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    btrfs::start_scrub(&mut session, "/", MINUTE)?;
+    btrfs::start_scrub(&mut session, "/")?;
     let mut summaries = Vec::new();
     let status = btrfs::wait_for_scrub(&mut session, "/", Duration::from_secs(1), Deadline::after(5 * MINUTE), |status| {
         summaries.push(status.summary());
@@ -516,7 +516,7 @@ fn scrub_finds_corruption(vm: &Vm) -> Result<()> {
         ),
     )?;
 
-    btrfs::start_scrub(&mut session, &mountpoint, MINUTE)?;
+    btrfs::start_scrub(&mut session, &mountpoint)?;
     let status = btrfs::wait_for_scrub(&mut session, &mountpoint, Duration::from_millis(500), Deadline::after(MINUTE), |_| {})?;
     assert_eq!(status.state, ScrubState::Finished);
     assert!(status.errors.get("csum_errors").is_some_and(|&n| n > 0), "{status:?}");
@@ -726,7 +726,7 @@ fn catch_when_up(vm: &Vm) -> Result<()> {
     // so that it's still running when cancelled)
     let speed_max = format!("/sys/fs/btrfs/{uuid}/devinfo/1/scrub_speed_max");
     sh(&mut session, &format!("echo 1m >{speed_max}"))?;
-    btrfs::start_scrub(&mut session, "/", MINUTE)?;
+    btrfs::start_scrub(&mut session, "/")?;
     sh(&mut session, &format!("btrfs scrub cancel / && echo 0 >{speed_max}"))?;
     assert_eq!(btrfs::scrub_status(&mut session, "/")?.state, ScrubState::Aborted);
     let (problems, printed) = catch_vm(vm, None)?;

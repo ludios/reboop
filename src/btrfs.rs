@@ -280,6 +280,13 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     })
 }
 
+/// How long to let a `btrfs scrub` command take, or a new scrub take to show
+/// up in `btrfs scrub status`.  Each asks the kernel how the scrub is going,
+/// under a lock that a starting scrub holds while it reads the superblocks
+/// at its idle IO priority, which can take a while on disks busy with other
+/// IO, such as hard drives just after boot.
+const SCRUB_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// What `btrfs scrub status` says when another btrfs command has the status
 /// file locked, such as a scrub rewriting it, which one does every 5s.  It
 /// reads that file whenever it can't ask the scrub over its socket, which
@@ -296,7 +303,7 @@ const LOCKED_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::fr
 /// [`LOCKED_RETRY_DELAYS`].
 fn run_scrub_status(session: &mut Session, script: &str) -> Result<String> {
     for delay in LOCKED_RETRY_DELAYS {
-        match session.run_ok(script, QUICK) {
+        match session.run_ok(script, SCRUB_COMMAND_TIMEOUT) {
             Err(error) if error.to_string().contains(STATUS_FILE_LOCKED) => {
                 debug!("{error:#}; trying again in {delay:?}");
                 sleep(delay);
@@ -304,7 +311,7 @@ fn run_scrub_status(session: &mut Session, script: &str) -> Result<String> {
             result => return result,
         }
     }
-    session.run_ok(script, QUICK).with_context(|| format!("tried {} times", LOCKED_RETRY_DELAYS.len() + 1))
+    session.run_ok(script, SCRUB_COMMAND_TIMEOUT).with_context(|| format!("tried {} times", LOCKED_RETRY_DELAYS.len() + 1))
 }
 
 /// The state of the latest scrub of the btrfs filesystem mounted at
@@ -317,21 +324,27 @@ pub fn scrub_status(session: &mut Session, mountpoint: &str) -> Result<ScrubStat
 }
 
 /// Starts scrubbing the btrfs filesystem mounted at `mountpoint`, and waits
-/// (up to `timeout`) until btrfs-progs reports it as the latest scrub.
-pub fn start_scrub(session: &mut Session, mountpoint: &str, timeout: Duration) -> Result<()> {
-    let deadline = Deadline::after(timeout);
+/// until btrfs-progs reports it as the latest scrub.
+pub fn start_scrub(session: &mut Session, mountpoint: &str) -> Result<()> {
     let before = scrub_status(session, mountpoint)?;
     ensure!(before.state != ScrubState::Running, "a scrub is already running on {mountpoint}");
-    session.run_ok(&format!("btrfs scrub start -- {}", shell_quote(mountpoint)), QUICK)?;
+    session.run_ok(&format!("btrfs scrub start -- {}", shell_quote(mountpoint)), SCRUB_COMMAND_TIMEOUT)?;
     // For a moment, the new scrub has "no stats available".  (Start times
     // are to the second, so a scrub that started and ended within the same
     // second as this one would fool us, but that's no real filesystem.)
+    // It shows up once the scrub has written its status file, which it does
+    // after asking the kernel how it's going.
+    let deadline = Deadline::after(SCRUB_COMMAND_TIMEOUT);
     loop {
+        // A status reads that file before it asks the kernel, so it can be
+        // stale by the time it's back; only one begun after the deadline
+        // counts against the scrub.
+        let late = deadline.has_passed();
         let started = scrub_status(session, mountpoint)?.started;
         if started.is_some() && started != before.started {
             return Ok(());
         }
-        ensure!(!deadline.has_passed(), "the scrub of {mountpoint} didn't start");
+        ensure!(!late, "the scrub of {mountpoint} didn't start");
         sleep(Duration::from_millis(200).min(deadline.remaining()));
     }
 }
