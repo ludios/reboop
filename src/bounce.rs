@@ -94,13 +94,12 @@ impl<'a> Printer<'a> {
             let _ = write!(self.out, "\r{}\r", " ".repeat(self.progress_chars));
             self.progress_chars = 0;
         }
-        let text = match self.clock {
-            Some(clock) => {
-                let time = clock();
-                let text = text.replace('\n', &format!("\n{}", " ".repeat(time.chars().count() + 1)));
-                format!("{} {}", self.paint(Dim, &time), self.paint(style, &text))
-            }
-            None => self.paint(style, text),
+        let text = if let Some(clock) = self.clock {
+            let time = clock();
+            let text = text.replace('\n', &format!("\n{}", " ".repeat(time.chars().count() + 1)));
+            format!("{} {}", self.paint(Dim, &time), self.paint(style, &text))
+        } else {
+            self.paint(style, text)
         };
         let _ = writeln!(self.out, "{text}");
         let _ = self.out.flush();

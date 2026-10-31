@@ -4,7 +4,7 @@
 //! Taking a remote machine down.
 
 use crate::ssh::{QUICK, Session, shell_quote};
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use std::time::Duration;
 use tracing::info;
 
@@ -80,12 +80,10 @@ impl Down {
 /// systemctl failed or hung.
 pub fn ask(mut session: Session, down: Down) -> Result<()> {
     let command = down.command();
-    match session.run_or_disconnect(command, Duration::from_secs(60))? {
-        Some(output) if output.status == 0 => Ok(()),
-        Some(output) => bail!("{command} exited with status {}: {}", output.status, output.stderr_text()),
-        None => {
-            info!("the connection closed after asking to {}, as expected", down.verb());
-            Ok(())
-        }
-    }
+    let Some(output) = session.run_or_disconnect(command, Duration::from_secs(60))? else {
+        info!("the connection closed after asking to {}, as expected", down.verb());
+        return Ok(());
+    };
+    ensure!(output.status == 0, "{command} exited with status {}: {}", output.status, output.stderr_text());
+    Ok(())
 }

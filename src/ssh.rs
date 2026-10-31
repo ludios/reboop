@@ -194,10 +194,8 @@ impl Session {
                 return Ok(Some(line));
             }
             self.scanned = self.pending.len();
-            match self.ssh.read_stdout(deadline)? {
-                Some(chunk) => self.pending.extend_from_slice(&chunk),
-                None => return Ok(None),
-            }
+            let Some(chunk) = self.ssh.read_stdout(deadline)? else { return Ok(None) };
+            self.pending.extend_from_slice(&chunk);
         }
     }
 
@@ -209,14 +207,12 @@ impl Session {
     /// connection closed first.
     fn exchange(&mut self, script: &str, deadline: Deadline) -> Result<Option<CommandOutput>> {
         self.ssh.write_stdin(format!("{}\n", BASE64.encode(script)).as_bytes(), deadline)?;
-        match self.read_line(deadline)? {
-            Some(line) => Ok(Some(parse_response(&line)?)),
-            None => {
-                // So that ssh's stderr is complete
-                let _ = self.ssh.finish(deadline);
-                Ok(None)
-            }
-        }
+        let Some(line) = self.read_line(deadline)? else {
+            // So that ssh's stderr is complete
+            let _ = self.ssh.finish(deadline);
+            return Ok(None);
+        };
+        Ok(Some(parse_response(&line)?))
     }
 
     /// Like [`Session::run`], but for a command that may end the connection,
@@ -278,18 +274,17 @@ impl Opening {
     pub fn open(self, deadline: Deadline) -> Result<Session> {
         let Opening(mut session) = self;
         loop {
-            // Skip anything that root's shell startup files print.
-            match session.read_line(deadline).with_context(|| format!("failed to open a session to {}", session.target))? {
-                Some(line) if line == SESSION_READY => return Ok(session),
-                Some(_) => {}
-                None => {
-                    let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
-                    let target = &session.target;
-                    if is_permanent_failure(&stderr) {
-                        return Err(Permanent(format!("failed to open a session to {target}: {stderr}")).into());
-                    }
-                    return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
+            let Some(line) = session.read_line(deadline).with_context(|| format!("failed to open a session to {}", session.target))? else {
+                let stderr = session.ssh.finish(deadline).map(|(_, stderr)| stderr).unwrap_or_default();
+                let target = &session.target;
+                if is_permanent_failure(&stderr) {
+                    return Err(Permanent(format!("failed to open a session to {target}: {stderr}")).into());
                 }
+                return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
+            };
+            // Skip anything that root's shell startup files print.
+            if line == SESSION_READY {
+                return Ok(session);
             }
         }
     }
