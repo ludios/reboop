@@ -35,12 +35,13 @@ pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", kilobytes_or_more(bytes_per_sec))
 }
 
-/// Formats seconds like "1d 2h 3m 4s", leaving out leading zero units.
-pub fn seconds(seconds: u64) -> String {
-    let days    = seconds / 86400;
-    let hours   = seconds / 3600 % 24;
-    let minutes = seconds / 60 % 60;
-    let seconds = seconds % 60;
+/// Formats `total` seconds like "1d 2h 3m 4s", leaving out leading zero
+/// units.
+pub fn seconds(total: u64) -> String {
+    let days    = total / 86400;
+    let hours   = total / 3600 % 24;
+    let minutes = total / 60 % 60;
+    let seconds = total % 60;
     match (days, hours, minutes) {
         (0, 0, 0) => format!("{seconds}s"),
         (0, 0, _) => format!("{minutes}m {seconds}s"),
