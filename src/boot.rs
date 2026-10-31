@@ -224,8 +224,11 @@ fn find_entry<'a>(menu: &'a [MenuItem], path: &str) -> Option<&'a MenuItem> {
 /// (A path's start depends on the filesystem GRUB reads it from, and any
 /// btrfs subvolume, but its end is a store path or a /boot's kernels
 /// directory.)
-fn grub_file(boot_path: &str, path: &str) -> String {
-    let path = path.strip_prefix('(').and_then(|rest| rest.split_once(')')).map_or(path, |(_, rest)| rest);
+fn grub_file(boot_path: &str, mut path: &str) -> String {
+    // Drop a leading GRUB device name, like "($drive1)"
+    if let Some(rest) = path.strip_prefix('(') && let Some((_, rest)) = rest.split_once(')') {
+        path = rest;
+    }
     let boot_path = boot_path.trim_end_matches('/');
     if let Some(start) = path.find("/nix/store/") {
         path[start..].to_string()
@@ -360,7 +363,7 @@ fn parse_firmware_overrides(boot_next: Option<&[u8]>, os_indications: Option<&[u
         overrides.push(format!("the firmware will boot Boot{option:04X} next (BootNext), whatever the boot loader's default"));
     }
     // EFI_OS_INDICATIONS_BOOT_TO_FW_UI
-    if os_indications.and_then(|bytes| bytes.first()).is_some_and(|&low| low & 1 != 0) {
+    if let Some(&[low, ..]) = os_indications && low & 1 != 0 {
         overrides.push("the firmware will open its setup at the next boot (OsIndications)".into());
     }
     overrides

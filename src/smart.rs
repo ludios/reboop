@@ -238,11 +238,12 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
     };
     // smartctl leaves a disk in standby or asleep alone (`-n standby`),
     // saying e.g. "Device is in STANDBY mode, exit(2)".
-    let low_power = output.smartctl.messages.iter().find_map(|message| message.string.strip_prefix("Device is in ")?.split_once(" mode, exit(").map(|(mode, _)| mode));
-    if let Some(mode) = low_power {
-        // smartctl takes a disk whose power mode it can't read to be asleep.
-        let unsure = if mode == "SLEEP" { " (or its power mode couldn't be read)" } else { "" };
-        return unread(format!("not woken from {mode} mode{unsure}"));
+    for message in &output.smartctl.messages {
+        if let Some(rest) = message.string.strip_prefix("Device is in ") && let Some((mode, _)) = rest.split_once(" mode, exit(") {
+            // smartctl takes a disk whose power mode it can't read to be asleep.
+            let unsure = if mode == "SLEEP" { " (or its power mode couldn't be read)" } else { "" };
+            return unread(format!("not woken from {mode} mode{unsure}"));
+        }
     }
 
     let mut warnings = BTreeMap::new();

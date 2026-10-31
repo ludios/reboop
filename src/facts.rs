@@ -60,7 +60,8 @@ fn store_entry(output: &str) -> Result<String> {
     let context = || anyhow!("not a path in the store: {path:?}");
     let rest = path.strip_prefix("/nix/store/").ok_or_else(context)?;
     let entry = rest.split_once('/').map_or(rest, |(entry, _)| entry);
-    let (hash, name) = entry.split_at_checked(32).and_then(|(hash, rest)| Some((hash, rest.strip_prefix('-')?))).ok_or_else(context)?;
+    let (hash, rest) = entry.split_at_checked(32).ok_or_else(context)?;
+    let name = rest.strip_prefix('-').ok_or_else(context)?;
     ensure!(hash.bytes().all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()) && !name.is_empty(), context());
     Ok(format!("/nix/store/{entry}"))
 }
