@@ -61,7 +61,21 @@ If you can't fetch something, use google-chrome or curl_chrome150 on this machin
 
 Files with any LLM-authored code (not counting mechanistic sed-like changes) begin with a comment like `// Model-output: <model name>`, one per model that contributed (e.g. "Claude Mythos 5.1", "ChatGPT 6 Astra"); keep existing lines.
 
+# English
+
+All new English must be maximally unambiguous, even if it becomes slightly longer! Think as a reader, and read the text every possible way. For example, never write "cannot change a hash once set" instead of "cannot change a hash (if already set)".
+
+You can ask Astra via codex to rewrite stuff.
+
 # Code conventions
+
+For Rust code:
+
+- No useless use of tuple: `let (size, frame_size) = (self.size, self.frame_size);` should be two lines instead.
+- It's okay to keep things simple; no need to use combinators like `and_then` unless they're ideal.
+- Bodies of e.g. `if` / `else` expressions should be on their own lines unless they are very simple.
+- Prefer e.g. `let mut x = None` followed by `x = ...` over a `match` with a None or more lines.
+- Prefer `if let ` / `let ... else {` where it results in fewer lines than `match`.
 
 When writing _any_ kind of code:
 
@@ -152,7 +166,7 @@ After each commit made, `git clone --shared` the repo into some /tmp/ folder and
 	claude -p --model claude-mythos-5-1 --effort xhigh "/code-review xhigh commit <sha>"
 	claude -p --model claude-opus-5-5 --effort xhigh "/code-review xhigh commit <sha>"
 
-Ensure that the output of each review gets written or copied to ~/.ai-code-reviews/{model}/{commit} or /{commit-range}, then delete the clone.
+Ensure that the output of each review gets written or copied to ~/.ai-code-reviews/{model}/{full commit hash} or /{full commit hash-final full commit hash}, then delete the clone.
 
 Notes:
 
