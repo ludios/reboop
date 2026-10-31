@@ -388,7 +388,9 @@ fn wait_for_return(
     // inside Ok so that retry doesn't try again.
     let attempt = |deadline: Deadline| -> Result<Result<Found, UnlockError>> {
         let opening = Opening::start(ssh, &target)?;
-        let Some(password) = password else { return Ok(Ok(Found::Back(back(opening, deadline)?))) };
+        let Some(password) = password else {
+            return Ok(Ok(Found::Back(back(opening, deadline)?)));
+        };
         let agent = match Agent::start(ssh, &initrd_target, password) {
             Ok(agent) => agent,
             Err(fatal) => return Ok(Err(fatal)),

@@ -58,7 +58,11 @@ impl fmt::Display for Disk {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let serial = self.serial.as_ref().map(|serial| format!("serial {serial}"));
         let details: Vec<String> = [self.model.clone(), serial].into_iter().flatten().collect();
-        if details.is_empty() { write!(f, "{}", self.path) } else { write!(f, "{} ({})", self.path, details.join(", ")) }
+        if details.is_empty() {
+            write!(f, "{}", self.path)
+        } else {
+            write!(f, "{} ({})", self.path, details.join(", "))
+        }
     }
 }
 
@@ -269,11 +273,17 @@ fn parse_smartctl(status: &str, stdout: &str, stderr: &str) -> Smart {
     // messages are about `-n standby`, e.g. that it couldn't tell whether
     // the disk is in standby.
     let messages: Vec<&str> = output.smartctl.messages.iter().filter(|message| message.severity != "information").map(|message| message.string.as_str()).collect();
-    let why = if messages.is_empty() { format!("smartctl exited with status {}", output.smartctl.exit_status) } else { messages.join("; ") };
+    let why = if messages.is_empty() {
+        format!("smartctl exited with status {}", output.smartctl.exit_status)
+    } else {
+        messages.join("; ")
+    };
     let incomplete = match (passed.is_some(), ata || nvme) {
-        (false, false) => Some(if messages.is_empty() { format!("no SMART data ({why})") } else { why }),
+        (false, false) if messages.is_empty() => Some(format!("no SMART data ({why})")),
+        (false, false) => Some(why),
         (false, true) => Some(format!("no overall self-assessment ({why})")),
-        (true, false) => Some(if messages.is_empty() { "no ATA attributes or NVMe health log".to_string() } else { format!("no ATA attributes or NVMe health log ({why})") }),
+        (true, false) if messages.is_empty() => Some("no ATA attributes or NVMe health log".to_string()),
+        (true, false) => Some(format!("no ATA attributes or NVMe health log ({why})")),
         (true, true) if output.smartctl.exit_status & 0b111 != 0 => Some(why),
         (true, true) => None,
     };
@@ -351,7 +361,11 @@ mod tests {
                 format!(r#"{{"id":{id},"name":"{name}","value":100,"worst":100,"thresh":10,"when_failed":"","flags":{{"value":51,"string":"PO--CK "}},"raw":{{"value":{raw},"string":"{raw}"}}}}"#)
             })
             .collect();
-        let table = if with_table { format!(r#","ata_smart_attributes":{{"revision":16,"table":[{}]}}"#, rows.join(",")) } else { String::new() };
+        let table = if with_table {
+            format!(r#","ata_smart_attributes":{{"revision":16,"table":[{}]}}"#, rows.join(","))
+        } else {
+            String::new()
+        };
         format!(
             r#"{{"json_format_version":[1,0],"smartctl":{{"version":[7,5],"exit_status":{exit_status}}},"device":{{"name":"/dev/sda","type":"sat","protocol":"ATA"}},"model_name":"QEMU HARDDISK","serial_number":"QM00001",{status}"power_on_time":{{"hours":1}}{table}}}"#
         )

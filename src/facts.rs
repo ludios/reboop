@@ -190,7 +190,11 @@ pub fn systems(session: &mut Session) -> Result<Systems> {
     let default = store_path(&session.run_ok("readlink -f /nix/var/nix/profiles/system", QUICK)?)?;
     let default_kernel = kernel_release(session, &default)?;
     let booted_parts = boot_parts(session, &booted)?;
-    let default_parts = if default == booted { booted_parts.clone() } else { boot_parts(session, &default)? };
+    let default_parts = if default == booted {
+        booted_parts.clone()
+    } else {
+        boot_parts(session, &default)?
+    };
     let systemd = store_entry(&session.run_ok("readlink -v /proc/1/exe", QUICK)?)?;
     let running_parts = BootParts { systemd, ..booted_parts };
     Ok(Systems { current, booted, running_kernel, running_kernel_built_at, default, default_kernel, running_parts, default_parts })

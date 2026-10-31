@@ -292,7 +292,11 @@ fn grub_boot_paths(session: &mut Session) -> Result<Vec<String>> {
     let command = format!("findmnt --list --json --output TARGET --types {LOCAL_FILESYSTEMS}");
     let output = session.run(&command, QUICK)?;
     // findmnt exits 1 without output when nothing matches.
-    let mut candidates = if output.status == 1 && output.stdout.is_empty() { vec![] } else { parse_mountpoints(&output.stdout_text())? };
+    let mut candidates = if output.status == 1 && output.stdout.is_empty() {
+        vec![]
+    } else {
+        parse_mountpoints(&output.stdout_text())?
+    };
     candidates.push("/boot".into());
     candidates.sort();
     candidates.dedup();
