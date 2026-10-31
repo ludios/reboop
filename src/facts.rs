@@ -122,7 +122,10 @@ fn boot_parts(session: &mut Session, system: &str) -> Result<BootParts> {
         "readlink -v -- {quoted}/kernel {quoted}/kernel-modules {quoted}/systemd && if test -L {quoted}/initrd; then readlink -v -- {quoted}/initrd; fi"
     );
     let mut entries: Vec<String> = session.run_ok(&script, QUICK)?.lines().map(store_entry).collect::<Result<_>>()?;
-    let initrd = if entries.len() == 4 { entries.pop() } else { None };
+    let mut initrd = None;
+    if entries.len() == 4 {
+        initrd = entries.pop();
+    }
     let [kernel, kernel_modules, systemd] =
         <[String; 3]>::try_from(entries).map_err(|entries| anyhow!("expected 3 or 4 links in {system}, found {entries:?}"))?;
     Ok(BootParts { kernel, kernel_modules, initrd, systemd })

@@ -149,11 +149,14 @@ fn parse_menu(config: &str) -> Result<Vec<MenuItem>> {
             });
         } else if line == "}" {
             let Some(item) = open.pop().ok_or_else(|| anyhow!("unbalanced braces in grub.cfg"))? else { continue };
-            let submenu = open.iter_mut().rev().find_map(|block| match block {
-                Some(MenuItem::Submenu { items, .. }) => Some(items),
-                _ => None,
-            });
-            submenu.unwrap_or(&mut menu).push(item);
+            let mut parent = &mut menu;
+            for block in open.iter_mut().rev() {
+                if let Some(MenuItem::Submenu { items, .. }) = block {
+                    parent = items;
+                    break;
+                }
+            }
+            parent.push(item);
         } else if let Some(Some(MenuItem::Entry { lines, .. })) = open.last_mut() {
             lines.push(line.to_string());
         }

@@ -132,7 +132,10 @@ fn parse_devices(text: &str) -> Result<Vec<Device>> {
                 1 => true,
                 other => bail!("device {devid} has missing={other}\n{}", context()),
             };
-            let errors = if device.invalid_counters { None } else { Some(nonzero_counters(DEVICE_ERROR_COUNTERS, field)?) };
+            let mut errors = None;
+            if !device.invalid_counters {
+                errors = Some(nonzero_counters(DEVICE_ERROR_COUNTERS, field)?);
+            }
             Ok(Device { devid, missing, errors })
         })
         .collect()
@@ -263,10 +266,10 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
     // the later counters, or we're missing a counter.
     let summary_has_errors = estimates.get("Error summary").is_some_and(|summary| summary != "no errors found");
     ensure!(!summary_has_errors || !errors.is_empty(), "the summary reports errors that no known counter has\n{}", context());
-    let seconds_left = match estimates.get("Time left") {
-        Some(time) => Some(parse_hms(time).with_context(context)?),
-        None => None,
-    };
+    let mut seconds_left = None;
+    if let Some(time) = estimates.get("Time left") {
+        seconds_left = Some(parse_hms(time).with_context(context)?);
+    }
 
     Ok(ScrubStatus {
         uuid: uuid.clone(),
