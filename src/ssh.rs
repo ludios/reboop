@@ -282,7 +282,8 @@ impl Opening {
                 }
                 return Err(anyhow!(stderr.trim_end().to_string()).context(format!("failed to open a session to {target}")));
             };
-            // Skip anything that root's shell startup files print.
+            // Lines before SESSION_READY are what root's shell startup files
+            // print; skip them.
             if line == SESSION_READY {
                 return Ok(session);
             }

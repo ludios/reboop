@@ -225,7 +225,7 @@ fn find_entry<'a>(menu: &'a [MenuItem], path: &str) -> Option<&'a MenuItem> {
 /// btrfs subvolume, but its end is a store path or a /boot's kernels
 /// directory.)
 fn grub_file(boot_path: &str, mut path: &str) -> String {
-    // Drop a leading GRUB device name, like "($drive1)"
+    // Drop a leading GRUB device, like "($drive1)" or "(hd0,gpt1)"
     if let Some(rest) = path.strip_prefix('(') && let Some((_, rest)) = rest.split_once(')') {
         path = rest;
     }
