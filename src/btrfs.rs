@@ -282,9 +282,10 @@ fn parse_scrub_status(summary: &str, raw: &str) -> Result<ScrubStatus> {
 
 /// How long to let a `btrfs scrub` command take, or a new scrub take to show
 /// up in `btrfs scrub status`.  Each asks the kernel how the scrub is going,
-/// under a lock that a starting scrub holds while it reads the superblocks
-/// at its idle IO priority, which can take a while on disks busy with other
-/// IO, such as hard drives just after boot.
+/// under a lock that a transaction commit holds while it flushes the disks,
+/// and a starting scrub while it reads the superblocks at its idle IO
+/// priority, which can take a while on disks busy with other IO, such as
+/// hard drives just after boot.
 const SCRUB_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// What `btrfs scrub status` says when another btrfs command has the status

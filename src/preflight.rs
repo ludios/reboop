@@ -92,7 +92,8 @@ fn disk_facts(session: &mut Session, filesystems: &[Filesystem]) -> Result<Optio
 /// Collects the facts about the machine at the other end of `session`, after
 /// making sure it's `hostname` (see [`facts::ensure_hostname`]).  Takes
 /// [`NETWORK_SAMPLE`] or a bit longer, plus up to [`smart::PATIENCE`] if a
-/// disk is slow to answer smartctl.
+/// disk is slow to answer smartctl, and minutes if busy disks hold up
+/// `btrfs scrub status`.
 pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
     facts::ensure_hostname(session, hostname)?;
 
