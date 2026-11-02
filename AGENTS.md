@@ -57,10 +57,6 @@ If more external information is needed, think and keep iterating on web search q
 
 If you can't fetch something, use google-chrome or curl_chrome150 on this machine.
 
-# Tracking AI authorship
-
-Files with any LLM-authored code (not counting mechanistic sed-like changes) begin with a comment like `// Model-output: <model name>`, one per model that contributed (e.g. "Claude Mythos 5.1", "ChatGPT 6 Astra"); keep existing lines.
-
 # English
 
 All new English must be maximally unambiguous, even if it becomes slightly longer! Think as a reader, and read the text every possible way. For example, never write "cannot change a hash once set" instead of "cannot change a hash (if already set)".
