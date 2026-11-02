@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # The test machine that boots with systemd-boot from UEFI, with a
 # LUKS-encrypted btrfs root unlocked over SSH from the initrd on port 23.
 { pkgs, sshKeys, ... }:

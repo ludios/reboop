@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Tests of reboop against NixOS VMs: systemd-boot.nix, with a LUKS-encrypted
 //! btrfs root, and grub.nix, which boots from BIOS and has no LUKS.
 //!

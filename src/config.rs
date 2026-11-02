@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! reboop's configuration, in ~/.config/reboop: defaults.json (JSON5, so
 //! comments and trailing commas are fine) with settings for all machines,
 //! and machines.jsonl with one JSON object per machine, whose settings take

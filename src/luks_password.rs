@@ -1,5 +1,3 @@
-// Model-output: Claude Opus 5.5
-
 //! `reboop set-luks-password`, which asks for a machine's LUKS password,
 //! makes sure it's right, and keeps it encrypted in
 //! [`config::passwords_dir`]; and `reboop get-luks-password`, which prints

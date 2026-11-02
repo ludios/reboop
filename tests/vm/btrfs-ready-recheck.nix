@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # Works around a race in systemd's 64-btrfs.rules (as of systemd 262), for
 # any NixOS machine.  The rules mark each member of a multi-device btrfs not
 # ready until the kernel has seen them all, and the member that completes

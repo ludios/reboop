@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 use anstream::AutoStream;
 use anstream::stream::RawStream;
 use clap::{ColorChoice, Parser};

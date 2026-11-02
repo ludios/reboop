@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Child processes whose output can be read as it arrives, without ever
 //! blocking past a deadline.
 

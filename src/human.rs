@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Formatting quantities and tables for people.
 
 use jiff::Timestamp;

@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # Everything each test VM needs, gathered into a directory per VM:
 #
 #     nix-build tests/vm -A systemd-boot

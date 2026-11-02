@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # The test machine that boots with GRUB from BIOS, like some of the real
 # machines: two disks, each with GRUB and a /boot of its own
 # (mirroredBoots), and an unencrypted btrfs RAID1 root across both.

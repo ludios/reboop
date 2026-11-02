@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! What SMART says about a machine's disks, via smartctl: whether any is
 //! about to fail.
 

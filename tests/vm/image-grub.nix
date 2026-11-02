@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # Two qcow2 disk images for grub.nix, each with a GPT, a BIOS boot partition
 # for GRUB, an ext4 /boot of its own (boot-1 for /boot, boot-2 for
 # /boot-fallback), and half of a btrfs RAID1 root.  `install` (from

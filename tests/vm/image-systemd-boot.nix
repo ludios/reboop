@@ -1,5 +1,3 @@
-# Model-output: Claude Opus 5.5
-#
 # A qcow2 disk image for systemd-boot.nix with a GPT, an ESP with
 # systemd-boot, and a LUKS2 partition holding a btrfs root.  `install` (from
 # default.nix) installs the systems onto it.

@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Finding the LUKS devices a machine's initrd will ask to unlock, testing
 //! the password beforehand, and unlocking them over SSH to the systemd initrd.
 

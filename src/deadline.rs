@@ -1,5 +1,3 @@
-// Model-output: Claude Opus 5.5
-
 //! Deadlines, and retrying until one passes.
 
 use anyhow::{Error, Result};

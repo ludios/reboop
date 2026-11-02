@@ -1,5 +1,3 @@
-// Model-output: Claude Opus 5.5
-
 //! Finding processes that make rebooting a bad idea.
 
 use crate::ssh::{QUICK, Session};

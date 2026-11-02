@@ -1,5 +1,3 @@
-// Model-output: Claude Opus 5.5
-
 //! Machines' LUKS passwords, stored in files encrypted with a key derived
 //! from an SSH signature.
 //!

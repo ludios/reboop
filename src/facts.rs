@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Facts about a remote NixOS machine, from before and after rebooting it.
 
 use crate::ssh::{QUICK, Session, shell_quote};

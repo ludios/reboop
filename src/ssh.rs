@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Logging in as root to machines whose host keys are already known, with
 //! the ssh binary (so the user's ssh config, agent and known_hosts all
 //! apply), and running commands there.

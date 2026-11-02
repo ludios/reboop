@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! `reboop bounce`: reboots a machine that's okay to reboot, unlocks its
 //! LUKS device from the initrd if it has one, shows how it came back, and
 //! scrubs its btrfs filesystems, unless a scrub found them clean lately;

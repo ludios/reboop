@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Builds a test VM (see default.nix), starts it if it isn't already
 //! running, and brings it up to where it accepts SSH connections.
 //!

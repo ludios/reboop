@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Primitives for carefully rebooting NixOS machines: see doc/spec.md.
 
 pub mod boot;

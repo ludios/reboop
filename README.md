@@ -1,6 +1,3 @@
-<!-- Model-output: Claude Opus 5.5 -->
-<!-- Model-output: Claude Fable 5.1 -->
-
 # reboop
 
 Reboots NixOS machines over SSH, carefully. `reboop bounce HOSTNAME`:

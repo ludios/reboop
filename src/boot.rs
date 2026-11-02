@@ -1,5 +1,3 @@
-// Model-output: Claude Opus 5.5
-
 //! What a machine's boot loader will boot next: systemd-boot's default
 //! entry, or GRUB's in each /boot that GRUB is installed to (several with
 //! NixOS's mirroredBoots), and what the UEFI firmware might do instead.

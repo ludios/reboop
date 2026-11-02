@@ -1,6 +1,3 @@
-<!-- Model-output: Claude Fable 5.1 -->
-<!-- Model-output: Claude Opus 5.5 -->
-
 This is a special-purpose utility for carefully rebooting a NixOS machine, which works in stages.
 
 ## General notes

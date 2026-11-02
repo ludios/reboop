@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! btrfs filesystems on a remote machine: operations a reboot would
 //! interrupt, and scrubs.
 

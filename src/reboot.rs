@@ -1,6 +1,3 @@
-// Model-output: Claude Opus 5.5
-// Model-output: Claude Fable 5.1
-
 //! Taking a remote machine down.
 
 use crate::ssh::{QUICK, Session, shell_quote};
