@@ -120,15 +120,33 @@ fn program_name(path: &str) -> String {
     name.strip_suffix(':').unwrap_or(name).to_string()
 }
 
+/// Whether `word` is a cluster of short options, like "-c" or "-ec", that
+/// includes -c, with which an interpreter runs a command string rather
+/// than a script.
+fn is_command_string_option(word: &str) -> bool {
+    word.strip_prefix('-').is_some_and(|options| options.contains('c') && options.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
 /// The names of the program(s) a command line runs: that of its first word,
 /// and for an interpreter like bash or python, also that of its script.
+/// (Not with a command string given with -c: the interpreter runs each of
+/// its programs as a process of their own, or execs it, which replaces the
+/// interpreter's command line.)
 fn program_names(args: &str) -> Vec<String> {
     let mut words = args.split_whitespace();
     let Some(first) = words.next() else { return vec![] };
     let mut names = vec![program_name(first)];
     let interpreter = matches!(names[0].as_str(), "sh" | "bash" | "dash" | "zsh" | "perl") || names[0].starts_with("python");
-    if interpreter && let Some(script) = words.find(|word| !word.starts_with('-')) {
-        names.push(program_name(script));
+    if interpreter {
+        for word in words {
+            if is_command_string_option(word) {
+                break;
+            }
+            if !word.starts_with('-') {
+                names.push(program_name(word));
+                break;
+            }
+        }
     }
     names
 }
@@ -324,6 +342,9 @@ mod tests {
             "btrfs s /snapshot",
             "btrfs re /backup",
             "systemd-cryptsetup attach data /dev/sdb",
+            // A shell that's done copying but lives on
+            "bash -c cp /etc/template /etc/x.conf && nginx -g daemon off;",
+            "/nix/store/abc-bash-5.3p9/bin/sh -ec dd if=/dev/zero of=/var/x count=1; sleep 600",
             "systemd-fsck /dev/sdb1",
             "btrfs filesystem resize max /",
         ] {
