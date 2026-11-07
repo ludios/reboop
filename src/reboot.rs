@@ -18,22 +18,34 @@ pub enum Stopped {
     NotLoaded,
 }
 
-/// Stops systemd unit `unit` (e.g. "postgresql.service"), waiting up to
-/// `timeout` for it to stop.
-pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result<Stopped> {
+/// Stops systemd unit `unit` (e.g. "postgresql.service"), along with the
+/// units that would start it again (its TriggeredBy=: sockets, timers and
+/// paths), waiting up to `timeout` for them all to stop.  (A socket left
+/// listening would start `unit` again as soon as a client connects, and
+/// that start cancels the stop if `unit` is still stopping.)
+///
+/// Returns what it found of `unit`, and the triggering units, which are now
+/// stopped as well.
+pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result<(Stopped, Vec<String>)> {
     let unit_word = shell_quote(unit);
-    let output = session.run(&format!("systemctl stop -- {unit_word}"), timeout)?;
+    let triggers = session.run_ok(&format!("systemctl show --property=TriggeredBy --value -- {unit_word}"), QUICK)?;
+    let triggers: Vec<String> = triggers.split_whitespace().map(String::from).collect();
+    let mut units = triggers.clone();
+    units.push(unit.to_string());
+    let words: Vec<String> = units.iter().map(|unit| shell_quote(unit)).collect();
+    let output = session.run(&format!("systemctl stop -- {}", words.join(" ")), timeout)?;
     match output.status {
         0 => {}
         // "program is not installed", in systemctl's LSB-style exit codes
-        5 => return Ok(Stopped::NotLoaded),
-        status => bail!("systemctl stop {unit} exited with status {status}: {}", output.stderr_text()),
+        5 => return Ok((Stopped::NotLoaded, triggers)),
+        status => bail!("systemctl stop {} exited with status {status}: {}", units.join(" "), output.stderr_text()),
     }
     let result = session.run_ok(&format!("systemctl show --property=Result --value -- {unit_word}"), QUICK)?;
-    Ok(match result.trim_end() {
+    let stopped = match result.trim_end() {
         "success" => Stopped::Cleanly,
         other => Stopped::Uncleanly(other.to_string()),
-    })
+    };
+    Ok((stopped, triggers))
 }
 
 /// A way to take a machine down.

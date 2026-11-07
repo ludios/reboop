@@ -612,18 +612,27 @@ fn scrub_status_outlasts_a_locked_status_file(vm: &Vm) -> Result<()> {
 
 fn stop_unit(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-nonexistent.service", MINUTE)?, Stopped::NotLoaded);
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-nonexistent.service", MINUTE)?, (Stopped::NotLoaded, vec![]));
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
-    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-sleep.service", MINUTE)?, Stopped::Cleanly);
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-sleep.service", MINUTE)?, (Stopped::Cleanly, vec![]));
     let output = session.run("systemctl is-active reboop-test-sleep.service", MINUTE)?;
     assert_ne!(output.stdout_text().trim(), "active");
+
+    // One with a socket, which would start it again when a client connects,
+    // so it's stopped too.
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-activated --socket-property=ListenStream=/run/reboop-test-activated.sock \
+                      --socket-property=RemoveOnStop=yes sleep 600 && systemctl start reboop-test-activated.service")?;
+    let socket = "reboop-test-activated.socket".to_string();
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-activated.service", MINUTE)?, (Stopped::Cleanly, vec![socket]));
+    let output = session.run("systemctl is-active reboop-test-activated.socket reboop-test-activated.service", MINUTE)?;
+    assert_eq!(output.stdout_text(), "inactive\ninactive\n");
 
     // One that ignores SIGTERM, so systemd has to kill it, once it's
     // ignoring it.  (See START_TMUX about -E PATH.)
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-stubborn -E PATH -p TimeoutStopSec=2 \
                       sh -c 'trap \"\" TERM; touch /var/tmp/reboop-test-stubborn; while :; do sleep 1; done'")?;
     wait_for(|| Ok(session.run("test -e /var/tmp/reboop-test-stubborn", MINUTE)?.status == 0))?;
-    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-stubborn.service", MINUTE)?, Stopped::Uncleanly("timeout".into()));
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-stubborn.service", MINUTE)?, (Stopped::Uncleanly("timeout".into()), vec![]));
     Ok(())
 }
 

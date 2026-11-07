@@ -221,15 +221,23 @@ fn password_for_initrd(
     Ok(Some(password))
 }
 
-/// Stops `machine`'s stop_services in order, over `session`.  Fails, with the
-/// machine still up, if systemctl fails to stop one.  Returns the services
-/// that are stopped now (leaving out those the machine doesn't have), and
-/// the problems: services that systemd doesn't say stopped cleanly.
+/// Stops `machine`'s stop_services in order, over `session`, along with the
+/// units that would start them again (see [`reboot::stop_unit`]).  Fails,
+/// with the machine still up, if systemctl fails to stop one.  Returns the
+/// units that are stopped now (leaving out services the machine doesn't
+/// have), and the problems: services that systemd doesn't say stopped
+/// cleanly.
 fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer) -> Result<(Vec<String>, Vec<String>)> {
     let mut stopped = Vec::new();
     let mut problems = Vec::new();
     for service in &machine.stop_services {
-        match reboot::stop_unit(session, service, STOP_TIMEOUT)? {
+        let (outcome, triggers) = reboot::stop_unit(session, service, STOP_TIMEOUT)?;
+        if !triggers.is_empty() {
+            let triggers: Vec<String> = triggers.iter().map(|trigger| printer.bold(trigger)).collect();
+            printer.line(&format!("Stopped what would start {} again: {}", printer.bold(service), triggers.join(", ")));
+        }
+        stopped.extend(triggers);
+        match outcome {
             Stopped::Cleanly => printer.line(&format!("{} is stopped", printer.bold(service))),
             Stopped::Uncleanly(result) => {
                 let problem = format!("{service} is stopped, but systemd's result for it is {result}, not success");
