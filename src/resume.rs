@@ -192,13 +192,17 @@ fn is_failure(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Failed>().is_some()
 }
 
-/// Runs `tmux ARGS` against the server at `socket`, returning its output:
-/// with no environment if `bare`, so that none of this session's (like
-/// SSH_CONNECTION) reaches a tmux session that it creates.  A failure of
-/// tmux's is a [`Failed`].
-fn run_tmux(session: &mut Session, socket: &str, args: &str, bare: bool) -> Result<String> {
-    let tmux = if bare { "env -i \"$(command -v tmux)\"" } else { "tmux" };
-    let output = session.run(&format!("{tmux} -S {} {args}", shell_quote(socket)), QUICK)?;
+/// tmux, run with no environment, so that none of this session's reaches
+/// what it makes: a session would get some (like SSH_CONNECTION), and a
+/// pane made through a client that isn't attached gets the client's PATH.
+/// (Sessions are made with -E too, since update-environment would take the
+/// missing DISPLAY and such as reasons to unset the server's in them.)
+const BARE_TMUX: &str = "env -i \"$(command -v tmux)\"";
+
+/// Runs `tmux ARGS` against the server at `socket` (as [`BARE_TMUX`]),
+/// returning its output.  A failure of tmux's is a [`Failed`].
+fn run_tmux(session: &mut Session, socket: &str, args: &str) -> Result<String> {
+    let output = session.run(&format!("{BARE_TMUX} -S {} {args}", shell_quote(socket)), QUICK)?;
     if output.status != 0 {
         return Err(Failed(format!("tmux {} failed: {}", args.split_whitespace().next().unwrap_or_default(), output.stderr_text())).into());
     }
@@ -274,17 +278,17 @@ fn create_window(session: &mut Session, socket: &str, name: &str, window: &Windo
     let (window_id, mut pane_ids) = match first {
         Some((id, index, pane_id)) => {
             if index != window.index {
-                run_tmux(session, socket, &format!("move-window -s {id} -t {}", shell_quote(&format!("={name}:{}", window.index))), false)?;
+                run_tmux(session, socket, &format!("move-window -s {id} -t {}", shell_quote(&format!("={name}:{}", window.index))))?;
             }
             if let Some(window_name) = &window.name {
-                run_tmux(session, socket, &format!("rename-window -t {id} {}", format_quote(window_name)), false)?;
+                run_tmux(session, socket, &format!("rename-window -t {id} {}", format_quote(window_name)))?;
             }
             (id.to_string(), vec![pane_id.to_string()])
         }
         None => {
             let named = window.name.as_ref().map_or(String::new(), |window_name| format!(" -n {}", format_quote(window_name)));
             let target = shell_quote(&format!("={name}:{}", window.index));
-            let ids = run_tmux(session, socket, &format!("new-window -d -t {target} -c {}{named} -P -F '#{{window_id}} #{{pane_id}}'", format_quote(&first_pane.cwd)), false)?;
+            let ids = run_tmux(session, socket, &format!("new-window -d -t {target} -c {}{named} -P -F '#{{window_id}} #{{pane_id}}'", format_quote(&first_pane.cwd)))?;
             let (window_id, pane_id) = ids.trim_end().split_once(' ').ok_or_else(|| Failed(format!("new-window printed {ids:?}")))?;
             (window_id.to_string(), vec![pane_id.to_string()])
         }
@@ -293,15 +297,15 @@ fn create_window(session: &mut Session, socket: &str, name: &str, window: &Windo
     // full width and 2 rows, for the layout to size.
     for pane in more {
         let previous = pane_ids.last().unwrap().clone();
-        let id = run_tmux(session, socket, &format!("split-window -d -f -v -l 2 -t {previous} -c {} -P -F '#{{pane_id}}'", format_quote(&pane.cwd)), false)?;
+        let id = run_tmux(session, socket, &format!("split-window -d -f -v -l 2 -t {previous} -c {} -P -F '#{{pane_id}}'", format_quote(&pane.cwd)))?;
         pane_ids.push(id.trim_end().to_string());
     }
-    run_tmux(session, socket, &format!("select-layout -t {window_id} {}", shell_quote(&window.layout)), false)?;
+    run_tmux(session, socket, &format!("select-layout -t {window_id} {}", shell_quote(&window.layout)))?;
     if let Some(active) = window.panes.iter().position(|pane| pane.active) {
-        run_tmux(session, socket, &format!("select-pane -t {}", pane_ids[active]), false)?;
+        run_tmux(session, socket, &format!("select-pane -t {}", pane_ids[active]))?;
     }
     if window.active {
-        run_tmux(session, socket, &format!("select-window -t {window_id}"), false)?;
+        run_tmux(session, socket, &format!("select-window -t {window_id}"))?;
     }
     Ok(pane_ids)
 }
@@ -425,7 +429,7 @@ fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, w
                 shell_quote(command)
             ),
             // Through tmux's own parser, which takes the quoting back
-            Running::Started { command } => format!("printf '%s\\n' {} | tmux -S {socket} source-file -", shell_quote(&format!("respawn-pane -k -t {pane_id} {command}"))),
+            Running::Started { command } => format!("printf '%s\\n' {} | {BARE_TMUX} -S {socket} source-file -", shell_quote(&format!("respawn-pane -k -t {pane_id} {command}"))),
             _ => unreachable!("only typed and started commands are resumable"),
         };
         let output = session.run(&run, QUICK)?;
@@ -445,7 +449,7 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
     let mut problems = Vec::new();
     let socket = &server.socket;
     // The sessions already there, if a server's running at the socket
-    let mut existing = match run_tmux(session, socket, "list-sessions -F '#{session_name}'", false) {
+    let mut existing = match run_tmux(session, socket, "list-sessions -F '#{session_name}'") {
         Ok(names) => Some(names.lines().map(String::from).collect::<Vec<_>>()),
         Err(error) if is_failure(&error) => None,
         Err(error) => return Err(error),
@@ -462,7 +466,7 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             continue;
         }
         if let Some(first) = tmux_session.group.as_deref().and_then(|group| groups.get(group)) {
-            match run_tmux(session, socket, &format!("new-session -d -s {} -t {}", format_quote(name), shell_quote(&format!("={first}"))), true) {
+            match run_tmux(session, socket, &format!("new-session -d -E -s {} -t {}", format_quote(name), shell_quote(&format!("={first}")))) {
                 Ok(_) => existing.get_or_insert_with(Vec::new).push(name.clone()),
                 Err(error) if is_failure(&error) => problems.push(not_recreated(&error)),
                 Err(error) => return Err(error),
@@ -482,13 +486,12 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             // rather than being tried again for each session.
             None => {
                 start_server(session, server, tmux_session, &first_pane.cwd)?;
-                run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={name}:^"))), false)
+                run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={name}:^"))))
             }
             Some(_) => run_tmux(
                 session,
                 socket,
-                &format!("new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {} -P -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", format_quote(name), format_quote(&first_pane.cwd)),
-                true,
+                &format!("new-session -d -E -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {} -P -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", format_quote(name), format_quote(&first_pane.cwd)),
             ),
         };
         let created = match created {
