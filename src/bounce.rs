@@ -300,14 +300,7 @@ fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &M
         // servers that are gone now, which aren't to be brought back.
         return resume::forget_outlived(session, &facts.boot_id);
     }
-    // A reboot is followed by the postflight, which brings the capture back;
-    // a shutdown isn't, so the user has to run `reboop catch` once the
-    // machine is up again.
-    let resumer = match down {
-        Down::Reboot   => None,
-        Down::Shutdown => Some(format!("reboop catch {}", machine.hostname)),
-    };
-    resume::tell_saved(&path, &capture, &machine.resumable_commands, resumer.as_deref(), printer);
+    resume::tell_saved(&path, &capture, machine, printer);
     Ok(())
 }
 

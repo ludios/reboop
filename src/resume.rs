@@ -157,20 +157,27 @@ pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<S
     Ok(format!("{DIR}/{name}"))
 }
 
-/// Tells the user that `capture` was saved at `path` (see [`save`]), and
-/// which of its commands `patterns` allow to be run again when it's brought
-/// back: by `resumer`, the reboop command that the user has to run for
-/// that, or with no such command if `None`.
-pub fn tell_saved(path: &str, capture: &Capture, patterns: &CommandPatterns, resumer: Option<&str>, printer: &mut Printer) {
+/// Tells the user that `capture`, taken on `machine`, was saved at `path`
+/// (see [`save`]), and which of its commands the machine's
+/// resumable_commands allow to be run again when it's brought back.  Names
+/// the reboop command that the user has to run to bring it back, unless it
+/// was taken for a reboot by `reboop bounce`, which brings it back itself.
+pub fn tell_saved(path: &str, capture: &Capture, machine: &Machine, printer: &mut Printer) {
     printer.line(&format!("tmux: wrote {path} — {}", capture.counts()));
-    let resumable = capture.resumable(patterns);
-    if !resumable.is_empty() {
-        let heading = match resumer {
-            Some(resumer) => format!("tmux: `{resumer}` will resume commands:"),
-            None => "tmux: will resume commands:".into(),
-        };
-        printer.line(&indented_list(&heading, &resumable));
+    let resumable = capture.resumable(&machine.resumable_commands);
+    if resumable.is_empty() {
+        return;
     }
+    let hostname = &machine.hostname;
+    let heading = match capture.purpose {
+        // `reboop bounce` brings it back itself, and if it's cut short, its
+        // error names `reboop catch`.
+        Purpose::Reboot   => "tmux: will resume commands:".into(),
+        Purpose::Shutdown => format!("tmux: `reboop catch {hostname}` will resume commands:"),
+        Purpose::TmuxStop => format!("tmux: `reboop tmux start {hostname}` will resume commands:"),
+        Purpose::Check    => unreachable!("a check's capture isn't saved to be brought back"),
+    };
+    printer.line(&indented_list(&heading, &resumable));
 }
 
 /// The path of a saved capture given as an absolute path, or by its name in
@@ -717,7 +724,7 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<S
         return Ok(vec![]);
     }
     let path = save(&mut session, &capture, true)?;
-    tell_saved(&path, &capture, &machine.resumable_commands, Some(&format!("reboop tmux start {hostname}")), printer);
+    tell_saved(&path, &capture, machine, printer);
     stop_servers(&mut session, &capture, printer)?;
     Ok(vec![])
 }
@@ -777,6 +784,7 @@ pub fn run_start(hostname: &str, saved: Option<&str>, color: bool) -> Result<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preflight::test_machine;
     use crate::tmux::tests::{patterns, test_server};
 
     #[test]
@@ -817,6 +825,23 @@ mod tests {
         other.windows.retain(|window| window.index == 3);
         linked.servers[0].sessions.push(other);
         assert_eq!(linked.resumable(&patterns(&["rsync .*", "htop"])), resumable);
+    }
+
+    #[test]
+    fn names_the_command_that_brings_a_capture_back() {
+        let told = |machine: &Machine, purpose| {
+            let mut out = Vec::new();
+            tell_saved("/x.json", &Capture::new(purpose, "4f6f3fbb", vec![test_server()]), machine, &mut Printer::new(&mut out, false, None, None));
+            String::from_utf8(out).unwrap()
+        };
+        let machine = Machine { resumable_commands: patterns(&["htop"]), ..test_machine() };
+        let wrote = "tmux: wrote /x.json — 1 tmux server with 1 session and 3 panes\n";
+        let htop = ":\n    at's work:3.0 in /home/at: htop\n";
+        assert_eq!(told(&machine, Purpose::Reboot),   format!("{wrote}tmux: will resume commands{htop}"));
+        assert_eq!(told(&machine, Purpose::Shutdown), format!("{wrote}tmux: `reboop catch one` will resume commands{htop}"));
+        assert_eq!(told(&machine, Purpose::TmuxStop), format!("{wrote}tmux: `reboop tmux start one` will resume commands{htop}"));
+        // With no command to run again, only the capture is told of.
+        assert_eq!(told(&test_machine(), Purpose::TmuxStop), wrote);
     }
 
     #[test]
