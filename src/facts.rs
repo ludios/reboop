@@ -502,14 +502,15 @@ pub fn jobs_summary(jobs: &[Job]) -> String {
 /// Whether systemd's `state` (see [`system_state`]) means that the machine
 /// is still booting: the states that `systemctl is-system-running --wait`
 /// waits through.
-fn is_booting(state: &str) -> bool {
+pub fn is_booting(state: &str) -> bool {
     state == "initializing" || state == "starting"
 }
 
 /// Waits for the machine to finish booting, checking every `interval` until
-/// `deadline`, and returns its [`system_state`], which [`is_booting`] if the
-/// deadline passed first.  Each time that it finds the machine still
-/// booting before the deadline, it passes systemd's jobs to `progress`.
+/// `deadline`, and returns its [`system_state`].  (If the deadline passed
+/// first, that's a state for which [`is_booting`] is true.)  Each time that
+/// it finds the machine still booting before the deadline, it passes
+/// systemd's jobs to `progress`.
 pub fn wait_until_booted(session: &mut Session, interval: Duration, deadline: Deadline, mut progress: impl FnMut(&[Job])) -> Result<String> {
     loop {
         let state = system_state(session)?;

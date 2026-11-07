@@ -38,8 +38,9 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RETURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How long systemd gets to finish starting up once the machine accepts SSH,
-/// before the postflight goes on without it.  (A unit can hold startup up
-/// for hours, e.g. by retrying a request that a server has rate-limited.)
+/// before the postflight goes on with startup unfinished.  (A unit can hold
+/// startup up for hours, e.g. by retrying a request that a server has
+/// rate-limited.)
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 /// How often to check on systemd's starting up.
@@ -456,18 +457,19 @@ fn wait_for_return(
 }
 
 /// What's wrong with how a machine came back, given its `systems`, systemd's
-/// `state` of it (from [`facts::wait_until_booted`]), systemd's `jobs`
-/// (named if `state` is a problem, as they may be what holds startup up),
-/// and its `failed_units`.  It should have booted its system profile.
+/// `state` of it (from [`facts::wait_until_booted`]) and `jobs` just after
+/// that (summarized if it was still booting, since they're what held it
+/// up), and its `failed_units`.  It should have booted its system profile.
 fn postflight_problems(systems: &Systems, state: &str, jobs: &[Job], failed_units: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     // "degraded" means there are failed units, which get their own problem.
-    if state != "running" && state != "degraded" {
-        let mut problem = format!("systemd says the system is {state}");
-        if !jobs.is_empty() {
-            problem += &format!(", with {}", facts::jobs_summary(jobs));
-        }
-        problems.push(problem);
+    if facts::is_booting(state) {
+        // In the past tense, since the problems are shown after the tmux
+        // restore and the scrubs, by when startup may have finished
+        let timeout = human::seconds(STARTUP_TIMEOUT.as_secs());
+        problems.push(format!("systemd hadn't finished starting up after {timeout}, with {}", facts::jobs_summary(jobs)));
+    } else if state != "running" && state != "degraded" {
+        problems.push(format!("systemd says the system is {state}"));
     }
     if !failed_units.is_empty() {
         problems.push(format!("failed units: {}", failed_units.join(", ")));
@@ -489,9 +491,9 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
     let state = facts::wait_until_booted(session, STARTUP_INTERVAL, Deadline::after(STARTUP_TIMEOUT), |jobs| {
         printer.progress(&format!("systemd's {}", facts::jobs_summary(jobs)));
     })?;
+    let jobs = facts::jobs(session)?;
     // Not before, since a hostname from DHCP can come late in startup
     facts::ensure_hostname(session, hostname)?;
-    let jobs = facts::jobs(session)?;
     let failed_units = facts::failed_units(session)?;
     let after = facts::systems(session)?;
     let kernel_errors = facts::kernel_errors(session)?;
@@ -909,7 +911,7 @@ mod tests {
         ];
         assert_eq!(
             postflight_problems(&systems, "starting", &jobs, &[]),
-            ["systemd says the system is starting, with waiting jobs: 1; running jobs: start acme-order-renew-example.com.service"]
+            ["systemd hadn't finished starting up after 3m 0s, with waiting jobs: 1; running jobs: start acme-order-renew-example.com.service"]
         );
         // Jobs while it's running, like a timer's, aren't a problem.
         assert_eq!(postflight_problems(&systems, "running", &jobs, &[]), Vec::<String>::new());

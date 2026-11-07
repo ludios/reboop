@@ -146,7 +146,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     `systemctl is-system-running`
 
-    Meanwhile, if stdout is a terminal, show how many of systemd's jobs (from `systemctl list-jobs`) are waiting, and which are running. If the 3 minutes pass, go on anyway, since a unit can hold startup up for hours (e.g. by retrying a request that a server has rate-limited): the state that step 3 shows is then a problem, and names those jobs.
+    Meanwhile, if stdout is a terminal, show how many of systemd's jobs (from `systemctl list-jobs`) are waiting, and which are running. If the 3 minutes pass, go on anyway, since a unit can hold startup up for hours (e.g. by retrying a request that a server has rate-limited). Not having finished starting up is then a problem, which names the jobs that were running and counts those that were waiting.
 
 3. Collect this information and show it to the user of `reboop`:
 
