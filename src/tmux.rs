@@ -592,7 +592,7 @@ pub fn verdict(pane: &Pane, patterns: &CommandPatterns) -> Verdict {
         Running::Idle => Verdict::Idle,
         Running::Typed { command } | Running::Started { command } => {
             if pane.mountpoint.is_empty() {
-                Verdict::Block(format!("{} (its directory, {}, isn't there)", summary(command), pane.cwd))
+                Verdict::Block(format!("{} (its directory isn't there)", summary(command)))
             } else if patterns.matches(command) {
                 Verdict::Resume(summary(command))
             } else {
@@ -865,7 +865,7 @@ pub(crate) mod tests {
         let multiline = pane(0, "/", Running::Typed { command: "rsync -a \\\n  /a \\\n  /b".into() });
         assert_eq!(verdict(&multiline, &super::tests::patterns(&["(?s)rsync .*"])), Verdict::Resume("rsync -a \\ /a \\ /b".into()));
         let gone = Pane { mountpoint: String::new(), ..pane(0, "/gone", Running::Typed { command: "rsync -a /a /b".into() }) };
-        assert_eq!(verdict(&gone, &patterns), Verdict::Block("rsync -a /a /b (its directory, /gone, isn't there)".into()));
+        assert_eq!(verdict(&gone, &patterns), Verdict::Block("rsync -a /a /b (its directory isn't there)".into()));
         let jobs = pane(0, "/", Running::Background { jobs: vec![Some("sleep 9".into()), None] });
         assert_eq!(verdict(&jobs, &patterns), Verdict::Block("background jobs are still running: sleep 9; one whose line was hidden".into()));
         let job = pane(0, "/", Running::Background { jobs: vec![Some("sleep 9".into())] });
