@@ -258,11 +258,8 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  Below
-/// the table, if `verbose` or if `hostnames` isn't empty, prints for each
-/// machine: the reasons not to reboot it, what a nixos-rebuild would change
-/// or why its configuration couldn't be evaluated, and the error, if it
-/// couldn't be checked.
-/// Returns the exit status: see [`exit_status`].
+/// the table, if `verbose` or if `hostnames` isn't empty, prints the
+/// [`details`].  Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
