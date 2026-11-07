@@ -108,7 +108,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which stop_services are still stopped, and leave it at that.
 
-    Save what that check found in the tmux servers on the machine, as `/var/lib/reboop/tmux/TIME.reboot.json` (`.shutdown.json` for a stop; TIME to the millisecond), written whole and synced, and if there's anything in them, point `/var/lib/reboop/tmux/pending` at it, and say what will be run again. If that fails, say which stop_services are still stopped, and leave it at that. (Every `reboop check` and `reboop tmux list` saves a `TIME.check.json` there too, without `pending`, though a check goes on if that fails; the last 200 captures are kept, for root only, plus the pending one.)
+    Save what that check found in the tmux servers on the machine, as `/var/lib/reboop/tmux/TIME.reboot.json` (`.shutdown.json` for a stop; TIME to the millisecond), written whole and synced, and if there's anything in them, point `/var/lib/reboop/tmux/pending` at it, and say what will be run again; if there isn't, remove `pending` if it points to a capture taken for a reboot or shutdown during this boot, which didn't happen, and whose servers are gone now. If that fails, say which stop_services are still stopped, and leave it at that. (Every `reboop check` and `reboop tmux list` saves a `TIME.check.json` there too, without `pending`, though a check goes on if that fails; the last 200 captures are kept, for root only, plus the pending one.)
 
     `shutdown -r now`
 
@@ -156,7 +156,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     Whether we booted into the Linux kernel we expected
 
-4. If `/var/lib/reboop/tmux/pending` points to a capture, remove the link (so that a restore cut short isn't repeated on top of itself; the capture stays), and bring back what the capture describes, unless it's from this very boot (by its boot id) and was for a reboot or shutdown, in which case the machine never went down and what it describes is still running:
+4. If `/var/lib/reboop/tmux/pending` points to a capture, remove the link (so that a restore cut short isn't repeated on top of itself; the capture stays). If the capture can't be read, or was taken for a reboot or shutdown during this very boot (by its boot id), so that the machine never went down, that's a problem; else bring back what the capture describes:
 
     Wait up to 10 minutes for every `mount` process to finish, as for filesystems that a script mounts in parallel, which systemd doesn't wait for (just `mount`, which waits for the `mount.*` helper it runs; some helpers stay around as the filesystem's daemon). Go on anyway after that, as a problem.
 

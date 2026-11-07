@@ -285,9 +285,9 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
 /// Saves what's in the machine's tmux servers (as `facts` has it) on the
 /// machine, for taking it `down`, as the capture to bring back once it's up
 /// again (see [`resume::restore_pending`]) if there's anything in them,
-/// telling the user what that will run again.  If there isn't, a capture
-/// still pending from a reboot or shutdown in this boot, which didn't
-/// happen, is no longer pending.
+/// telling the user what that will run again.  If there isn't, a pending
+/// capture that was taken for a reboot or shutdown during this boot (one
+/// that didn't happen) is no longer pending.
 fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &Machine, printer: &mut Printer) -> Result<()> {
     let purpose = match down {
         Down::Reboot   => Purpose::Reboot,
@@ -296,14 +296,9 @@ fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &M
     let capture = Capture::new(purpose, &facts.boot_id, facts.tmux.clone());
     let path = resume::save(session, &capture, !capture.servers.is_empty())?;
     if capture.servers.is_empty() {
-        // One pending from a reboot that didn't happen describes servers
-        // that are gone now, rather than ones to bring back after this one.
-        if let Ok(Some((_, pending))) = resume::pending(session)
-            && pending.outlived(&facts.boot_id)
-        {
-            resume::forget_pending(session)?;
-        }
-        return Ok(());
+        // One pending from a reboot or shutdown that didn't happen describes
+        // servers that are gone now, which aren't to be brought back.
+        return resume::forget_outlived(session, &facts.boot_id);
     }
     let when = match down {
         Down::Reboot   => "after the reboot",

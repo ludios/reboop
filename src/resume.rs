@@ -97,7 +97,7 @@ impl Capture {
     /// `boot_id`: then if that's the current boot, the machine didn't go
     /// down after all.
     pub fn outlived(&self, boot_id: &str) -> bool {
-        self.purpose != Purpose::TmuxStop && self.boot_id == boot_id
+        matches!(self.purpose, Purpose::Reboot | Purpose::Shutdown) && self.boot_id == boot_id
     }
 
     /// Its file name in [`DIR`], like "20261107T063228.512Z.reboot.json",
@@ -183,6 +183,18 @@ pub fn pending(session: &mut Session) -> Result<Option<(String, Capture)>> {
 /// pointed to.
 pub fn forget_pending(session: &mut Session) -> Result<()> {
     session.run_ok(&format!("rm -f {PENDING} && sync {DIR}"), QUICK).map(drop)
+}
+
+/// Removes [`PENDING`] if it points to a capture taken for a reboot or
+/// shutdown during the boot `boot_id` (see [`Capture::outlived`]): if that's
+/// this boot, the reboot or shutdown didn't happen.
+pub fn forget_outlived(session: &mut Session, boot_id: &str) -> Result<()> {
+    if let Some((_, capture)) = pending(session)?
+        && capture.outlived(boot_id)
+    {
+        forget_pending(session)?;
+    }
+    Ok(())
 }
 
 /// Something about bringing a server back failed on the machine, as opposed
@@ -595,18 +607,20 @@ pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatte
 
 /// Brings back what the capture pending on the machine (see [`PENDING`])
 /// describes, if one is: see [`restore`], which `machine`'s
-/// resumable_commands are for.  Fails if the capture is from this very
-/// boot and was taken for a reboot or shutdown: then the machine didn't go
-/// down after all, and what it describes is still running.  Either way, the
-/// capture is no longer pending.  Returns the problems, or `None` if
-/// nothing is pending.
+/// resumable_commands are for.  Fails if the capture was taken for a
+/// reboot or shutdown during this very boot, so that the machine didn't go
+/// down after all, or if it can't be read.  Either way, the capture is no
+/// longer pending.  Returns the problems, or `None` if nothing is pending.
 pub fn restore_pending(session: &mut Session, machine: &Machine, printer: &mut Printer) -> Result<Option<Vec<String>>> {
-    let Some((path, capture)) = pending(session)? else { return Ok(None) };
+    let pending = pending(session);
     // First, so that a restore that's cut short isn't repeated on top of
     // itself; the capture stays in DIR for `reboop tmux start --saved`.
-    forget_pending(session)?;
+    if !matches!(pending, Ok(None)) {
+        forget_pending(session)?;
+    }
+    let Some((path, capture)) = pending? else { return Ok(None) };
     if capture.outlived(&facts::boot_id(session)?) {
-        bail!("{path} is from this boot, so what it describes is still running; not bringing it back");
+        bail!("{path} was taken for a reboot or shutdown during this boot, which didn't happen; not bringing it back");
     }
     printer.line(&format!("Bringing back what was in tmux, from {path}"));
     Ok(Some(restore(session, &capture, &machine.resumable_commands, printer)?))
@@ -767,8 +781,9 @@ mod tests {
         assert!(Capture::new(Purpose::Reboot, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
         assert!(Capture::new(Purpose::Shutdown, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
         assert!(!Capture::new(Purpose::Reboot, "4f6f3fbb", vec![]).outlived("9d1c2e07"));
-        // `reboop tmux stop` doesn't take the machine down
+        // `reboop tmux stop` and checks don't take the machine down
         assert!(!Capture::new(Purpose::TmuxStop, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
+        assert!(!Capture::new(Purpose::Check, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
     }
 
     #[test]
