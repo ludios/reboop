@@ -23,7 +23,8 @@ pub enum Activity {
     Nix,
     SwitchToConfiguration,
     Tmux,
-    Rsync,
+    /// Copying or moving files, which leaves a partial copy if interrupted
+    Copy,
     /// Interrupting a receive leaves a partial subvolume behind.
     BtrfsSendReceive,
     /// Anything from opening a device to reencrypting it
@@ -36,7 +37,7 @@ impl fmt::Display for Activity {
             Activity::Nix => "nix",
             Activity::SwitchToConfiguration => "switch-to-configuration",
             Activity::Tmux => "tmux",
-            Activity::Rsync => "rsync",
+            Activity::Copy => "copy",
             Activity::BtrfsSendReceive => "btrfs-send-receive",
             Activity::Cryptsetup => "cryptsetup",
         })
@@ -66,6 +67,10 @@ const NIX_PROGRAMS: &[&str] = &[
     "nixos-install",
     "nixos-rebuild",
 ];
+
+/// Programs that copy or move files.  (A move within one filesystem is a
+/// quick rename, but one to another filesystem copies.)
+const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv"];
 
 fn parse_ps(output: &str) -> Result<Vec<Process>> {
     output
@@ -139,7 +144,8 @@ pub fn activity(process: &Process) -> Option<Activity> {
     }
     let names = program_names(&process.args);
     let is = |name: &str| names.iter().any(|n| n == name);
-    if names.iter().any(|n| NIX_PROGRAMS.contains(&n.as_str())) {
+    let is_any = |programs: &[&str]| names.iter().any(|n| programs.contains(&n.as_str()));
+    if is_any(NIX_PROGRAMS) {
         Some(Activity::Nix)
     } else if is("nix-daemon") && process.args.split_whitespace().any(|arg| arg == "--stdio") {
         // Serving a remote build or copy over ssh.
@@ -148,8 +154,8 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::SwitchToConfiguration)
     } else if is("tmux") {
         Some(Activity::Tmux)
-    } else if is("rsync") {
-        Some(Activity::Rsync)
+    } else if is_any(COPY_PROGRAMS) {
+        Some(Activity::Copy)
     } else if is("btrfs") && is_btrfs_send_receive(&process.args) {
         Some(Activity::BtrfsSendReceive)
     } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
@@ -208,7 +214,9 @@ mod tests {
         let stc_wrapper = "/nix/store/abc-bash-5.3p9/bin/bash -e /nix/store/abc-nixos-system-foo/bin/switch-to-configuration boot";
         assert_eq!(activity_of("root", stc_wrapper), Some(Activity::SwitchToConfiguration));
         assert_eq!(activity_of("at", "tmux new -s work"), Some(Activity::Tmux));
-        assert_eq!(activity_of("root", "rsync --server -logDtpre.iLsfxCIvu . /backup/"), Some(Activity::Rsync));
+        for args in ["rsync --server -logDtpre.iLsfxCIvu . /backup/", "cp -a /data /backup", "/run/current-system/sw/bin/mv /mnt/a/big /mnt/b/"] {
+            assert_eq!(activity_of("root", args), Some(Activity::Copy), "{args}");
+        }
         for args in [
             "btrfs send -p /snap/a /snap/b",
             "/nix/store/abc-btrfs-progs-6.17/bin/btrfs -q receive /backup",
@@ -226,6 +234,7 @@ mod tests {
         for args in [
             "man tmux",
             "less /var/log/rsync.log",
+            "man cp",
             "[kworker/0:1-events]",
             "sshd: root [priv]",
             "",

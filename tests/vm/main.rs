@@ -259,7 +259,7 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
         Activity::Nix,
         Activity::SwitchToConfiguration,
         Activity::Tmux,
-        Activity::Rsync,
+        Activity::Copy,
         Activity::BtrfsSendReceive,
         Activity::Cryptsetup,
     ]);

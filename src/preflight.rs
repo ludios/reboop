@@ -473,12 +473,12 @@ mod tests {
         facts.busy_processes.insert(Activity::Nix, builders.collect());
         // A local copy: rsync, and its copies of itself
         let rsyncs = [(200, 1), (201, 200)].map(|(pid, ppid)| process(pid, ppid, "root", "rsync -a /a /b"));
-        facts.busy_processes.insert(Activity::Rsync, rsyncs.to_vec());
+        facts.busy_processes.insert(Activity::Copy, rsyncs.to_vec());
         let blockers = blockers(&test_machine(), &facts);
         assert_eq!(blockers.len(), 6, "{blockers:#?}");
         assert!(blockers[0].starts_with("nix: pid 101 (nixbld1): bash -e builder-1.sh xxx"), "{}", blockers[0]);
         assert!(blockers[0].ends_with("x…"), "{}", blockers[0]);
         assert_eq!(blockers[3], "nix: 2 more processes");
-        assert_eq!(blockers[4..], ["rsync: pid 200 (root): rsync -a /a /b", "rsync: 1 more process"]);
+        assert_eq!(blockers[4..], ["copy: pid 200 (root): rsync -a /a /b", "copy: 1 more process"]);
     }
 }

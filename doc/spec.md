@@ -61,7 +61,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - Is any btrfs balance or drive replace in progress?
     - Is switch-to-configuration or a nix build running?
     - Any tmux servers running (any user, not just root)?
-    - Is an rsync process running?
+    - Is something copying files: rsync, cp or mv?
     - Is a btrfs send or receive running, or cryptsetup?
     - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?
     - If the machine has smartctl: what SMART says about each whole disk beneath the btrfs filesystems' devices (`lsblk --inverse` from sysfs' devices/*, then `smartctl -n standby -H -A` on all the disks at once, each with a timeout, leaving any in standby asleep, as spinning up can take a minute, and likewise any whose power mode smartctl can't read, which it takes to be asleep): its overall health, and the counts of sectors gone bad (ATA attributes 5, 187, 197 and 198 when their names say so, as vendors put other counters there too; for NVMe, the critical warning except its temperature bit, and the media errors). Whatever smartctl could read counts, and what it couldn't is noted.
@@ -84,7 +84,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - If any btrfs balance or drive replace is running, no.
     - If switch-to-configuration or a nix build running, no.
     - If any tmux server running, no.
-    - If any rsync process running, no.
+    - If anything is copying files, no.
     - If a btrfs send or receive, or cryptsetup, is running, no.
     - If a btrfs device is missing (the filesystem wouldn't mount at boot without the degraded option) or has had errors, no.
     - If a disk's SMART self-assessment failed, or any of those counts is above zero, or smartctl got no answer from the disk within its timeout, no. (A disk whose SMART smartctl can't read, like a virtual one or one in standby, doesn't count, but `reboop check` marks it.)

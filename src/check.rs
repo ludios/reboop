@@ -30,9 +30,9 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
 }
 
 /// The activities that have columns of their own.
-const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Rsync];
+const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Copy];
 
-const HEADER: [&str; 16] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "RSYNC", "NET", "LOAD", "ROOT", "SMART", "OTHER", "REBUILD", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
+const HEADER: [&str; 16] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "COPY", "NET", "LOAD", "ROOT", "SMART", "OTHER", "REBUILD", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
@@ -111,7 +111,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         list(Red, scrubbing.collect()),
         count(Activity::Nix),
         count(Activity::Tmux),
-        count(Activity::Rsync),
+        count(Activity::Copy),
         number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
@@ -311,12 +311,12 @@ mod tests {
         ];
         assert_eq!(
             table(&outcomes, false, &TimeZone::UTC),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  RSYNC     NET      LOAD   ROOT  SMART                                 OTHER                                 REBUILD  REBOOT                      KERNEL             BUILT        BOOTED\n\
-             one      no                    1         12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  stale    new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
-             two      yes                              1.00 kB/s   0.50   45%  ok                                                                          ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  COPY     NET      LOAD   ROOT  SMART                                 OTHER                                 REBUILD  REBOOT                      KERNEL             BUILT        BOOTED\n\
+             one      no                    1        12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  stale    new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                             1.00 kB/s   0.50   45%  ok                                                                          ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
-             four     yes                              1.00 kB/s   0.50   45%  ok                                                                          ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
-             five     yes                              1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n\
+             four     yes                             1.00 kB/s   0.50   45%  ok                                                                          ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
+             five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n\
              \n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
