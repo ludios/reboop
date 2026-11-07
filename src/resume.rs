@@ -2,16 +2,17 @@
 //! after a reboot, or after `reboop tmux stop`: the captures that reboop
 //! saves on the machine, and recreating what one of them describes.
 
-use crate::bounce::Printer;
-use crate::config::{self, Machine};
+use crate::bounce::{Printer, indented_list};
+use crate::config::{self, Machine, TmuxPolicy};
 use crate::deadline::Deadline;
 use crate::facts;
 use crate::human::Style::Red;
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, shell_quote};
-use crate::tmux::{self, CommandPatterns, Pane, Server, TmuxSession, Verdict, Window, count, location};
-use anyhow::{Context, Result, bail, ensure};
+use crate::tmux::{self, CommandPatterns, Pane, Running, Server, TmuxSession, Verdict, Window, count, location};
+use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::thread::sleep;
 use std::time::Duration;
@@ -21,11 +22,11 @@ use std::time::Duration;
 pub const DIR: &str = "/var/lib/reboop/tmux";
 
 /// A link in [`DIR`] to the capture taken right before reboop took the
-/// machine's tmux servers down, until they're brought back.
+/// machine's tmux servers down, until bringing them back is tried.
 const PENDING: &str = "/var/lib/reboop/tmux/pending";
 
 /// How many captures are kept in [`DIR`]; older ones are deleted when a
-/// capture is saved.
+/// capture is saved, except the one that's pending.
 const KEEP: usize = 200;
 
 /// How long mounts in progress get to finish before the servers are
@@ -42,6 +43,11 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a server gets to exit once asked to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The width and height of a session as it's recreated: room to split off
+/// any number of panes before each window's layout sizes it.  (A client
+/// resizes it on attaching anyway.)
+const STAGING_SIZE: u32 = 400;
 
 /// The tmux buffer that commands are pasted through.
 const BUFFER: &str = "reboop-resume";
@@ -87,10 +93,11 @@ impl Capture {
         Capture { captured_at: Timestamp::now(), boot_id: boot_id.into(), purpose, servers }
     }
 
-    /// Its file name in [`DIR`], like "20261107T063228Z.reboot.json", which
-    /// sorts by time.
+    /// Its file name in [`DIR`], like "20261107T063228.512Z.reboot.json",
+    /// which sorts by time.
     pub fn file_name(&self) -> String {
-        format!("{}.{}.json", self.captured_at.strftime("%Y%m%dT%H%M%SZ"), self.purpose)
+        let millis = self.captured_at.as_millisecond().rem_euclid(1000);
+        format!("{}.{millis:03}Z.{}.json", self.captured_at.strftime("%Y%m%dT%H%M%S"), self.purpose)
     }
 
     /// Every pane in every server that could be listed, with its server
@@ -110,7 +117,7 @@ impl Capture {
             .collect()
     }
 
-    /// "2 servers with 3 sessions and 8 panes", or "no tmux servers"
+    /// "2 tmux servers with 3 sessions and 8 panes", or "no tmux servers"
     pub fn counts(&self) -> String {
         if self.servers.is_empty() {
             return "no tmux servers".into();
@@ -122,22 +129,26 @@ impl Capture {
 }
 
 /// Saves `capture` on the machine, in [`DIR`] under its file name, for root
-/// only, deleting all but the latest [`KEEP`] captures there; and if
-/// `pending`, points [`PENDING`] at it.  Returns the file's path.
+/// only, deleting all but the latest [`KEEP`] captures there (and the one
+/// that's pending); and if `pending`, points [`PENDING`] at it.  Returns the
+/// file's path.
 pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<String> {
     let name = capture.file_name();
     let json = serde_json::to_string_pretty(capture)?;
     let link = if pending { format!("ln -sfn {name} {PENDING}\n") } else { String::new() };
+    // Written whole and synced, so that a crash right after leaves either
+    // the capture or nothing
     let script = format!(
-        "set -e\numask 077\nmkdir -p {DIR}\nprintf %s {} >{DIR}/{name}.tmp\nmv {DIR}/{name}.tmp {DIR}/{name}\n{link}ls -1 {DIR}/*.json | head -n -{KEEP} | xargs -r rm -f",
+        "set -e\numask 077\nmkdir -p {DIR}\ntmp=$(mktemp {DIR}/.capture.XXXXXX)\nprintf %s {} >\"$tmp\"\nmv \"$tmp\" {DIR}/{name}\n{link}sync {DIR}/{name} {DIR}\n\
+         keep=$(readlink {PENDING} 2>/dev/null || true)\nls -1 {DIR}/*.json | head -n -{KEEP} | grep -vxF \"{DIR}/$keep\" | xargs -r rm -f",
         shell_quote(&json)
     );
     session.run_ok(&script, QUICK).context("failed to save the tmux capture")?;
     Ok(format!("{DIR}/{name}"))
 }
 
-/// The path in [`DIR`] of a saved capture given by its name there, or by its
-/// path.
+/// The path of a saved capture given as an absolute path, or by its name in
+/// [`DIR`].
 pub fn saved_path(name_or_path: &str) -> String {
     if name_or_path.starts_with('/') { name_or_path.to_string() } else { format!("{DIR}/{name_or_path}") }
 }
@@ -163,48 +174,52 @@ pub fn forget_pending(session: &mut Session) -> Result<()> {
     session.run_ok(&format!("rm -f {PENDING}"), QUICK).map(drop)
 }
 
-/// A tmux command that failed, as opposed to a session that did.
+/// Something about bringing a server back failed on the machine, as opposed
+/// to the session failing: a problem to report, not a reason to stop.
 #[derive(Debug)]
-struct TmuxFailed(String);
+struct Failed(String);
 
-impl fmt::Display for TmuxFailed {
+impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for TmuxFailed {}
+impl std::error::Error for Failed {}
 
-/// Whether `error` is a tmux command's failure, which is a problem with
-/// what it was asked to do, rather than the session's, which ends things.
-fn is_tmux_failure(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<TmuxFailed>().is_some()
+/// Whether `error` is a [`Failed`].
+fn is_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Failed>().is_some()
 }
 
-/// Runs `tmux ARGS` against the server at `socket`, returning its output.
-/// A failure of tmux's is a [`TmuxFailed`].
-fn run_tmux(session: &mut Session, socket: &str, args: &str) -> Result<String> {
-    let output = session.run(&format!("tmux -S {} {args}", shell_quote(socket)), QUICK)?;
+/// Runs `tmux ARGS` against the server at `socket`, returning its output:
+/// with no environment if `bare`, so that none of this session's (like
+/// SSH_CONNECTION) reaches a tmux session that it creates.  A failure of
+/// tmux's is a [`Failed`].
+fn run_tmux(session: &mut Session, socket: &str, args: &str, bare: bool) -> Result<String> {
+    let tmux = if bare { "env -i \"$(command -v tmux)\"" } else { "tmux" };
+    let output = session.run(&format!("{tmux} -S {} {args}", shell_quote(socket)), QUICK)?;
     if output.status != 0 {
-        return Err(TmuxFailed(format!("tmux {} failed: {}", args.split_whitespace().next().unwrap_or_default(), output.stderr_text())).into());
+        return Err(Failed(format!("tmux {} failed: {}", args.split_whitespace().next().unwrap_or_default(), output.stderr_text())).into());
     }
     Ok(output.stdout_text())
 }
 
 /// `value` as a tmux argument that tmux expands as a format, like a `-c`
-/// directory or a window name, with its "#"s kept.
+/// directory or a session or window name, with its "#"s kept.
 fn format_quote(value: &str) -> String {
     shell_quote(&value.replace('#', "##"))
 }
 
-/// Waits (up to [`MOUNT_TIMEOUT`]) until no mount or mount.* process is
-/// running, so that filesystems a script is mounting in parallel are there.
-/// Returns whether that happened.
+/// Waits (up to [`MOUNT_TIMEOUT`]) until no `mount` process is running, so
+/// that filesystems a script is mounting in parallel are there.  (Just
+/// mount itself, which waits for the mount.* helper it runs; some helpers
+/// stay around as the filesystem's daemon.)  Returns whether that happened.
 fn wait_for_mounts(session: &mut Session, printer: &mut Printer) -> Result<bool> {
     let deadline = Deadline::after(MOUNT_TIMEOUT);
     loop {
         let comms = session.run_ok("ps -e -o comm=", QUICK)?;
-        let mounting = comms.lines().map(str::trim).filter(|comm| *comm == "mount" || comm.starts_with("mount.")).count();
+        let mounting = comms.lines().filter(|comm| comm.trim() == "mount").count();
         if mounting == 0 {
             return Ok(true);
         }
@@ -217,24 +232,24 @@ fn wait_for_mounts(session: &mut Session, printer: &mut Printer) -> Result<bool>
 }
 
 /// Starts `server`'s user's tmux server at its socket, with its first
-/// session, `first`, of `width` by `height`, whose first window starts in
-/// `cwd`: from a transient unit that logs the user in through PAM, which
-/// puts the server in a logind session scope of the user's, as a login
-/// would, where it stays once the unit is done, like a tmux left behind by
-/// logging out.
-fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, width: u32, height: u32, cwd: &str) -> Result<()> {
+/// session, `first`, whose first window starts in `cwd`: from a transient
+/// unit that logs the user in through PAM, which puts the server in a
+/// logind session scope of the user's, as a login would, where it stays
+/// once the unit is done, like a tmux left behind by logging out.
+fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, cwd: &str) -> Result<()> {
     let socket_dir = server.socket.rsplit_once('/').map_or(".", |(dir, _)| dir);
     let script = format!(
-        "umask 077 && mkdir -p {} && exec tmux -S {} new-session -d -s {} -x {width} -y {height} -c {}",
+        "umask 077 && mkdir -p {} && exec tmux -S {} new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {}",
         shell_quote(socket_dir),
         shell_quote(&server.socket),
-        shell_quote(&first.name),
+        format_quote(&first.name),
         format_quote(cwd)
     );
     let unit = format!("reboop-tmux-$(systemd-escape -- {})-$(date +%s%N)", shell_quote(&server.user));
     let description = format!("reboop: {}'s tmux server at {}", server.user, server.socket);
+    // systemd-run would otherwise expand $VARIABLEs in the command line
     let start = format!(
-        "unit={unit} && systemd-run --quiet --unit=\"$unit\" --uid={} -p PAMName=login --description={} /bin/sh -c {} || exit 1
+        "unit={unit} && systemd-run --quiet --unit=\"$unit\" --uid={} -p PAMName=login --expand-environment=no --description={} /bin/sh -c {} || exit 1
 i=0; until tmux -S {} has-session -t {} 2>/dev/null; do i=$((i + 1)); [ $i -ge {} ] && {{ systemctl status --no-pager \"$unit\" 2>&1; exit 1; }}; sleep 0.2; done",
         shell_quote(&server.user),
         shell_quote(&description),
@@ -244,7 +259,9 @@ i=0; until tmux -S {} has-session -t {} 2>/dev/null; do i=$((i + 1)); [ $i -ge {
         SERVER_TIMEOUT.as_millis() / 200
     );
     let output = session.run(&start, SERVER_TIMEOUT + QUICK)?;
-    ensure!(output.status == 0, "{}'s tmux server at {} didn't start: {}\n{}", server.user, server.socket, output.stderr_text(), output.stdout_text().trim_end());
+    if output.status != 0 {
+        return Err(Failed(format!("the server didn't start: {}\n{}", output.stderr_text(), output.stdout_text().trim_end())).into());
+    }
     Ok(())
 }
 
@@ -253,69 +270,77 @@ i=0; until tmux -S {} has-session -t {} 2>/dev/null; do i=$((i + 1)); [ $i -ge {
 /// session was created with it), or as a new one.  Returns its pane ids, in
 /// the panes' order.
 fn create_window(session: &mut Session, socket: &str, name: &str, window: &Window, first: Option<(&str, u32, &str)>) -> Result<Vec<String>> {
-    let [first_pane, more @ ..] = &window.panes[..] else { bail!("the window has no panes") };
+    let [first_pane, more @ ..] = &window.panes[..] else { return Err(Failed("the window has no panes".into()).into()) };
     let (window_id, mut pane_ids) = match first {
         Some((id, index, pane_id)) => {
             if index != window.index {
-                run_tmux(session, socket, &format!("move-window -s {id} -t {}", shell_quote(&format!("={name}:{}", window.index))))?;
+                run_tmux(session, socket, &format!("move-window -s {id} -t {}", shell_quote(&format!("={name}:{}", window.index))), false)?;
             }
             if let Some(window_name) = &window.name {
-                run_tmux(session, socket, &format!("rename-window -t {id} {}", format_quote(window_name)))?;
+                run_tmux(session, socket, &format!("rename-window -t {id} {}", format_quote(window_name)), false)?;
             }
             (id.to_string(), vec![pane_id.to_string()])
         }
         None => {
             let named = window.name.as_ref().map_or(String::new(), |window_name| format!(" -n {}", format_quote(window_name)));
             let target = shell_quote(&format!("={name}:{}", window.index));
-            let ids = run_tmux(session, socket, &format!("new-window -d -t {target} -c {}{named} -P -F '#{{window_id}} #{{pane_id}}'", format_quote(&first_pane.cwd)))?;
-            let (window_id, pane_id) = ids.trim_end().split_once(' ').ok_or_else(|| TmuxFailed(format!("new-window printed {ids:?}")))?;
+            let ids = run_tmux(session, socket, &format!("new-window -d -t {target} -c {}{named} -P -F '#{{window_id}} #{{pane_id}}'", format_quote(&first_pane.cwd)), false)?;
+            let (window_id, pane_id) = ids.trim_end().split_once(' ').ok_or_else(|| Failed(format!("new-window printed {ids:?}")))?;
             (window_id.to_string(), vec![pane_id.to_string()])
         }
     };
     // Each pane after the first is split off below the one before it, at
-    // full width and 2 rows (as many as fit), for the layout to size.
+    // full width and 2 rows, for the layout to size.
     for pane in more {
         let previous = pane_ids.last().unwrap().clone();
-        let id = run_tmux(session, socket, &format!("split-window -d -f -v -l 2 -t {previous} -c {} -P -F '#{{pane_id}}'", format_quote(&pane.cwd)))?;
+        let id = run_tmux(session, socket, &format!("split-window -d -f -v -l 2 -t {previous} -c {} -P -F '#{{pane_id}}'", format_quote(&pane.cwd)), false)?;
         pane_ids.push(id.trim_end().to_string());
     }
-    run_tmux(session, socket, &format!("select-layout -t {window_id} {}", shell_quote(&window.layout)))?;
+    run_tmux(session, socket, &format!("select-layout -t {window_id} {}", shell_quote(&window.layout)), false)?;
     if let Some(active) = window.panes.iter().position(|pane| pane.active) {
-        run_tmux(session, socket, &format!("select-pane -t {}", pane_ids[active]))?;
+        run_tmux(session, socket, &format!("select-pane -t {}", pane_ids[active]), false)?;
     }
     if window.active {
-        run_tmux(session, socket, &format!("select-window -t {window_id}"))?;
+        run_tmux(session, socket, &format!("select-window -t {window_id}"), false)?;
     }
     Ok(pane_ids)
 }
 
-/// Why a pane's command can't be run again.
+/// Why a pane isn't as it should be.
 enum NotReady {
     /// Its shell didn't reach its prompt within [`PROMPT_TIMEOUT`].
     NoPrompt,
-    /// Its shell is in this directory, not the pane's.
+    /// Its process is in this directory, not the pane's.
     Elsewhere(String),
     /// The pane's directory is on the filesystem mounted here, not where it
     /// was.
     OtherMount(String),
 }
 
-/// Waits (up to [`PROMPT_TIMEOUT`]) for the shell in pane `pane_id` to be at
-/// its prompt, and checks that it's in `pane`'s directory, which is on the
-/// filesystem mounted where it was.
-fn wait_for_prompt(session: &mut Session, socket: &str, pane_id: &str, pane: &Pane) -> Result<Result<(), NotReady>> {
+/// Checks that the process in pane `pane_id` is in `pane`'s directory (by
+/// its real path, as the pane's may go through a symlink), and that the
+/// directory is on the filesystem mounted where it was.  If `prompt`, first
+/// waits (up to [`PROMPT_TIMEOUT`]) for the pane's shell to be at its prompt:
+/// in the foreground, reading in non-canonical mode, as a line editor does.
+fn check_pane(session: &mut Session, socket: &str, pane_id: &str, pane: &Pane, prompt: bool) -> Result<Result<(), NotReady>> {
     let script = format!(
-        r#"set -- $(tmux -S {} display -p -t {pane_id} -F '#{{pane_pid}} #{{pane_tty}}' 2>/dev/null)
+        r#"set -- $(tmux -S {socket} display -p -t {pane_id} -F '#{{pane_pid}} #{{pane_tty}}' 2>/dev/null)
 pid=$1 tty=$2
 [ -n "$tty" ] || exit 1
-i=0; until stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do i=$((i + 1)); [ $i -ge {} ] && exit 2; sleep 0.1; done
+if [ {} = 1 ]; then
+    i=0
+    until [ "$(tmux -S {socket} display -p -t {pane_id} -F '#{{pane_current_command}}')" = "$(cat /proc/$pid/comm)" ] && stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do
+        i=$((i + 1)); [ $i -ge {} ] && exit 2; sleep 0.1
+    done
+fi
 cwd=$(readlink /proc/$pid/cwd) || cwd=
-[ "$cwd" = {cwd} ] || {{ printf '%s' "$cwd"; exit 3; }}
+[ "$cwd" = "$(readlink -f -- {cwd})" ] || {{ printf '%s' "$cwd"; exit 3; }}
 m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
 [ "$m" = {} ] || {{ printf '%s' "$m"; exit 4; }}"#,
-        shell_quote(socket),
+        u8::from(prompt),
         PROMPT_TIMEOUT.as_millis() / 100,
         shell_quote(&pane.mountpoint),
+        socket = shell_quote(socket),
         cwd = shell_quote(&pane.cwd)
     );
     let output = session.run(&script, PROMPT_TIMEOUT + QUICK)?;
@@ -329,56 +354,77 @@ m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
     })
 }
 
-/// Runs the commands of the panes of `window` (which has pane ids
-/// `pane_ids`) again in them, where `patterns` allow, telling the user.
-/// Returns the problems: commands that couldn't be run.
-fn run_commands(session: &mut Session, server: &Server, name: &str, window: &Window, pane_ids: &[String], patterns: &CommandPatterns, printer: &mut Printer) -> Result<Vec<String>> {
+/// A server being brought back.
+struct Restoring<'a> {
+    server: &'a Server,
+    /// The commands that may be run again
+    patterns: &'a CommandPatterns,
+    /// The ids of the panes whose commands run again already (a window
+    /// linked into several sessions comes back once per session)
+    resumed: HashSet<String>,
+}
+
+/// Checks the panes of `window` (which has pane ids `pane_ids`) in session
+/// `name` of the server being brought back, and runs their commands again
+/// in them where allowed, telling the user.  Returns the problems: panes
+/// that aren't where they should be, and commands that couldn't be run.
+fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, window: &Window, pane_ids: &[String], printer: &mut Printer) -> Result<Vec<String>> {
+    let server = restoring.server;
     let mut problems = Vec::new();
     for (pane, pane_id) in window.panes.iter().zip(pane_ids) {
+        let verdict = tmux::verdict(pane, restoring.patterns);
         let where_ = format!("{}'s {} in {}", server.user, location(name, window.index, pane.index), pane.cwd);
-        let command = match tmux::verdict(pane, patterns) {
-            Verdict::Idle => continue,
-            Verdict::Block(why) => {
-                printer.line(&format!("Left {where_} idle: {why}"));
-                continue;
-            }
-            Verdict::Resume(command) => command,
+        let command = match &verdict {
+            Verdict::Resume(command) => Some(command.clone()),
+            Verdict::Idle | Verdict::Block(_) => None,
         };
-        let not_run = |why: String| format!("{where_}: {command} wasn't run again: {why}");
-        match wait_for_prompt(session, &server.socket, pane_id, pane)? {
+        let problem = |why: String| match &command {
+            Some(command) => format!("{where_}: {command} wasn't run again: {why}"),
+            None => format!("{where_}: {why}"),
+        };
+        let typed = matches!(pane.running, Running::Typed { .. });
+        match check_pane(session, &server.socket, pane_id, pane, command.is_some() && typed)? {
             Ok(()) => {}
             Err(NotReady::NoPrompt) => {
-                problems.push(not_run(format!("its shell didn't reach its prompt within {}s", PROMPT_TIMEOUT.as_secs())));
+                problems.push(problem(format!("its shell didn't reach its prompt within {}s", PROMPT_TIMEOUT.as_secs())));
                 continue;
             }
             Err(NotReady::Elsewhere(cwd)) => {
-                problems.push(not_run(format!("its shell is in {cwd:?} (does {} exist?)", pane.cwd)));
+                problems.push(problem(format!("its shell is in {cwd:?} (does {} exist?)", pane.cwd)));
                 continue;
             }
             Err(NotReady::OtherMount(mountpoint)) => {
-                problems.push(not_run(format!("{} is on the filesystem mounted at {mountpoint:?}, not {:?} as before", pane.cwd, pane.mountpoint)));
+                problems.push(problem(format!("{} is on the filesystem mounted at {mountpoint:?}, not {:?} as before", pane.cwd, pane.mountpoint)));
                 continue;
             }
         }
+        let Some(command) = &command else {
+            if let Verdict::Block(why) = verdict {
+                printer.line(&format!("Left {where_} idle: {why}"));
+            }
+            continue;
+        };
+        if !restoring.resumed.insert(pane.id.clone()) {
+            printer.line(&format!("Left {where_} idle: it's the same pane as one brought back already"));
+            continue;
+        }
+        let socket = shell_quote(&server.socket);
         let run = match &pane.running {
             // Pasted as typed (with bracketed paste, so a line break doesn't
-            // run what's before it), then Enter.
-            tmux::Running::Typed { command } => {
-                let socket = shell_quote(&server.socket);
-                format!(
-                    "tmux -S {socket} set-buffer -b {BUFFER} -- {} && tmux -S {socket} paste-buffer -p -d -b {BUFFER} -t {pane_id} && tmux -S {socket} send-keys -t {pane_id} Enter",
-                    shell_quote(command)
-                )
-            }
+            // run what's before it), then Enter
+            Running::Typed { command } => format!(
+                "tmux -S {socket} set-buffer -b {BUFFER} -- {} && tmux -S {socket} paste-buffer -p -d -b {BUFFER} -t {pane_id} && tmux -S {socket} send-keys -t {pane_id} Enter",
+                shell_quote(command)
+            ),
             // Through tmux's own parser, which takes the quoting back
-            tmux::Running::Started { command } => format!("printf '%s\\n' {} | tmux -S {} source-file -", shell_quote(&format!("respawn-pane -k -t {pane_id} {command}")), shell_quote(&server.socket)),
+            Running::Started { command } => format!("printf '%s\\n' {} | tmux -S {socket} source-file -", shell_quote(&format!("respawn-pane -k -t {pane_id} {command}"))),
             _ => unreachable!("only typed and started commands are resumable"),
         };
         let output = session.run(&run, QUICK)?;
         if output.status == 0 {
             printer.line(&format!("Resumed {where_}: {command}"));
         } else {
-            problems.push(not_run(format!("tmux failed: {}", output.stderr_text())));
+            problems.push(problem(format!("tmux failed: {}", output.stderr_text())));
         }
     }
     Ok(problems)
@@ -391,48 +437,73 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
     let mut problems = Vec::new();
     let socket = &server.socket;
     // The sessions already there, if a server's running at the socket
-    let mut existing = match run_tmux(session, socket, "list-sessions -F '#{session_name}'") {
+    let mut existing = match run_tmux(session, socket, "list-sessions -F '#{session_name}'", false) {
         Ok(names) => Some(names.lines().map(String::from).collect::<Vec<_>>()),
-        Err(error) if is_tmux_failure(&error) => None,
+        Err(error) if is_failure(&error) => None,
         Err(error) => return Err(error),
     };
+    // The first session brought back of each session group, whose windows
+    // the group's others share
+    let mut groups: HashMap<&str, &str> = HashMap::new();
+    let mut restoring = Restoring { server, patterns, resumed: HashSet::new() };
     for tmux_session in &server.sessions {
-        let [first, ..] = &tmux_session.windows[..] else { bail!("session {} has no windows", tmux_session.name) };
-        let [first_pane, ..] = &first.panes[..] else { bail!("window {}:{} has no panes", tmux_session.name, first.index) };
-        if existing.as_ref().is_some_and(|names| names.contains(&tmux_session.name)) {
-            problems.push(format!("{}'s tmux at {socket} already has a session called {}, which was left alone", server.user, tmux_session.name));
+        let name = &tmux_session.name;
+        let not_recreated = |error: &anyhow::Error| format!("{}'s session {name} couldn't be recreated: {error:#}", server.user);
+        if existing.as_ref().is_some_and(|names| names.contains(name)) {
+            problems.push(format!("{}'s tmux at {socket} already has a session called {name}, which was left alone", server.user));
             continue;
         }
-        // Big enough for every window's panes to be split off before the
-        // layouts size them
-        let width  = tmux_session.windows.iter().map(|window| window.width).max().unwrap_or(80);
-        let height = tmux_session.windows.iter().map(|window| window.height).max().unwrap_or(24);
-        let created = match &mut existing {
-            None => {
-                start_server(session, server, tmux_session, width, height, &first_pane.cwd)?;
-                existing = Some(vec![]);
-                run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={}:^", tmux_session.name))))?
+        if let Some(first) = tmux_session.group.as_deref().and_then(|group| groups.get(group)) {
+            match run_tmux(session, socket, &format!("new-session -d -s {} -t {}", format_quote(name), shell_quote(&format!("={first}"))), true) {
+                Ok(_) => existing.get_or_insert_with(Vec::new).push(name.clone()),
+                Err(error) if is_failure(&error) => problems.push(not_recreated(&error)),
+                Err(error) => return Err(error),
             }
+            continue;
+        }
+        let Some(first_window) = tmux_session.windows.first() else {
+            problems.push(not_recreated(&anyhow!("it has no windows")));
+            continue;
+        };
+        let Some(first_pane) = first_window.panes.first() else {
+            problems.push(not_recreated(&anyhow!("its window {} has no panes", first_window.index)));
+            continue;
+        };
+        let created = match &existing {
+            None => start_server(session, server, tmux_session, &first_pane.cwd)
+                .and_then(|()| run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={name}:^"))), false)),
             Some(_) => run_tmux(
                 session,
                 socket,
-                &format!("new-session -d -s {} -x {width} -y {height} -c {} -P -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&tmux_session.name), format_quote(&first_pane.cwd)),
-            )?,
+                &format!("new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {} -P -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", format_quote(name), format_quote(&first_pane.cwd)),
+                true,
+            ),
         };
-        existing.as_mut().unwrap().push(tmux_session.name.clone());
+        let created = match created {
+            Ok(created) => created,
+            Err(error) if is_failure(&error) => {
+                problems.push(not_recreated(&error));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        existing.get_or_insert_with(Vec::new).push(name.clone());
+        if let Some(group) = &tmux_session.group {
+            groups.insert(group, name);
+        }
         let [window_id, index, pane_id] = created.split_whitespace().collect::<Vec<_>>()[..] else { bail!("unexpected tmux output {created:?}") };
         let index: u32 = index.parse().with_context(|| format!("unexpected tmux output {created:?}"))?;
         for (i, window) in tmux_session.windows.iter().enumerate() {
             let first = (i == 0).then_some((window_id, index, pane_id));
-            let pane_ids = match create_window(session, socket, &tmux_session.name, window, first) {
+            let pane_ids = match create_window(session, socket, name, window, first) {
                 Ok(pane_ids) => pane_ids,
-                Err(error) if is_tmux_failure(&error) => {
-                    problems.push(format!("{}'s {}:{} couldn't be recreated: {error:#}", server.user, tmux_session.name, window.index));
+                Err(error) if is_failure(&error) => {
+                    problems.push(format!("{}'s {name}:{} couldn't be recreated: {error:#}", server.user, window.index));
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            problems.extend(run_commands(session, server, &tmux_session.name, window, &pane_ids, patterns, printer)?);
+            problems.extend(restore_panes(session, &mut restoring, name, window, &pane_ids, printer)?);
         }
     }
     Ok(problems)
@@ -454,11 +525,19 @@ pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatte
     }
     for server in &capture.servers {
         if let Some(error) = &server.error {
-            problems.push(format!("{}'s tmux server at {} couldn't be listed when captured ({error}), so there's nothing to bring back", server.user, server.socket));
+            problems.push(format!("{} couldn't be listed when captured ({error}), so there's nothing to bring back", server.name()));
             continue;
         }
         printer.line(&format!("Bringing back {}'s tmux server at {}: {}", server.user, server.socket, server.counts()));
-        problems.extend(restore_server(session, server, patterns, printer)?);
+        match restore_server(session, server, patterns, printer) {
+            Ok(found) => problems.extend(found),
+            Err(error) if is_failure(&error) => {
+                let problem = format!("{} couldn't be brought back: {error:#}", server.name());
+                printer.styled_line(Red, &problem);
+                problems.push(problem);
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(problems)
 }
@@ -468,21 +547,24 @@ pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatte
 /// resumable_commands are for.  Not if the capture is from this very boot
 /// and was taken for a reboot or shutdown: then the machine didn't go down
 /// after all, and what it describes is still running.  Either way, the
-/// capture is no longer pending.  Returns the problems.
-pub fn restore_pending(session: &mut Session, machine: &Machine, printer: &mut Printer) -> Result<Vec<String>> {
-    let Some((path, capture)) = pending(session)? else { return Ok(vec![]) };
+/// capture is no longer pending.  Returns the problems, or `None` if
+/// nothing was brought back.
+pub fn restore_pending(session: &mut Session, machine: &Machine, printer: &mut Printer) -> Result<Option<Vec<String>>> {
+    let Some((path, capture)) = pending(session)? else { return Ok(None) };
     // First, so that a restore that's cut short isn't repeated on top of
     // itself; the capture stays in DIR for `reboop tmux start --saved`.
     forget_pending(session)?;
     if capture.purpose != Purpose::TmuxStop && capture.boot_id == facts::boot_id(session)? {
         printer.line(&format!("{path} is from this boot, so what it describes is still running; not bringing it back"));
-        return Ok(vec![]);
+        return Ok(None);
     }
     printer.line(&format!("Bringing back what was in tmux, from {path}"));
-    restore(session, &capture, &machine.resumable_commands, printer)
+    Ok(Some(restore(session, &capture, &machine.resumable_commands, printer)?))
 }
 
-/// Kills every server in `capture`, waiting for each to exit.
+/// Kills every server in `capture`, waiting for each to exit.  (That hangs
+/// up on the panes' processes, as closing a terminal does; one that ignores
+/// SIGHUP keeps running.)
 fn stop_servers(session: &mut Session, capture: &Capture, printer: &mut Printer) -> Result<()> {
     for server in &capture.servers {
         let script = format!(
@@ -492,7 +574,9 @@ fn stop_servers(session: &mut Session, capture: &Capture, printer: &mut Printer)
             STOP_TIMEOUT.as_millis() / 100
         );
         let output = session.run(&script, STOP_TIMEOUT + QUICK)?;
-        ensure!(output.status == 0, "{}'s tmux server at {} (pid {}) didn't exit within {}s", server.user, server.socket, server.pid, STOP_TIMEOUT.as_secs());
+        if output.status != 0 {
+            bail!("{} (pid {}) didn't exit within {}s", server.name(), server.pid, STOP_TIMEOUT.as_secs());
+        }
         printer.line(&format!("Stopped {}'s tmux server at {}", server.user, server.socket));
     }
     Ok(())
@@ -511,34 +595,39 @@ fn open(ssh: &Ssh, machine: &Machine) -> Result<Session> {
 pub fn list(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Printer) -> Result<()> {
     let mut session = open(ssh, machine)?;
     let capture = match saved {
-        Some(saved) => load(&mut session, &saved_path(saved))?,
+        Some(saved) => {
+            let path = saved_path(saved);
+            let capture = load(&mut session, &path)?;
+            printer.line(&format!("{path}, saved at {} for a {}, has {}:", capture.captured_at.strftime("%Y-%m-%d %H:%M:%S UTC"), capture.purpose, capture.counts()));
+            capture
+        }
         None => {
             let capture = Capture::new(Purpose::Check, &facts::boot_id(&mut session)?, tmux::capture(&mut session)?);
             save(&mut session, &capture, false)?;
+            if capture.servers.is_empty() {
+                printer.line(&format!("{} has no tmux servers", machine.hostname));
+            }
             capture
         }
     };
-    if capture.servers.is_empty() {
-        printer.line(&format!("{} has no tmux servers", machine.hostname));
-    }
     for server in &capture.servers {
         printer.line(&tmux::lines(server, machine.tmux, &machine.resumable_commands).join("\n"));
     }
     Ok(())
 }
 
-/// Stops `machine`'s tmux servers if every pane's command is resumable,
-/// saving what's in them first for `start` to bring back, telling the user.
-/// Returns the reasons not to, if it wasn't okay (none if the servers were
-/// stopped).
+/// Stops `machine`'s tmux servers if every pane's command is resumable (by
+/// its resumable_commands, whatever its tmux setting) and every server
+/// could be listed, saving what's in them first for `start` to bring back,
+/// telling the user.  Returns the reasons not to, if it wasn't okay (none if
+/// the servers were stopped).
 pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<String>> {
     let hostname = &machine.hostname;
     let mut session = open(ssh, machine)?;
     let capture = Capture::new(Purpose::TmuxStop, &facts::boot_id(&mut session)?, tmux::capture(&mut session)?);
-    // By the patterns alone: this is the user's own decision to stop tmux.
-    let blockers = tmux::blockers(config::TmuxPolicy::Resume, &machine.resumable_commands, &capture.servers);
+    let blockers = tmux::blockers(TmuxPolicy::Resume, &machine.resumable_commands, &capture.servers);
     if !blockers.is_empty() {
-        printer.styled_line(Red, &format!("Not stopping tmux on {hostname}:\n    {}", blockers.join("\n    ")));
+        printer.styled_line(Red, &indented_list(&format!("Not stopping tmux on {hostname}:"), &blockers));
         return Ok(blockers);
     }
     if capture.servers.is_empty() {
@@ -549,7 +638,7 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<S
     printer.line(&format!("Saved what's in {hostname}'s tmux to {path}, for `reboop tmux start {hostname}` to bring back: {}", capture.counts()));
     let resumable = capture.resumable(&machine.resumable_commands);
     if !resumable.is_empty() {
-        printer.line(&format!("Commands to run again then:\n    {}", resumable.join("\n    ")));
+        printer.line(&indented_list("Commands to run again then:", &resumable));
     }
     stop_servers(&mut session, &capture, printer)?;
     Ok(vec![])
@@ -557,7 +646,8 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<S
 
 /// Brings back what's pending on `machine` (see [`restore_pending`]), or the
 /// capture `saved` on it if given (see [`saved_path`]), telling the user.
-/// Returns the problems.  Fails if nothing is pending and nothing is given.
+/// Returns the problems.  Fails if nothing is brought back for want of a
+/// capture.
 pub fn start(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let hostname = &machine.hostname;
     let mut session = open(ssh, machine)?;
@@ -568,18 +658,13 @@ pub fn start(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Pr
             printer.line(&format!("Bringing back what was in tmux, from {path}"));
             restore(&mut session, &capture, &machine.resumable_commands, printer)?
         }
-        None => {
-            ensure!(
-                pending(&mut session)?.is_some(),
-                "no tmux capture is pending on {hostname}; `reboop tmux start {hostname} --saved FILE` brings back one of those in {DIR}"
-            );
-            restore_pending(&mut session, machine, printer)?
-        }
+        None => restore_pending(&mut session, machine, printer)?
+            .ok_or_else(|| anyhow!("nothing is pending on {hostname} to bring back; `reboop tmux start {hostname} --saved FILE` brings back one of the captures in {DIR}"))?,
     };
     if problems.is_empty() {
         printer.line(&format!("tmux is back on {hostname}, and all is well"));
     } else {
-        printer.styled_line(Red, &format!("tmux is back on {hostname}, but:\n    {}", problems.join("\n    ")));
+        printer.styled_line(Red, &indented_list(&format!("tmux is back on {hostname}, but:"), &problems));
     }
     Ok(problems)
 }
@@ -619,11 +704,11 @@ mod tests {
     #[test]
     fn names_files_by_time_and_purpose() {
         let mut capture = Capture::new(Purpose::Reboot, "4f6f3fbb", vec![]);
-        capture.captured_at = "2026-11-07T06:32:28.5Z".parse().unwrap();
-        assert_eq!(capture.file_name(), "20261107T063228Z.reboot.json");
+        capture.captured_at = "2026-11-07T06:32:28.5126Z".parse().unwrap();
+        assert_eq!(capture.file_name(), "20261107T063228.512Z.reboot.json");
         capture.purpose = Purpose::TmuxStop;
-        assert_eq!(capture.file_name(), "20261107T063228Z.tmux-stop.json");
-        assert_eq!(saved_path("20261107T063228Z.check.json"), "/var/lib/reboop/tmux/20261107T063228Z.check.json");
+        assert_eq!(capture.file_name(), "20261107T063228.512Z.tmux-stop.json");
+        assert_eq!(saved_path("20261107T063228.512Z.check.json"), "/var/lib/reboop/tmux/20261107T063228.512Z.check.json");
         assert_eq!(saved_path("/tmp/x.json"), "/tmp/x.json");
     }
 

@@ -17,6 +17,7 @@ use jiff::tz::TimeZone;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::thread;
+use tracing::warn;
 
 /// The facts about a machine, the reasons not to reboot it (none if it's
 /// okay), and whether a nixos-rebuild would change it (if its check_rebuild
@@ -27,8 +28,11 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
-    // A record of what was in tmux, for after a crash: see resume::DIR.
-    resume::save(&mut session, &Capture::new(Purpose::Check, &facts.boot_id, facts.tmux.clone()), false)?;
+    // A record of what was in tmux, for after a crash (see resume::DIR),
+    // which isn't worth losing the facts over if it can't be written
+    if let Err(error) = resume::save(&mut session, &Capture::new(Purpose::Check, &facts.boot_id, facts.tmux.clone()), false) {
+        warn!("couldn't save what's in tmux on {}: {error:#}", machine.hostname);
+    }
     // After the facts, which the evaluation would skew, e.g. the load
     let rebuild = machine.check_rebuild.then(|| facts::rebuild(&mut session, &facts.systems.default));
     Ok((facts, blockers, rebuild))

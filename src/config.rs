@@ -1,7 +1,7 @@
 //! reboop's configuration, in ~/.config/reboop: defaults.json (JSON5, so
 //! comments and trailing commas are fine) with settings for all machines,
 //! and machines.jsonl with one JSON object per machine, whose settings take
-//! precedence.
+//! precedence (except its resumable_commands, which add to the defaults').
 
 use crate::ssh::Target;
 use crate::tmux::CommandPatterns;
@@ -68,9 +68,9 @@ pub struct Machine {
     pub stop_services: Vec<String>,
     pub tmux: TmuxPolicy,
     /// The commands that may be resumed (see [`crate::tmux`]), as regular
-    /// expressions, each of which has to match a whole command line.  Those
-    /// in defaults.json apply to every machine, and a machine's own are added
-    /// to them.
+    /// expressions (the regex crate's), each of which has to match a whole
+    /// command line.  Those in defaults.json apply to every machine, and a
+    /// machine's own are added to them.
     pub resumable_commands: CommandPatterns,
 }
 
@@ -266,6 +266,7 @@ pub fn passwords_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::tests::patterns;
 
     const DEFAULTS: &str = r#"{
         // comments are fine
@@ -282,10 +283,6 @@ mod tests {
         "tmux": "resume",
         "resumable_commands": ["rsync .*"],
     }"#;
-
-    fn patterns(patterns: &[&str]) -> CommandPatterns {
-        CommandPatterns::new(patterns.iter().map(|&pattern| pattern.into()).collect()).unwrap()
-    }
 
     const HOME: &str = "/home/user";
 

@@ -38,8 +38,9 @@ enum ReboopCommand {
         color: ColorOption,
     },
     /// Reboot a machine if it's okay to (see check), unlock its LUKS device
-    /// from the initrd if it has one, show how it came back, and scrub its
-    /// btrfs filesystems, unless a scrub found them clean lately.
+    /// from the initrd if it has one, show how it came back, bring back
+    /// what was in its tmux servers (see tmux), and scrub its btrfs
+    /// filesystems, unless a scrub found them clean lately.
     /// Exits 0 if it came back fine, 2 if it wasn't okay to reboot, or 1 if
     /// it came back with problems or something failed.
     #[clap(name = "bounce")]
@@ -51,8 +52,10 @@ enum ReboopCommand {
     },
     /// Do what bounce does after the reboot, for a machine that was rebooted
     /// some other way, or whose bounce was cut short: unlock its LUKS device
-    /// from the initrd if it's waiting there, show how it came back, and
-    /// scrub its btrfs filesystems, unless a scrub found them clean lately.
+    /// from the initrd if it's waiting there, show how it came back, bring
+    /// back what was in its tmux servers if reboop took them down (see
+    /// tmux), and scrub its btrfs filesystems, unless a scrub found them
+    /// clean lately.
     /// Exits 0 if it came back fine, or 1 if it came back with problems or
     /// something failed.
     #[clap(name = "catch")]
@@ -62,8 +65,9 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
-    /// Shut down a machine if it's okay to (see check), and wait for it to
-    /// stop accepting SSH.
+    /// Shut down a machine if it's okay to (see check), saving what's in
+    /// its tmux servers for catch to bring back (see tmux), and wait for it
+    /// to stop accepting SSH.
     /// Exits 0 if it went down fine, 2 if it wasn't okay to shut down, or 1
     /// if it went down with problems or something failed.
     #[clap(name = "stop")]
@@ -97,23 +101,24 @@ enum ReboopCommand {
 }
 
 /// What's in a machine's tmux servers: every session, window and pane, with
-/// the pane's directory and the command it's running, as zsh-spy recorded
-/// it being typed.  A bounce saves that right before the reboot and brings
-/// it back afterwards, running the commands that the machine's
-/// resumable_commands allow again, if its tmux setting is "resume".
+/// the pane's directory and what it's running (a command typed into its
+/// shell, which zsh-spy recorded, or one tmux started it with).  A bounce
+/// saves that right before the reboot and brings it back afterwards,
+/// running again the commands that the machine's resumable_commands allow,
+/// if its tmux setting is "resume".
 #[derive(clap::Subcommand, Debug)]
 enum TmuxCommand {
     /// List what's in a machine's tmux servers: each pane's directory and
-    /// what it's running, and whether that would be run again after a
-    /// reboot.  (Saved on the machine like every look at the servers: see
-    /// --saved.)
+    /// what it's running (shortened to a line), and whether that's
+    /// resumable by the machine's resumable_commands.  (Saved on the
+    /// machine like every look at the servers: see --saved.)
     /// Exits 0, or 1 if that failed.
     #[clap(name = "list")]
     List {
         /// A machine from machines.jsonl
         hostname: String,
         /// Show a capture saved on the machine instead: a file in
-        /// /var/lib/reboop/tmux, by its name there or its path
+        /// /var/lib/reboop/tmux, by its name there or its absolute path
         #[clap(long, value_name = "FILE")]
         saved: Option<String>,
         #[clap(flatten)]
@@ -121,7 +126,8 @@ enum TmuxCommand {
     },
     /// Save what's in a machine's tmux servers and kill them, for `reboop
     /// tmux start` to bring back (e.g. around upgrading tmux).  Refuses if
-    /// a pane runs something that isn't resumable, as a reboot would.
+    /// a pane runs something that isn't resumable or a server can't be
+    /// listed, whatever the machine's tmux setting.
     /// Exits 0 if the servers were stopped, 2 if it wasn't okay to, or 1 if
     /// something failed.
     #[clap(name = "stop")]
@@ -142,7 +148,7 @@ enum TmuxCommand {
         /// A machine from machines.jsonl
         hostname: String,
         /// Bring back a capture saved on the machine instead: a file in
-        /// /var/lib/reboop/tmux, by its name there or its path
+        /// /var/lib/reboop/tmux, by its name there or its absolute path
         #[clap(long, value_name = "FILE")]
         saved: Option<String>,
         #[clap(flatten)]

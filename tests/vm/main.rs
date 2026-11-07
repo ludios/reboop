@@ -970,7 +970,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // tester's server: session work with window 0 (a zsh pane in /var/tmp,
     // then one in /home/tester), window 3, "jobs", started with sleep 600 in
     // /tmp, and window 5 in a directory that'll be gone; and session other,
-    // with a background job, and a line typed with a leading space.
+    // with a background job, a line typed with a leading space, and a job
+    // that was disowned (which only shows as a child of the shell).
     sh(&mut session, START_TMUX)?;
     tester_tmux(&mut session)?;
     sh(
@@ -978,17 +979,21 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
         &format!(
             "mkdir -p /var/tmp/reboop-test-gone && chown tester /var/tmp/reboop-test-gone && \
              {tmux_cmd} split-window -d -h -t work:0 -c /home/tester && {tmux_cmd} new-window -d -t work:3 -n jobs -c /tmp 'sleep 600' && \
-             {tmux_cmd} new-window -d -t work:5 -c /var/tmp/reboop-test-gone && {tmux_cmd} new-session -d -s other -c /tmp && {tmux_cmd} new-window -d -t other:1 -c /tmp"
+             {tmux_cmd} new-window -d -t work:5 -c /var/tmp/reboop-test-gone && {tmux_cmd} new-session -d -s other -c /tmp && \
+             {tmux_cmd} new-window -d -t other:1 -c /tmp && {tmux_cmd} new-window -d -t other:2 -c /tmp"
         ),
     )?;
     type_into(&mut session, "work:0.0", "sleep 601")?;
     type_into(&mut session, "work:5.0", "sleep 604")?;
     type_into(&mut session, "other:0.0", "sleep 602 &")?;
     type_into(&mut session, "other:1.0", " sleep 603")?;
+    type_into(&mut session, "other:2.0", "sleep 605 & disown")?;
     // zsh-spy has written about each once its command is running.
     wait_for(|| {
         let server = tester_tmux(&mut session)?;
-        Ok(matches!(pane(&server, "other:0.0")?.running, Running::Background { .. }) && matches!(pane(&server, "other:1.0")?.running, Running::Unknown { .. }))
+        Ok(matches!(pane(&server, "other:0.0")?.running, Running::Background { .. })
+            && matches!(pane(&server, "other:1.0")?.running, Running::Unknown { .. })
+            && matches!(pane(&server, "other:2.0")?.running, Running::Unknown { .. }))
     })?;
     let server = tester_tmux(&mut session)?;
     assert_eq!((server.user.as_str(), server.socket.as_str(), &server.error), ("tester", TESTER_SOCKET, &None));
@@ -999,6 +1004,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     expect_pane(&server, "work:5.0", "/var/tmp/reboop-test-gone", typed("sleep 604"))?;
     expect_pane(&server, "other:0.0", "/tmp", Running::Background { jobs: vec![Some("sleep 602".into())] })?;
     expect_pane(&server, "other:1.0", "/tmp", Running::Unknown { program: "sleep".into() })?;
+    expect_pane(&server, "other:2.0", "/tmp", Running::Unknown { program: "sleep".into() })?;
     assert_eq!(pane(&server, "work:0.0")?.mountpoint, "/");
     let work = server.sessions.iter().find(|tmux_session| tmux_session.name == "work").unwrap();
     assert_eq!(work.windows.iter().map(|window| (window.index, window.name.as_deref(), window.panes.len())).collect::<Vec<_>>(), [(0, None, 2), (3, Some("jobs"), 1), (5, None, 1)]);
@@ -1009,12 +1015,13 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let machine = vm_machine(vm);
     let resuming = resuming_machine(vm, &["sleep 60[14]", "\"sleep 600\""]);
     let facts = preflight::gather(&mut session, &machine.hostname)?;
-    assert_eq!(preflight::blockers(&machine, &facts), [format!("tmux: tester's server at {TESTER_SOCKET} has 2 sessions and 6 panes (tmux is \"block\")")]);
+    assert_eq!(preflight::blockers(&machine, &facts), [format!("tmux: tester's server at {TESTER_SOCKET} has 2 sessions and 7 panes (tmux is \"block\")")]);
     assert_eq!(
         preflight::blockers(&resuming, &facts),
         [
             "tmux: tester's other:0.0 in /tmp: a background job is still running: sleep 602",
             "tmux: tester's other:1.0 in /tmp: running sleep, but what was typed to start it is unknown",
+            "tmux: tester's other:2.0 in /tmp: running sleep, but what was typed to start it is unknown",
         ]
     );
     // `reboop tmux list` says as much, and saves a look at the servers.
@@ -1022,7 +1029,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     resume::list(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
     let printed = String::from_utf8(printed)?;
     print!("{printed}");
-    let listing = format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 6 panes\n    other:0.0 in /tmp: a background job is still running: sleep 602\n", server.pid);
+    let listing = format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 7 panes\n    other:0.0 in /tmp: a background job is still running: sleep 602\n", server.pid);
     assert!(printed.contains(&listing), "{printed}");
     assert!(printed.contains("\n    work:0.0 in /var/tmp: sleep 601 (resumable)\n    work:0.1 in /home/tester: idle\n    work:3.0 in /tmp: \"sleep 600\" (resumable)\n"), "{printed}");
     let saved = sh(&mut session, &format!("ls {}", resume::DIR))?;
@@ -1031,7 +1038,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // `reboop tmux stop` refuses for the same reasons.
     let mut printed = Vec::new();
     let refused = resume::stop(&vm.ssh, &resuming, &mut Printer::new(&mut printed, false, None, None))?;
-    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert_eq!(refused.len(), 3, "{refused:?}");
     assert!(String::from_utf8(printed)?.starts_with(&format!("Not stopping tmux on {}:\n    tmux: tester's other:0.0", machine.hostname)));
     tester_tmux(&mut session)?;
     // Without those, it stops the server, having saved what's in it.
@@ -1080,7 +1087,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let boot_id = facts::boot_id(&mut session)?;
     resume::save(&mut session, &Capture::new(Purpose::Reboot, &boot_id, vec![server.clone()]), true)?;
     let mut printed = Vec::new();
-    assert_eq!(resume::restore_pending(&mut session, &resuming, &mut Printer::new(&mut printed, false, None, None))?, Vec::<String>::new());
+    assert_eq!(resume::restore_pending(&mut session, &resuming, &mut Printer::new(&mut printed, false, None, None))?, None);
     assert!(String::from_utf8(printed)?.contains(" is from this boot, so what it describes is still running; not bringing it back\n"));
     assert!(resume::pending(&mut session)?.is_none());
     clean_up(&mut session)

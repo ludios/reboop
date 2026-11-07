@@ -283,10 +283,12 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
 }
 
 /// Stops `machine`'s stop_services over `session` (see [`stop_services`]),
-/// and checks again whether it's okay to take `down` (see [`check_again`],
-/// which `luks` is for), telling the user.  Returns the facts and the
+/// checks again whether it's okay to take `down` (see [`check_again`],
+/// which `luks` is for), and saves what's in its tmux servers (see
+/// [`save_for_resume`]), telling the user.  Returns the facts and the
 /// problems so far (services that didn't stop cleanly) if so; or else the
-/// reasons not to, leaving the stop_services stopped and saying so.
+/// reasons not to, leaving the stop_services stopped and saying so (as a
+/// failure to save does too).
 fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Checked<(Facts, Vec<String>)>> {
     let hostname = &machine.hostname;
     let (stopped, problems) = stop_services(machine, session, printer)?;
@@ -297,7 +299,13 @@ fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, lu
     };
     printer.line(&format!("Checking again whether {hostname} is okay to {}", down.verb()));
     match check_again(machine, session, luks) {
-        Ok((facts, blockers)) if blockers.is_empty() => Ok(Ok((facts, problems))),
+        Ok((facts, blockers)) if blockers.is_empty() => {
+            if let Err(error) = save_for_resume(session, &facts, down, machine, printer) {
+                still_stopped(printer);
+                return Err(error);
+            }
+            Ok(Ok((facts, problems)))
+        }
         Ok((_, blockers)) => {
             printer.styled_line(Red, &indented_list(&format!("Not {} {hostname} after all:", down.gerund()), &blockers));
             still_stopped(printer);
@@ -566,7 +574,7 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
     let mut problems = postflight(&mut session, &machine.hostname, printer)?;
     // Before the scrubs, which can take hours
     match resume::restore_pending(&mut session, machine, printer) {
-        Ok(found) => problems.extend(found),
+        Ok(found) => problems.extend(found.unwrap_or_default()),
         Err(error) => {
             let problem = format!("couldn't bring tmux back: {error:#}");
             printer.styled_line(Red, &problem);
@@ -632,7 +640,6 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
         Ok(stopped) => stopped,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
-    save_for_resume(&mut session, &facts, Down::Reboot, machine, printer).with_context(not_rebooted)?;
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
     reboot::ask(session, Down::Reboot).with_context(|| format!("failed to ask {hostname} to reboot (if it's rebooting anyway, `reboop catch {hostname}` takes it from there)"))?;
@@ -649,9 +656,10 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
 /// Catches `machine` on its way back up from a reboot that wasn't a bounce,
 /// or whose bounce was cut short: waits for it, unlocking its initrd with
 /// `password` (if any) if it waits there; makes sure it's `machine`; shows
-/// how it came back; and scrubs its scrub_mounts, unless a scrub found them
-/// clean lately (see [`scrub`]).  If it's up, that's taken to be the boot it
-/// came back in.  Returns the problems (none if all is well).
+/// how it came back; brings back what was in its tmux servers, if a capture
+/// of that is pending; and scrubs its scrub_mounts, unless a scrub found
+/// them clean lately (see [`come_back`]).  If it's up, that's taken to be
+/// the boot it came back in.  Returns the problems (none if all is well).
 pub fn catch(ssh: &Ssh, machine: &Machine, password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let hostname = &machine.hostname;
     if password.is_none() {
@@ -706,11 +714,10 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Outco
     };
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to shut down, and will boot {} with kernel {} next time", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
-    let (facts, problems) = match stop_and_check_again(machine, &mut session, Down::Shutdown, false, printer).with_context(not_stopped)? {
+    let (_, problems) = match stop_and_check_again(machine, &mut session, Down::Shutdown, false, printer).with_context(not_stopped)? {
         Ok(stopped) => stopped,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
-    save_for_resume(&mut session, &facts, Down::Shutdown, machine, printer).with_context(not_stopped)?;
     printer.line(&format!("Asking {hostname} to shut down"));
     reboot::ask(session, Down::Shutdown).with_context(|| format!("failed to ask {hostname} to shut down"))?;
     // So that the first try doesn't log in to the machine on its way down,
