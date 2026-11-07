@@ -44,9 +44,9 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a server gets to exit once asked to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The width and height of a session as it's recreated: room to split off
-/// any number of panes before each window's layout sizes it.  (A client
-/// resizes it on attaching anyway.)
+/// The width and height of a session as it's recreated: room for 200 panes,
+/// split off one below another, before each window's layout sizes them.
+/// (A client resizes it on attaching anyway.)
 const STAGING_SIZE: u32 = 400;
 
 /// The tmux buffer that commands are pasted through.

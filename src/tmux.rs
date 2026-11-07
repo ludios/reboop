@@ -193,8 +193,8 @@ fn parse_ss(output: &str) -> Result<Vec<(String, u32)>> {
 }
 
 /// Separates the fields of the lines that [`capture_server`] has
-/// `tmux list-panes` print: a control character that no name or path has.
-/// (One that does makes the server unlistable.)
+/// `tmux list-panes` print: a control character, which names and paths
+/// hardly ever have.  (One that has it makes the server unlistable.)
 const FIELD_SEPARATOR: char = '\x1f';
 
 /// Those fields, as tmux calls them.
