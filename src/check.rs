@@ -24,6 +24,8 @@ use tracing::warn;
 /// is on), or why it couldn't be checked.
 type Outcome = Result<(Facts, Vec<String>, Option<Rebuild>)>;
 
+/// Checks `machine` over `ssh` (see [`Outcome`]), and saves what's in its
+/// tmux servers on it, for after a crash, only warning if that fails.
 fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;

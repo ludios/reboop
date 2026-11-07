@@ -282,6 +282,32 @@ fn check_again(machine: &Machine, session: &mut Session, luks: bool) -> Result<(
     Ok((facts, blockers))
 }
 
+/// Saves what's in the machine's tmux servers (as `facts` has it) on the
+/// machine, for taking it `down`, as the capture to bring back once it's up
+/// again (see [`resume::restore_pending`]) if there's anything in them,
+/// telling the user what that will run again.
+fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &Machine, printer: &mut Printer) -> Result<()> {
+    let purpose = match down {
+        Down::Reboot   => Purpose::Reboot,
+        Down::Shutdown => Purpose::Shutdown,
+    };
+    let capture = Capture::new(purpose, &facts.boot_id, facts.tmux.clone());
+    let path = resume::save(session, &capture, !capture.servers.is_empty())?;
+    if capture.servers.is_empty() {
+        return Ok(());
+    }
+    let when = match down {
+        Down::Reboot   => "after the reboot",
+        Down::Shutdown => "once it's up again",
+    };
+    printer.line(&format!("Saved what's in tmux to {path}, to bring back {when}: {}", capture.counts()));
+    let resumable = capture.resumable(&machine.resumable_commands);
+    if !resumable.is_empty() {
+        printer.line(&indented_list("Commands to run again then:", &resumable));
+    }
+    Ok(())
+}
+
 /// Stops `machine`'s stop_services over `session` (see [`stop_services`]),
 /// checks again whether it's okay to take `down` (see [`check_again`],
 /// which `luks` is for), and saves what's in its tmux servers (see
@@ -316,32 +342,6 @@ fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, lu
             Err(error)
         }
     }
-}
-
-/// Saves what's in the machine's tmux servers (as `facts` has it) on the
-/// machine, for taking it `down`, as the capture to bring back once it's up
-/// again (see [`resume::restore_pending`]) if there's anything in them,
-/// telling the user what that will run again.
-fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &Machine, printer: &mut Printer) -> Result<()> {
-    let purpose = match down {
-        Down::Reboot   => Purpose::Reboot,
-        Down::Shutdown => Purpose::Shutdown,
-    };
-    let capture = Capture::new(purpose, &facts.boot_id, facts.tmux.clone());
-    let path = resume::save(session, &capture, !capture.servers.is_empty())?;
-    if capture.servers.is_empty() {
-        return Ok(());
-    }
-    let when = match down {
-        Down::Reboot   => "after the reboot",
-        Down::Shutdown => "once it's up again",
-    };
-    printer.line(&format!("Saved what's in tmux to {path}, to bring back {when}: {}", capture.counts()));
-    let resumable = capture.resumable(&machine.resumable_commands);
-    if !resumable.is_empty() {
-        printer.line(&indented_list("Commands to run again then:", &resumable));
-    }
-    Ok(())
 }
 
 /// Shows on `printer`'s progress line why the last try at something

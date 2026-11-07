@@ -580,7 +580,8 @@ pub fn capture(session: &mut Session) -> Result<Vec<Server>> {
     }
     for line in session.run_ok("ps -e -o pid=,user:64=,comm=", QUICK)?.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(pid), Some(user)) = (fields.next(), fields.next()) else { continue };
+        let Some(pid) = fields.next() else { continue };
+        let Some(user) = fields.next() else { continue };
         if fields.collect::<Vec<_>>().join(" ") != "tmux: server" {
             continue;
         }
