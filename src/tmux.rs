@@ -26,38 +26,54 @@ const COMMAND_SHOWN: usize = 100;
 /// - every record from the last command_start on (a builtin that has run
 ///   for a while may have had records of many background jobs come after
 ///   it);
-/// - of the records before the last command_start, the async_start of
-///   every job that hasn't ended (no async_end or async_lost anywhere in
-///   the archive), and the command_start and command_end of the line that
-///   started that job, however far back they are;
-/// - of the records before the last command_start, the async_end and
-///   async_lost of every job whose async_start comes after the last
-///   command_start, since an end can be written before its start.
+/// - of the records before the last command_start, the async_start,
+///   async_end and async_lost of every job that hasn't ended (one that has
+///   more async_starts than async_ends and async_losts in the archive, as
+///   zsh can give a job the number of one that ended during the same line),
+///   and the command_start and command_end of the line that started that
+///   job, however far back they are;
+/// - of the records before the last command_start, those about a job whose
+///   async_end or async_lost was written before its async_start, if that
+///   async_start comes after the last command_start.
 ///
 /// Its arguments are `ARCHIVE pass=2 ARCHIVE`: it reads the archive twice,
-/// so as to hold no more than the jobs' keys.
+/// so as to hold no more than the keys of the jobs that haven't ended.
 const PICK_RECORDS: &str = r#"# A record's first "id" and "job": its line's id and its job number.  (A
 # command's text can't hold them, as JSON escapes its quotes.)
 function id(r) { match(r, /"id":"[^"]*"/); return substr(r, RSTART + 6, RLENGTH - 7) }
 function job(r) { match(r, /"job":[0-9]+/); return substr(r, RSTART + 6, RLENGTH - 6) }
+# Pass 1: n[k] is how many more async_starts than ends job k has had so
+# far (kept only while it isn't 0), and late[k] where an async_start of job
+# k came after an end that it made up for.
 pass != 2 {
-    if (/"type":"command_start"/) last = FNR
-    else if (/"type":"async_start"/) started[id($0), job($0)] = FNR
-    else if (/"type":"async_(end|lost)"/) ended[id($0), job($0)] = 1
+    if (/"type":"command_start"/) {
+        last = FNR
+    } else if (/"type":"async_start"/) {
+        k = id($0) SUBSEP job($0)
+        if (++n[k] == 0) {
+            delete n[k]
+            late[k] = FNR
+        }
+    } else if (/"type":"async_(end|lost)"/) {
+        k = id($0) SUBSEP job($0)
+        if (--n[k] == 0) delete n[k]
+    }
     next
 }
+# Pass 2 (where looking up a key that isn't there would add it)
 !ready {
     ready = 1
-    for (key in started) if (!(key in ended)) {
-        unended[key] = 1
-        split(key, part, SUBSEP)
+    for (k in n) if (n[k] > 0) {
+        split(k, part, SUBSEP)
         lines[part[1]] = 1
     }
 }
 last && FNR >= last { print; next }
 /"type":"command_(start|end)"/ { if (id($0) in lines) print; next }
-/"type":"async_start"/ { if ((id($0), job($0)) in unended) print; next }
-/"type":"async_(end|lost)"/ { if ((id($0), job($0)) in started && started[id($0), job($0)] > last) print }"#;
+/"type":"async_(start|end|lost)"/ {
+    k = id($0) SUBSEP job($0)
+    if ((k in n && n[k] > 0) || (k in late && late[k] > last)) print
+}"#;
 
 /// Regular expressions for the commands that may be resumed.  Each has to
 /// match a whole command line, like `grep -x`, so that "rsync .*" can't
@@ -383,23 +399,28 @@ struct Job<'a> {
     text: Option<String>,
 }
 
-/// The jobs that `records` show started, but not ended or lost.  (By
-/// command id and job number, in whatever order the records came, since
-/// zsh-spy's traps can write them out of order.)
+/// The jobs that `records` show started, but not ended or lost: by command
+/// id and job number, those with more async_starts than async_ends and
+/// async_losts, in whatever order the records came, since zsh-spy's traps
+/// can write them out of order, and zsh can give a job the number of one
+/// that ended during the same line.
 fn unended_jobs(records: &[Record]) -> Vec<Job<'_>> {
-    // (the job, if started; whether ended) by (command id, job number)
-    let mut jobs: BTreeMap<(&str, u64), (Option<Job>, bool)> = BTreeMap::new();
+    // (how many more starts than ends, the job of the last start) by
+    // (command id, job number)
+    let mut jobs: BTreeMap<(&str, u64), (i64, Option<Job>)> = BTreeMap::new();
     for record in records {
         match record {
             Record::AsyncStart { id, job, job_pids, job_text } => {
                 let leader = job_pids.as_deref().and_then(|pids| pids.split(',').next()?.parse().ok());
-                jobs.entry((id, *job)).or_default().0 = Some(Job { id, number: *job, leader, text: job_text.clone() });
+                let entry = jobs.entry((id, *job)).or_default();
+                entry.0 += 1;
+                entry.1 = Some(Job { id, number: *job, leader, text: job_text.clone() });
             }
-            Record::AsyncEnd { id, job } | Record::AsyncLost { id, job } => jobs.entry((id, *job)).or_default().1 = true,
+            Record::AsyncEnd { id, job } | Record::AsyncLost { id, job } => jobs.entry((id, *job)).or_default().0 -= 1,
             _ => {}
         }
     }
-    jobs.into_values().filter(|(_, ended)| !ended).filter_map(|(job, _)| job).collect()
+    jobs.into_values().filter(|(starts, _)| *starts > 0).filter_map(|(_, job)| job).collect()
 }
 
 /// Whether `command`, a line typed into zsh, does nothing but bring a job
@@ -1058,7 +1079,7 @@ pub(crate) mod tests {
 
     /// The lines that [`PICK_RECORDS`], run by this machine's awk, prints
     /// for an archive of `records`.
-    fn picked(records: &[&str]) -> Vec<String> {
+    fn picked(records: &[String]) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("hist.s.jsonl");
         std::fs::write(&archive, records.iter().map(|record| format!("{record}\n")).collect::<String>()).unwrap();
@@ -1069,35 +1090,52 @@ pub(crate) mod tests {
 
     #[test]
     fn picks_the_records_that_tell_what_a_shell_runs() {
-        let archive = [
-            r#"{"type":"session_start","shell_pid":4242}"#,
-            // Job 1 of s.1, still running
-            r#"{"type":"command_start","id":"s.1","shell_pid":4242,"cwd":"/","command":"sleep 9 &"}"#,
-            r#"{"type":"async_start","id":"s.1","job":1,"job_text":"sleep 9"}"#,
-            r#"{"type":"command_end","id":"s.1","status":0}"#,
-            // Jobs 1 and 2 of s.2, which ended and were lost
-            r#"{"type":"command_start","id":"s.2","shell_pid":4242,"cwd":"/","command":"sleep 1 & sleep 2 &"}"#,
-            r#"{"type":"async_start","id":"s.2","job":1,"job_text":"sleep 1"}"#,
-            r#"{"type":"async_start","id":"s.2","job":2,"job_text":"sleep 2"}"#,
-            r#"{"type":"command_end","id":"s.2","status":0}"#,
-            r#"{"type":"async_end","id":"s.2","job":1,"status":0}"#,
-            r#"{"type":"async_lost","id":"s.2","job":2,"reason":"missing_from_job_table"}"#,
-            // A line whose text looks like the keys of job 1 of s.1
-            r#"{"type":"command_start","id":"s.3","shell_pid":4242,"cwd":"/","command":"echo \"id\":\"s.1\",\"job\":1"}"#,
-            r#"{"type":"command_end","id":"s.3","status":0}"#,
-            // The end of job 1 of s.4, written before its start
-            r#"{"type":"async_end","id":"s.4","job":1,"status":0}"#,
-            r#"{"type":"command_start","id":"s.4","shell_pid":4242,"cwd":"/","command":"sleep 3 & sleep 4 & make"}"#,
-            r#"{"type":"async_start","id":"s.4","job":1,"job_text":"sleep 3"}"#,
-            r#"{"type":"async_start","id":"s.4","job":2,"job_text":"sleep 4"}"#,
+        let start = |id: &str, command: &str| format!(r#"{{"type":"command_start","id":"{id}","shell_pid":4242,"cwd":"/","command":"{command}"}}"#);
+        let end = |id: &str| format!(r#"{{"type":"command_end","id":"{id}","status":0}}"#);
+        let job = |kind: &str, id: &str, number: u32| format!(r#"{{"type":"async_{kind}","id":"{id}","job":{number}}}"#);
+        let mut archive = vec![r#"{"type":"session_start","shell_pid":4242}"#.to_string()];
+        // Job 1 of s.1, still running, then more than 100 records
+        let old = [start("s.1", "sleep 9 &"), job("start", "s.1", 1), end("s.1")];
+        archive.extend(old.clone());
+        for n in 0..60 {
+            archive.extend([start(&format!("f.{n}"), "true"), end(&format!("f.{n}"))]);
+        }
+        // Job 1 of s.2, which ended, then another job 1, still running; and
+        // job 2, lost
+        let reused = [
+            start("s.2", "sleep 1 & sleep 2; jobs; sleep 8 & sleep 7 &"),
+            job("start", "s.2", 1),
+            job("end", "s.2", 1),
+            job("start", "s.2", 1),
+            job("start", "s.2", 2),
+            end("s.2"),
+            job("lost", "s.2", 2),
         ];
-        let lines = |indexes: &[usize]| indexes.iter().map(|&index| archive[index].to_string()).collect::<Vec<_>>();
-        assert_eq!(picked(&archive), lines(&[1, 2, 3, 12, 13, 14, 15]));
+        archive.extend(reused.clone());
+        // A line whose text looks like the keys of job 1 of s.1
+        archive.push(r#"{"type":"command_start","id":"s.3","shell_pid":4242,"cwd":"/","command":"echo \"id\":\"s.1\",\"job\":1"}"#.into());
+        archive.push(end("s.3"));
+        // The end of job 1 of s.4, written before its start, which comes
+        // after the last command_start
+        let early = job("end", "s.4", 1);
+        let last = [start("s.4", "sleep 3 & sleep 4 & make"), job("start", "s.4", 1), job("start", "s.4", 2)];
+        archive.push(early.clone());
+        archive.extend(last.clone());
+
+        let mut expected = old.to_vec();
+        expected.extend_from_slice(&reused[..4]);
+        expected.push(reused[5].clone());
+        expected.push(early);
+        expected.extend_from_slice(&last);
+        let picked_records = picked(&archive);
+        assert_eq!(picked_records, expected);
+        let records = parse_records(&picked_records.join("\n")).unwrap();
+        assert_eq!(unended_jobs(&records).iter().map(|job| (job.id, job.number)).collect::<Vec<_>>(), [("s.1", 1), ("s.2", 1), ("s.4", 2)]);
         // Nothing to pick without a command line
-        assert_eq!(picked(&archive[..1]), lines(&[]));
-        assert_eq!(picked(&[]), lines(&[]));
+        assert_eq!(picked(&archive[..1]), Vec::<String>::new());
+        assert_eq!(picked(&[]), Vec::<String>::new());
         // Only the last line's own records when no job is left
-        assert_eq!(picked(&archive[4..12]), lines(&[10, 11]));
+        assert_eq!(picked(&archive[4..10]), archive[8..10]);
     }
 
     #[test]
