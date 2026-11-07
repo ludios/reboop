@@ -110,8 +110,8 @@ enum ReboopCommand {
 /// What's in a machine's tmux servers: every session, window and pane, with
 /// the pane's directory and what it's running, if anything: a command typed
 /// into its shell (as zsh-spy recorded it), the command tmux started it
-/// with, background jobs, or something unknown.  A bounce
-/// saves that right before the reboot and brings it back afterwards,
+/// with, jobs of its shell that haven't ended, or something unknown.  A
+/// bounce saves that right before the reboot and brings it back afterwards,
 /// running again the commands that the machine's resumable_commands allow,
 /// if its tmux setting is "resume".
 #[derive(clap::Subcommand, Debug)]

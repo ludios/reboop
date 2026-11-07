@@ -1023,7 +1023,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert_eq!(
         preflight::blockers(&resuming, &facts),
         [
-            "tmux: tester's other:0.0 in /tmp: a background job is still running: sleep 602",
+            "tmux: tester's other:0.0 in /tmp: its shell has a job that hasn't ended: sleep 602",
             "tmux: tester's other:1.0 in /tmp: running sleep, but what was typed to start it is unknown",
             "tmux: tester's other:2.0 in /tmp: running sleep, but what was typed to start it is unknown",
         ]
@@ -1035,7 +1035,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     print!("{printed}");
     let listing = [
         format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 7 panes", server.pid),
-        "not resumable  other:0.0  /tmp                       a background job is still running: sleep 602".into(),
+        "not resumable  other:0.0  /tmp                       its shell has a job that hasn't ended: sleep 602".into(),
         "not resumable  other:1.0  /tmp                       running sleep, but what was typed to start it is unknown".into(),
         "not resumable  other:2.0  /tmp                       running sleep, but what was typed to start it is unknown".into(),
         "    resumable  work:0.0   /var/tmp                   sleep 601".into(),

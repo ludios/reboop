@@ -106,9 +106,10 @@ pub enum Running {
     /// it, quoted for tmux's own command parser: e.g. `"sleep 300"` for a
     /// pane started with `tmux new-session 'sleep 300'`.
     Started { command: String },
-    /// Jobs its shell put in the background (with &) are still running, as
-    /// zsh-spy recorded what they ran: `None` for one whose line
-    /// HIST_IGNORE_SPACE hid.  (Whatever the shell runs in the foreground.)
+    /// Jobs of its shell haven't ended, whether they run in the background
+    /// (put there with &) or are stopped (as with Ctrl-Z): what each ran, as
+    /// zsh-spy recorded it, or `None` for one whose line HIST_IGNORE_SPACE
+    /// hid.  (Whatever the shell runs in the foreground.)
     Background { jobs: Vec<Option<String>> },
     /// It's running `program`, but what was typed to start it isn't known:
     /// its shell has no zsh-spy archive, or the line was hidden from it
@@ -356,8 +357,7 @@ fn parse_records(picked: &str) -> Result<Vec<Record>> {
         .collect()
 }
 
-/// What the background jobs that `records` show started, but not ended or
-/// lost, ran.  (By command id and job number, in whatever order the records
+/// What the jobs that `records` show started, but not ended or lost, ran.  (By command id and job number, in whatever order the records
 /// came, since zsh-spy's traps can write them out of order.)
 fn running_jobs(records: &[Record]) -> Vec<Option<String>> {
     // (started, ended, what it ran) by (command id, job number)
@@ -677,7 +677,7 @@ pub fn verdict(pane: &Pane, patterns: &CommandPatterns) -> Verdict {
         }
         Running::Background { jobs } => {
             let texts: Vec<String> = jobs.iter().map(|job| job.as_deref().map_or("one whose line was hidden".into(), summary)).collect();
-            Verdict::Block(format!("{} still running: {}", if jobs.len() == 1 { "a background job is" } else { "background jobs are" }, texts.join("; ")))
+            Verdict::Block(format!("its shell has {}: {}", if jobs.len() == 1 { "a job that hasn't ended" } else { "jobs that haven't ended" }, texts.join("; ")))
         }
         Running::Unknown { program } => Verdict::Block(format!("running {program}, but what was typed to start it is unknown")),
     }
@@ -1027,9 +1027,9 @@ pub(crate) mod tests {
         let gone = Pane { mountpoint: String::new(), ..pane(0, "/gone", Running::Typed { command: "rsync -a /a /b".into() }) };
         assert_eq!(verdict(&gone, &patterns), Verdict::Block("rsync -a /a /b (its directory isn't there)".into()));
         let jobs = pane(0, "/", Running::Background { jobs: vec![Some("sleep 9".into()), None] });
-        assert_eq!(verdict(&jobs, &patterns), Verdict::Block("background jobs are still running: sleep 9; one whose line was hidden".into()));
+        assert_eq!(verdict(&jobs, &patterns), Verdict::Block("its shell has jobs that haven't ended: sleep 9; one whose line was hidden".into()));
         let job = pane(0, "/", Running::Background { jobs: vec![Some("sleep 9".into())] });
-        assert_eq!(verdict(&job, &patterns), Verdict::Block("a background job is still running: sleep 9".into()));
+        assert_eq!(verdict(&job, &patterns), Verdict::Block("its shell has a job that hasn't ended: sleep 9".into()));
         let unknown = pane(0, "/", Running::Unknown { program: "sudo".into() });
         assert_eq!(verdict(&unknown, &patterns), Verdict::Block("running sudo, but what was typed to start it is unknown".into()));
     }
