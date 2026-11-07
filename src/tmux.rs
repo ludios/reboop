@@ -20,24 +20,43 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// How much of a command a [`Verdict`] shows.
 const COMMAND_SHOWN: usize = 100;
 
-/// How many records at the end of a zsh-spy archive are read, at least:
-/// enough for the background jobs of the last few commands.  (One whose
-/// start is further back shows up anyway, as a child of the shell outside
-/// its terminal's foreground process group.)  More are read if that's what
-/// it takes to reach the last command_start: see [`ARCHIVE_END`].
-const ARCHIVE_RECORDS: usize = 100;
-
-/// An awk program that prints the end of a zsh-spy archive: its last R
-/// lines, or if the last command_start is further back than that, every
-/// line from that one on, since that's what tells what the shell runs in
-/// the foreground.  (A builtin that has run for a while may have had
-/// records of many background jobs come after it.)
-const ARCHIVE_END: &str = r#"/"type":"command_start"/ { n = 0; seen = 1 }
-{ since[n++] = $0; last[NR % R] = $0 }
-END {
-    if (seen && n > R) for (i = 0; i < n; i++) print since[i]
-    else for (i = NR > R ? NR - R + 1 : 1; i <= NR; i++) print last[i % R]
-}"#;
+/// An awk program that prints the records of a zsh-spy archive that tell
+/// what its shell runs, in the archive's order:
+/// - every record from the last command_start on (a builtin that has run
+///   for a while may have had records of many background jobs come after
+///   it);
+/// - of the records before the last command_start, the async_start of
+///   every job that hasn't ended (no async_end or async_lost anywhere in
+///   the archive), and the command_start and command_end of the line that
+///   started that job, however far back they are;
+/// - of the records before the last command_start, the async_end and
+///   async_lost of every job whose async_start comes after the last
+///   command_start, since an end can be written before its start.
+///
+/// Its arguments are `ARCHIVE pass=2 ARCHIVE`: it reads the archive twice,
+/// so as to hold no more than the jobs' keys.
+const PICK_RECORDS: &str = r#"# A record's first "id" and "job": its line's id and its job number.  (A
+# command's text can't hold them, as JSON escapes its quotes.)
+function id(r) { match(r, /"id":"[^"]*"/); return substr(r, RSTART + 6, RLENGTH - 7) }
+function job(r) { match(r, /"job":[0-9]+/); return substr(r, RSTART + 6, RLENGTH - 6) }
+pass != 2 {
+    if (/"type":"command_start"/) last = FNR
+    else if (/"type":"async_start"/) started[id($0), job($0)] = FNR
+    else if (/"type":"async_(end|lost)"/) ended[id($0), job($0)] = 1
+    next
+}
+!ready {
+    ready = 1
+    for (key in started) if (!(key in ended)) {
+        unended[key] = 1
+        split(key, part, SUBSEP)
+        lines[part[1]] = 1
+    }
+}
+last && FNR >= last { print; next }
+/"type":"command_(start|end)"/ { if (id($0) in lines) print; next }
+/"type":"async_start"/ { if ((id($0), job($0)) in unended) print; next }
+/"type":"async_(end|lost)"/ { if ((id($0), job($0)) in started && started[id($0), job($0)] > last) print }"#;
 
 /// Regular expressions for the commands that may be resumed.  Each has to
 /// match a whole command line, like `grep -x`, so that "rsync .*" can't
@@ -328,10 +347,11 @@ enum Record {
     Other,
 }
 
-/// Parses the records in `tail`, the last lines of an archive.  A line that
-/// doesn't parse is an error, rather than a command that goes unseen.
-fn parse_records(tail: &str) -> Result<Vec<Record>> {
-    tail.lines()
+/// Parses the records in `picked`, the lines of an archive that
+/// [`PICK_RECORDS`] printed.  A line that doesn't parse is an error, rather
+/// than a command that goes unseen.
+fn parse_records(picked: &str) -> Result<Vec<Record>> {
+    picked.lines()
         .map(|line| serde_json::from_str(line).with_context(|| format!("couldn't parse a zsh-spy record: {}", human::truncate(line, COMMAND_SHOWN))))
         .collect()
 }
@@ -356,10 +376,11 @@ fn running_jobs(records: &[Record]) -> Vec<Option<String>> {
     jobs.into_values().filter(|(started, ended, _)| *started && !ended).map(|(_, _, text)| text).collect()
 }
 
-/// What the shell with pid `pid` is running, by the `records` at the end of
-/// its archive, and the directory to run it in again: where a typed command
-/// was typed, or else `path`, the pane's current directory.  tmux says the
-/// pane's foreground program is `program`.
+/// What the shell with pid `pid` is running, by the `records` that
+/// [`PICK_RECORDS`] picked from its archive, and the directory to run it in
+/// again: where a typed command was typed, or else `path`, the pane's
+/// current directory.  tmux says the pane's foreground program is
+/// `program`.
 fn shell_running(records: &[Record], pid: u32, program: &str, path: &str) -> Result<(Running, String)> {
     let jobs = running_jobs(records);
     if !jobs.is_empty() {
@@ -391,8 +412,8 @@ struct ProcessFacts {
     /// The names of those that aren't in the foreground process group of
     /// its terminal, as a typed command is and a background job isn't
     background: Vec<String>,
-    /// The end of its zsh-spy archive (see [`ARCHIVE_END`]), if it's a shell
-    /// that has one
+    /// The records of its zsh-spy archive that [`PICK_RECORDS`] prints, if
+    /// it's a shell that has one
     archive: Option<String>,
 }
 
@@ -405,8 +426,8 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
     }
     let facts = facts.ok_or_else(|| anyhow!("no facts about pid {}", line.pid))?;
     let unknown = || Running::Unknown { program: facts.children.first().cloned().unwrap_or_else(|| line.current_command.clone()) };
-    if let Some(tail) = &facts.archive {
-        let (running, cwd) = shell_running(&parse_records(tail)?, line.pid, &line.current_command, &line.path)?;
+    if let Some(picked) = &facts.archive {
+        let (running, cwd) = shell_running(&parse_records(picked)?, line.pid, &line.current_command, &line.path)?;
         // A child that the archive doesn't account for, like a disowned
         // job, means that more is running than the archive says.
         let unaccounted = match running {
@@ -459,15 +480,15 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
             children.entry(ppid).or_default().push((group, fields[4..].join(" ")));
         }
     }
-    // A line per pid: the pid, and the base64 of the end of its archive, or
-    // "-" without one
+    // A line per pid: the pid, and the base64 of its archive's records that
+    // matter, or "-" without an archive
     let script = format!(
         r#"for p in {}; do
     a=-
     for l in /proc/$p/fd/*; do
         case $(readlink "$l" 2>/dev/null) in
         */hist.*.jsonl)
-            t=$(awk -v R={ARCHIVE_RECORDS} {} "$l") || exit 1
+            t=$(awk {} "$l" pass=2 "$l") || exit 1
             a=$(printf %s "$t" | base64 -w0)
             break;;
         esac
@@ -475,7 +496,7 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
     printf '%s %s\n' "$p" "$a"
 done"#,
         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
-        shell_quote(ARCHIVE_END)
+        shell_quote(PICK_RECORDS)
     );
     let output = session.run_ok(&script, QUICK)?;
     for line in output.lines() {
@@ -864,7 +885,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_what_a_shell_is_running() {
-        let running = |tail: &str| shell_running(&parse_records(tail).unwrap(), 4242, "zsh", "/pane").unwrap();
+        let running = |picked: &str| shell_running(&parse_records(picked).unwrap(), 4242, "zsh", "/pane").unwrap();
         // A command still running
         let typed = "{\"type\":\"command_start\",\"id\":\"s.1\",\"shell_pid\":4242,\"cwd\":\"/data\",\"command\":\"rsync -a /a /b\"}\n";
         assert_eq!(running(typed), (Running::Typed { command: "rsync -a /a /b".into() }, "/data".into()));
@@ -897,6 +918,50 @@ pub(crate) mod tests {
         assert!(parse_records("{\"type\":\"session_start\"}\n{\"type\":\"command_start\",\"id\":\"s.1\"}").is_err());
         assert!(parse_records("\"type\":\"session_end\"}\n{\"type\":\"whatever\"}").is_err());
         assert!(parse_records("{\"type\":\"whatever\"}").is_ok());
+    }
+
+    /// The lines that [`PICK_RECORDS`], run by this machine's awk, prints
+    /// for an archive of `records`.
+    fn picked(records: &[&str]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("hist.s.jsonl");
+        std::fs::write(&archive, records.iter().map(|record| format!("{record}\n")).collect::<String>()).unwrap();
+        let output = std::process::Command::new("awk").arg(PICK_RECORDS).arg(&archive).arg("pass=2").arg(&archive).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn picks_the_records_that_tell_what_a_shell_runs() {
+        let archive = [
+            r#"{"type":"session_start","shell_pid":4242}"#,
+            // Job 1 of s.1, still running
+            r#"{"type":"command_start","id":"s.1","shell_pid":4242,"cwd":"/","command":"sleep 9 &"}"#,
+            r#"{"type":"async_start","id":"s.1","job":1,"job_text":"sleep 9"}"#,
+            r#"{"type":"command_end","id":"s.1","status":0}"#,
+            // Jobs 1 and 2 of s.2, which ended and were lost
+            r#"{"type":"command_start","id":"s.2","shell_pid":4242,"cwd":"/","command":"sleep 1 & sleep 2 &"}"#,
+            r#"{"type":"async_start","id":"s.2","job":1,"job_text":"sleep 1"}"#,
+            r#"{"type":"async_start","id":"s.2","job":2,"job_text":"sleep 2"}"#,
+            r#"{"type":"command_end","id":"s.2","status":0}"#,
+            r#"{"type":"async_end","id":"s.2","job":1,"status":0}"#,
+            r#"{"type":"async_lost","id":"s.2","job":2,"reason":"missing_from_job_table"}"#,
+            // A line whose text looks like the keys of job 1 of s.1
+            r#"{"type":"command_start","id":"s.3","shell_pid":4242,"cwd":"/","command":"echo \"id\":\"s.1\",\"job\":1"}"#,
+            r#"{"type":"command_end","id":"s.3","status":0}"#,
+            // The end of job 1 of s.4, written before its start
+            r#"{"type":"async_end","id":"s.4","job":1,"status":0}"#,
+            r#"{"type":"command_start","id":"s.4","shell_pid":4242,"cwd":"/","command":"sleep 3 & sleep 4 & make"}"#,
+            r#"{"type":"async_start","id":"s.4","job":1,"job_text":"sleep 3"}"#,
+            r#"{"type":"async_start","id":"s.4","job":2,"job_text":"sleep 4"}"#,
+        ];
+        let lines = |indexes: &[usize]| indexes.iter().map(|&index| archive[index].to_string()).collect::<Vec<_>>();
+        assert_eq!(picked(&archive), lines(&[1, 2, 3, 12, 13, 14, 15]));
+        // Nothing to pick without a command line
+        assert_eq!(picked(&archive[..1]), lines(&[]));
+        assert_eq!(picked(&[]), lines(&[]));
+        // Only the last line's own records when no job is left
+        assert_eq!(picked(&archive[4..12]), lines(&[10, 11]));
     }
 
     #[test]
