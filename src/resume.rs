@@ -323,7 +323,9 @@ enum NotReady {
 /// its real path, as the pane's may go through a symlink), and that the
 /// directory is on the filesystem mounted where it was.  If `prompt`, first
 /// waits (up to [`PROMPT_TIMEOUT`]) for the pane's shell to be at its prompt:
-/// in the foreground, reading in non-canonical mode, as a line editor does.
+/// in the foreground (its own process group, not a child's, is the
+/// terminal's foreground one), reading in non-canonical mode, as a line
+/// editor does.
 fn check_pane(session: &mut Session, socket: &str, pane_id: &str, pane: &Pane, prompt: bool) -> Result<Result<(), NotReady>> {
     let script = format!(
         r#"set -- $(tmux -S {socket} display -p -t {pane_id} -F '#{{pane_pid}} #{{pane_tty}}' 2>/dev/null)
@@ -331,7 +333,7 @@ pid=$1 tty=$2
 [ -n "$tty" ] || exit 1
 if [ {} = 1 ]; then
     i=0
-    until [ "$(tmux -S {socket} display -p -t {pane_id} -F '#{{pane_current_command}}')" = "$(cat /proc/$pid/comm)" ] && stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do
+    until [ "$(ps -o tpgid= -p $pid | tr -d ' ')" = "$pid" ] && stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do
         i=$((i + 1)); [ $i -ge {} ] && exit 2; sleep 0.1
     done
 fi
