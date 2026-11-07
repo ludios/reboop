@@ -37,7 +37,7 @@ enum ReboopCommand {
         /// Below the table, print for each machine: the reasons it isn't
         /// okay to reboot (if any); what a nixos-rebuild would change, or
         /// why its configuration couldn't be evaluated (if check_rebuild is
-        /// on); and the error, if it couldn't be checked.  (Those errors are
+        /// on); and the error, if it couldn't be checked.  (All of this is
         /// printed without -v too, when HOSTNAMES are given.)
         #[clap(short, long)]
         verbose: bool,

@@ -172,16 +172,15 @@ fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> Stri
 }
 
 /// The messages to go below the table about each machine: the error, if
-/// it couldn't be checked; and, if `all`, also each reason not to reboot
-/// it, and what a nixos-rebuild would change or why its configuration
-/// couldn't be evaluated.  The first line of each message starts with the
+/// it couldn't be checked; otherwise each reason not to reboot it, and
+/// what a nixos-rebuild would change or why its configuration couldn't be
+/// evaluated.  The first line of each message starts with the
 /// machine's hostname, and the message's further lines are indented.  A
 /// blank line comes before each machine's messages.
-fn details(outcomes: &[(&Machine, Outcome)], all: bool) -> String {
+fn details(outcomes: &[(&Machine, Outcome)]) -> String {
     let mut text = String::new();
     for (machine, outcome) in outcomes {
         let lines: Vec<String> = match outcome {
-            Ok(_) if !all => vec![],
             Ok((facts, blockers, rebuild)) => blockers.iter().cloned().chain(rebuild.as_ref().and_then(|rebuild| rebuild.trouble(&facts.systems.default))).collect(),
             Err(error) => vec![format!("{error:#}")],
         };
@@ -259,10 +258,10 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  Below
-/// the table, if `verbose`, prints for each machine: the reasons not to
-/// reboot it, what a nixos-rebuild would change or why its configuration
-/// couldn't be evaluated, and the error, if it couldn't be checked.  If
-/// not `verbose` but `hostnames` isn't empty, prints only those errors.
+/// the table, if `verbose` or if `hostnames` isn't empty, prints for each
+/// machine: the reasons not to reboot it, what a nixos-rebuild would change
+/// or why its configuration couldn't be evaluated, and the error, if it
+/// couldn't be checked.
 /// Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
@@ -281,7 +280,7 @@ pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Resu
     } else {
         print!("{}", table(&outcomes, color, &TimeZone::system()));
         if verbose || !hostnames.is_empty() {
-            print!("{}", details(&outcomes, verbose));
+            print!("{}", details(&outcomes));
         }
     }
     Ok(exit_status(&outcomes))
@@ -364,7 +363,7 @@ mod tests {
              five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n"
         );
         assert_eq!(
-            details(&outcomes, true),
+            details(&outcomes),
             "\n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
@@ -383,8 +382,7 @@ mod tests {
              \n\
              four: couldn't evaluate the configuration: attribute 'boot' missing\n    at /etc/nixos/configuration.nix:3:5:\n"
         );
-        assert_eq!(details(&outcomes, false), "\nthree: failed to open a session: no route to host\n    second line\n");
-        assert_eq!(details(&outcomes[..2], false), "");
+        assert_eq!(details(&outcomes[1..2]), "");
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
         assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
