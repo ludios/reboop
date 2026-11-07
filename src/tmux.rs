@@ -20,10 +20,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// How much of a command a [`Verdict`] shows.
 const COMMAND_SHOWN: usize = 100;
 
-/// How much of the end of a zsh-spy archive is read: plenty for the last
-/// command line typed, which is what it's for.  (A background job whose
-/// start is further back shows up anyway, as a child of the shell.)
-const ARCHIVE_TAIL: usize = 64 << 10;
+/// How many records at the end of a zsh-spy archive are read: plenty for
+/// the last command line typed, which is what they're for.  (A background
+/// job whose start is further back shows up anyway, as a child of the
+/// shell.)
+const ARCHIVE_RECORDS: usize = 100;
 
 /// Regular expressions for the commands that may be resumed.  Each has to
 /// match a whole command line, like `grep -x`, so that "rsync .*" can't
@@ -314,19 +315,12 @@ enum Record {
     Other,
 }
 
-/// Parses the records in `tail`, the end of an archive.  Its first line
-/// may be cut short, so that one is skipped if it doesn't parse; any other
-/// line that doesn't is an error, rather than a command that goes unseen.
+/// Parses the records in `tail`, the last lines of an archive.  A line that
+/// doesn't parse is an error, rather than a command that goes unseen.
 fn parse_records(tail: &str) -> Result<Vec<Record>> {
-    let mut records = Vec::new();
-    for (index, line) in tail.lines().enumerate() {
-        let parsed = serde_json::from_str(line);
-        if index == 0 && parsed.is_err() {
-            continue;
-        }
-        records.push(parsed.with_context(|| format!("couldn't parse a zsh-spy record: {}", human::truncate(line, COMMAND_SHOWN)))?);
-    }
-    Ok(records)
+    tail.lines()
+        .map(|line| serde_json::from_str(line).with_context(|| format!("couldn't parse a zsh-spy record: {}", human::truncate(line, COMMAND_SHOWN))))
+        .collect()
 }
 
 /// What the background jobs that `records` show started, but not ended or
@@ -381,7 +375,8 @@ const SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "fish", "ksh"];
 struct ProcessFacts {
     /// The names of its child processes
     children: Vec<String>,
-    /// The end of its zsh-spy archive, if it's a shell that has one
+    /// The last [`ARCHIVE_RECORDS`] lines of its zsh-spy archive, if it's a
+    /// shell that has one
     archive: Option<String>,
 }
 
@@ -411,7 +406,8 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
 
 /// The [`ProcessFacts`] about each live pane's process among `lines`, by
 /// pid: its children's names, and the end of the zsh-spy archive
-/// (hist.*.jsonl) that it holds open, if any.
+/// (hist.*.jsonl) that it holds open, if any, read through its fd (so that
+/// one in another mount namespace is found).
 fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u32, ProcessFacts>> {
     // Once each: a window linked into several sessions lists its panes once per session.
     let pids: BTreeSet<u32> = lines.iter().filter(|line| !line.dead).map(|line| line.pid).collect();
@@ -420,11 +416,19 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
         return Ok(facts);
     }
     // A line per pid: the pid, the base64 of its children's names (one per
-    // line), and the base64 of the archive's tail, or "-" without one
+    // line), and the base64 of the archive's last lines, or "-" without one
     let script = format!(
         r#"for p in {}; do
-    f=$(for l in /proc/$p/fd/*; do readlink "$l"; done 2>/dev/null | grep -m1 '/hist\..*\.jsonl$')
-    printf '%s %s %s\n' "$p" "$(ps -o comm= --ppid "$p" | base64 -w0)" "$(if [ -n "$f" ]; then tail -c {ARCHIVE_TAIL} -- "$f" | base64 -w0; else echo -; fi)"
+    a=-
+    for l in /proc/$p/fd/*; do
+        case $(readlink "$l" 2>/dev/null) in
+        */hist.*.jsonl)
+            t=$(tail -n {ARCHIVE_RECORDS} -- "$l") || exit 1
+            a=$(printf %s "$t" | base64 -w0)
+            break;;
+        esac
+    done
+    printf '%s %s %s\n' "$p" "$(ps -o comm= --ppid "$p" | base64 -w0)" "$a"
 done"#,
         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
     );
@@ -791,8 +795,8 @@ pub(crate) mod tests {
     #[test]
     fn reads_what_a_shell_is_running() {
         let running = |tail: &str| shell_running(&parse_records(tail).unwrap(), 4242, "zsh", "/pane").unwrap();
-        // A cut-short first line, then a command still running
-        let typed = "status\":0}\n{\"type\":\"command_start\",\"id\":\"s.1\",\"shell_pid\":4242,\"cwd\":\"/data\",\"command\":\"rsync -a /a /b\"}\n";
+        // A command still running
+        let typed = "{\"type\":\"command_start\",\"id\":\"s.1\",\"shell_pid\":4242,\"cwd\":\"/data\",\"command\":\"rsync -a /a /b\"}\n";
         assert_eq!(running(typed), (Running::Typed { command: "rsync -a /a /b".into() }, "/data".into()));
         // One typed with a leading space
         let hidden = r#"{"type":"command_start","id":"s.1","shell_pid":4242,"cwd":"/data","hist_hidden":true,"command":null}"#;
@@ -818,9 +822,11 @@ pub(crate) mod tests {
         // The wrong shell's archive
         let other = r#"{"type":"command_start","id":"s.1","shell_pid":1,"cwd":"/","command":"x"}"#;
         assert!(shell_running(&parse_records(other).unwrap(), 4242, "zsh", "/pane").is_err());
-        // A record of a known kind that doesn't parse, after the first line
+        // A record of a known kind that doesn't parse, or a line that isn't
+        // a record, even the first
         assert!(parse_records("{\"type\":\"session_start\"}\n{\"type\":\"command_start\",\"id\":\"s.1\"}").is_err());
-        assert!(parse_records("{\"type\":\"command_start\",\"id\":\"s.1\"}\n{\"type\":\"whatever\"}").is_ok());
+        assert!(parse_records("\"type\":\"session_end\"}\n{\"type\":\"whatever\"}").is_err());
+        assert!(parse_records("{\"type\":\"whatever\"}").is_ok());
     }
 
     #[test]
