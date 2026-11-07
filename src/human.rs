@@ -142,8 +142,10 @@ pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
 
 /// Lays out `rows` of cells in columns, two spaces apart, each cell aligned
 /// its own way, and in the cells' styles if `color`.  All rows must have
-/// the same number of cells.  Returns a line per row, without trailing
-/// spaces or a newline.
+/// the same number of cells.  Returns a string per row, in the order of
+/// `rows`, without trailing spaces or a newline at the end (a cell's own
+/// line breaks are kept, though they put the row's later cells out of
+/// line).
 pub fn table(rows: &[Vec<Cell>], color: bool) -> Vec<String> {
     let columns = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == columns), "rows have different numbers of cells");
