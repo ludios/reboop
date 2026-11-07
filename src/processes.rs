@@ -24,7 +24,7 @@ pub enum Activity {
     SwitchToConfiguration,
     Tmux,
     /// Copying or moving files, or writing or copying a disk image, which
-    /// leaves a partial copy if interrupted
+    /// can leave a partial copy if interrupted
     Copy,
     /// Interrupting a receive leaves a partial subvolume behind.
     BtrfsSendReceive,
@@ -75,9 +75,11 @@ const NIX_PROGRAMS: &[&str] = &[
     "nixos-rebuild",
 ];
 
-/// Programs that copy or move files, or write or copy disk images.  (A move
-/// within one filesystem is a quick rename, but one to another filesystem
-/// copies.)
+/// Programs that copy or move files, or write or copy disk images.  (mv
+/// copies when rename(2) can't move a file: to another filesystem, or on
+/// btrfs, to another subvolume.  The receiving end of a modern scp isn't
+/// here: it's sftp-server, which also serves sshfs mounts for as long as
+/// they're mounted.)
 const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv", "scp", "dd", "ddrescue", "pv"];
 
 /// Programs that check, repair, make, convert, tune, resize or partition a
@@ -138,9 +140,9 @@ fn is_command_string_option(word: &str) -> bool {
 
 /// The names of the program(s) a command line runs: that of its first word,
 /// and for an interpreter like bash or python, also that of its script.
-/// (Not with a command string given with -c: the interpreter runs each of
-/// its programs as a process of their own, or execs it, which replaces the
-/// interpreter's command line.)
+/// (Not with a command string given with -c: the interpreter runs each
+/// program in it as a process of its own, or execs the program, which
+/// replaces the interpreter's command line.)
 fn program_names(args: &str) -> Vec<String> {
     let mut words = args.split_whitespace();
     let Some(first) = words.next() else { return vec![] };
@@ -160,7 +162,8 @@ fn program_names(args: &str) -> Vec<String> {
     names
 }
 
-/// btrfs's top-level commands, as of btrfs-progs 7.3
+/// btrfs's top-level commands, as of btrfs-progs 7.3 (leaving out reflink,
+/// which only an experimental build has)
 const BTRFS_COMMANDS: &[&str] = &[
     "subvolume", "filesystem", "balance", "device", "scrub", "check", "rescue", "restore", "inspect-internal",
     "property", "send", "receive", "quota", "qgroup", "replace", "help", "version",
