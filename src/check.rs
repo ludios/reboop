@@ -95,14 +95,16 @@ fn smart_cell(facts: &Facts) -> Cell {
 
 /// The TMUX cell: nothing if the machine has no tmux server; with `tmux`
 /// block, how many servers it has, in red, as they block a reboot; with
-/// resume, how many panes are running something, in red if any of that (or
-/// a server that couldn't be listed) blocks a reboot, else in green.
+/// resume, "?" in red if a server couldn't be listed, which blocks a
+/// reboot, else how many panes are running something, in red if any of
+/// that blocks a reboot, else in green.
 fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
     if facts.tmux.is_empty() {
         return Plain.cell("");
     }
     let cell = match machine.tmux {
         TmuxPolicy::Block => Red.cell(facts.tmux.len().to_string()),
+        TmuxPolicy::Resume if facts.tmux.iter().any(|server| server.error.is_some()) => Red.cell("?"),
         TmuxPolicy::Resume => {
             let running = facts.tmux.iter().flat_map(|server| server.panes()).filter(|(_, pane)| pane.running != Running::Idle).count();
             let blocks = !tmux::blockers(machine.tmux, &machine.resumable_commands, &facts.tmux).is_empty();
@@ -413,7 +415,8 @@ mod tests {
         facts.tmux[0].sessions.clear();
         assert_eq!(cell(&lenient, &facts), (Green, "0".into()));
         facts.tmux[0].error = Some("protocol version mismatch".into());
-        assert_eq!(cell(&lenient, &facts), (Red, "0".into()));
+        assert_eq!(cell(&lenient, &facts), (Red, "?".into()));
+        assert_eq!(cell(&block, &facts), (Red, "1".into()));
     }
 
     #[test]
