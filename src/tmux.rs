@@ -536,8 +536,7 @@ fn capture_server(session: &mut Session, socket: String, pid: u32) -> Result<Opt
     let format: Vec<String> = PANE_FIELDS.iter().map(|field| format!("#{{{field}}}")).collect();
     // The user, then the listing; or what's wrong, with status 3
     let script = format!(
-        r#"test -d /proc/{pid} || {{ echo gone; exit 0; }}
-ids=$(stat -c '%U %u' /proc/{pid}) || exit 1
+        r#"ids=$(stat -c '%U %u' /proc/{pid} 2>/dev/null) || {{ echo gone; exit 0; }}
 set -- $ids
 [ "$1" = UNKNOWN ] && set -- "$2"
 printf '%s\n' "$1"
