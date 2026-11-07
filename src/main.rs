@@ -34,11 +34,11 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
-        /// Below the table, also print the reasons each machine isn't okay
-        /// to reboot, what a nixos-rebuild would change or why the
-        /// configuration couldn't be evaluated, and the error for each
-        /// machine that couldn't be checked (those errors are printed
-        /// without -v too when HOSTNAMES are given)
+        /// Below the table, print for each machine: the reasons it isn't
+        /// okay to reboot (if any); what a nixos-rebuild would change, or
+        /// why its configuration couldn't be evaluated (if check_rebuild is
+        /// on); and the error, if it couldn't be checked.  (Those errors are
+        /// printed without -v too, when HOSTNAMES are given.)
         #[clap(short, long)]
         verbose: bool,
         #[clap(flatten)]

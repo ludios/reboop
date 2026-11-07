@@ -169,12 +169,12 @@ fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> Stri
     human::table(&rows, color).join("\n") + "\n"
 }
 
-/// The lines to go below the table: the error for each machine that
-/// couldn't be checked, and, if `all`, also each reason not to reboot a
-/// machine, and what a nixos-rebuild would change or why the machine's
-/// configuration couldn't be evaluated.  Each line starts with the
-/// machine's hostname, any further lines of a message are indented, and
-/// a blank line comes before each machine's lines.
+/// The messages to go below the table about each machine: the error, if
+/// it couldn't be checked; and, if `all`, also each reason not to reboot
+/// it, and what a nixos-rebuild would change or why its configuration
+/// couldn't be evaluated.  The first line of each message starts with the
+/// machine's hostname, and the message's further lines are indented.  A
+/// blank line comes before each machine's messages.
 fn details(outcomes: &[(&Machine, Outcome)], all: bool) -> String {
     let mut text = String::new();
     for (machine, outcome) in outcomes {
@@ -257,9 +257,10 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  Below
-/// the table, prints the errors of the machines that couldn't be checked
-/// if `hostnames` isn't empty, and every detail (see [`details`]) if
-/// `verbose`.
+/// the table, if `verbose`, prints for each machine: the reasons not to
+/// reboot it, what a nixos-rebuild would change or why its configuration
+/// couldn't be evaluated, and the error, if it couldn't be checked.  If
+/// not `verbose` but `hostnames` isn't empty, prints only those errors.
 /// Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
