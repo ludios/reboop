@@ -1053,8 +1053,10 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert_eq!(refused.len(), 3, "{refused:?}");
     assert!(String::from_utf8(printed)?.starts_with(&format!("Not stopping tmux on {}:\n    tmux: tester's other:0.0", machine.hostname)));
     tester_tmux(&mut session)?;
-    // Without those, it stops the server, having saved what's in it.
+    // Without those, it stops the server, having saved what's in it, with
+    // window 3 of work linked into a second session.
     sh(&mut session, &format!("{tmux_cmd} kill-session -t other"))?;
+    sh(&mut session, &format!("{tmux_cmd} new-session -d -s zlinked -c /tmp && {tmux_cmd} link-window -d -s work:3 -t zlinked:1"))?;
     let geometry = |session: &mut Session| sh(session, &format!("{tmux_cmd} list-panes -a -F '#{{session_name}}:#{{window_index}}.#{{pane_index}} #{{pane_left}},#{{pane_top}} #{{pane_width}}x#{{pane_height}}'"));
     let before = geometry(&mut session)?;
     let mut printed = Vec::new();
@@ -1087,6 +1089,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     expect_pane(&server, "work:5.0", "/home/tester", Running::Idle)?;
     assert_eq!(server.sessions[0].windows.iter().map(|window| (window.index, window.name.as_deref())).collect::<Vec<_>>(), [(0, None), (3, Some("jobs")), (5, None)]);
     assert_eq!(geometry(&mut session)?, before);
+    let window_id = |session: &mut Session, target: &str| sh(session, &format!("{tmux_cmd} display -p -t {target} '#{{window_id}}'"));
+    assert_eq!(window_id(&mut session, "=zlinked:1")?, window_id(&mut session, "=work:3")?);
     let cgroup = sh(&mut session, &format!("cat /proc/{}/cgroup", server.pid))?;
     assert!(cgroup.contains("/user-1000.slice/session-") && cgroup.trim_end().ends_with(".scope"), "{cgroup}");
     assert!(sh(&mut session, "loginctl list-users")?.contains("tester"));
@@ -1094,7 +1098,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // sessions are then already there.
     assert!(resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut Vec::new(), false, None, None)).is_err());
     let problems = resume::start(&vm.ssh, &resuming, Some(&path), &mut Printer::new(&mut Vec::new(), false, None, None))?;
-    assert_eq!(problems, [format!("tester's tmux at {TESTER_SOCKET} already has a session called work, which was left alone")]);
+    let left_alone = |name: &str| format!("tester's tmux at {TESTER_SOCKET} already has a session called {name}, which was left alone");
+    assert_eq!(problems, [left_alone("work"), left_alone("zlinked")]);
     // A capture pending for a reboot that hasn't happened isn't brought back.
     let boot_id = facts::boot_id(&mut session)?;
     resume::save(&mut session, &Capture::new(Purpose::Reboot, &boot_id, vec![server.clone()]), true)?;

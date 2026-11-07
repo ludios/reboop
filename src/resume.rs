@@ -116,7 +116,10 @@ impl Capture {
     /// What would be run again, one line per pane for people, given the
     /// commands that `patterns` allow: "at's work:0.1 in /data: rsync ...".
     pub fn resumable(&self, patterns: &CommandPatterns) -> Vec<String> {
+        // Once each: a window linked into several sessions is in each.
+        let mut seen = HashSet::new();
         self.panes()
+            .filter(|(server, _, pane)| seen.insert((server.pid, &pane.id)))
             .filter_map(|(server, location, pane)| match tmux::verdict(pane, patterns) {
                 Verdict::Resume(command) => Some(format!("{}'s {location} in {}: {command}", server.user, pane.cwd)),
                 Verdict::Idle | Verdict::Block(_) => None,
@@ -279,9 +282,9 @@ i=0; until tmux -S {} has-session -t {} 2>/dev/null; do i=$((i + 1)); [ $i -ge {
 
 /// Recreates `window` in the session `name` at `socket`: as the window
 /// that's already there, `first` (its id, index and first pane's id, as the
-/// session was created with it), or as a new one.  Returns its pane ids, in
-/// the panes' order.
-fn create_window(session: &mut Session, socket: &str, name: &str, window: &Window, first: Option<(&str, u32, &str)>) -> Result<Vec<String>> {
+/// session was created with it), or as a new one.  Returns its id, and its
+/// pane ids, in the panes' order.
+fn create_window(session: &mut Session, socket: &str, name: &str, window: &Window, first: Option<(&str, u32, &str)>) -> Result<(String, Vec<String>)> {
     let [first_pane, more @ ..] = &window.panes[..] else { return Err(Failed("the window has no panes".into()).into()) };
     let (window_id, mut pane_ids) = match first {
         Some((id, index, pane_id)) => {
@@ -315,7 +318,25 @@ fn create_window(session: &mut Session, socket: &str, name: &str, window: &Windo
     if window.active {
         run_tmux(session, socket, &format!("select-window -t {window_id}"))?;
     }
-    Ok(pane_ids)
+    Ok((window_id, pane_ids))
+}
+
+/// Links the window with id `linked`, which was made for another session,
+/// into the session `name` at `socket` as `window`, in place of `first` (the
+/// window that the session was created with, and its index), if given.
+fn link_window(session: &mut Session, socket: &str, name: &str, window: &Window, linked: &str, first: Option<(&str, u32)>) -> Result<()> {
+    let target = shell_quote(&format!("={name}:{}", window.index));
+    // -k: in place of the first window, if that's at the index
+    run_tmux(session, socket, &format!("link-window -d -k -s {linked} -t {target}"))?;
+    if let Some((id, index)) = first
+        && index != window.index
+    {
+        run_tmux(session, socket, &format!("kill-window -t {id}"))?;
+    }
+    if window.active {
+        run_tmux(session, socket, &format!("select-window -t {target}"))?;
+    }
+    Ok(())
 }
 
 /// Why a pane isn't as it should be.
@@ -373,25 +394,15 @@ m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
     })
 }
 
-/// A server being brought back.
-struct Restoring<'a> {
-    server: &'a Server,
-    /// The commands that may be run again
-    patterns: &'a CommandPatterns,
-    /// The ids of the panes whose commands run again already (a window
-    /// linked into several sessions comes back once per session)
-    resumed: HashSet<String>,
-}
-
 /// Checks the panes of `window` (which has pane ids `pane_ids`) in session
-/// `name` of the server being brought back, and runs their commands again
-/// in them where allowed, telling the user.  Returns the problems: panes
-/// that aren't where they should be, and commands that couldn't be run.
-fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, window: &Window, pane_ids: &[String], printer: &mut Printer) -> Result<Vec<String>> {
-    let server = restoring.server;
+/// `name` of `server`, which is being brought back, and runs their commands
+/// again in them where `patterns` allow, telling the user.  Returns the
+/// problems: panes that aren't where they should be, and commands that
+/// couldn't be run.
+fn restore_panes(session: &mut Session, server: &Server, patterns: &CommandPatterns, name: &str, window: &Window, pane_ids: &[String], printer: &mut Printer) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for (pane, pane_id) in window.panes.iter().zip(pane_ids) {
-        let verdict = tmux::verdict(pane, restoring.patterns);
+        let verdict = tmux::verdict(pane, patterns);
         let where_ = format!("{}'s {} in {}", server.user, location(name, window.index, pane.index), pane.cwd);
         let command = match &verdict {
             Verdict::Resume(command) => Some(command.clone()),
@@ -418,10 +429,6 @@ fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, w
             }
             continue;
         };
-        if !restoring.resumed.insert(pane.id.clone()) {
-            printer.line(&format!("Left {where_} idle: it's the same pane as one brought back already"));
-            continue;
-        }
         let socket = shell_quote(&server.socket);
         let run = match &pane.running {
             // Pasted as typed (with bracketed paste, so a line break doesn't
@@ -467,7 +474,9 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             groups.entry(group).or_insert(&tmux_session.name);
         }
     }
-    let mut restoring = Restoring { server, patterns, resumed: HashSet::new() };
+    // The id of the window that each captured one became, by its first
+    // pane's id, for linking a window that was in several sessions into each
+    let mut made: HashMap<&str, String> = HashMap::new();
     for tmux_session in &server.sessions {
         let name = &tmux_session.name;
         let not_recreated = |error: &anyhow::Error| format!("{}'s session {name} couldn't be recreated: {error:#}", server.user);
@@ -525,16 +534,27 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
         let [window_id, index, pane_id] = created.split_whitespace().collect::<Vec<_>>()[..] else { return Err(unexpected().into()) };
         let index: u32 = index.parse().map_err(|_| unexpected())?;
         for (i, window) in tmux_session.windows.iter().enumerate() {
+            let window_not_recreated = |error: &anyhow::Error| format!("{}'s {name}:{} couldn't be recreated: {error:#}", server.user, window.index);
+            let first_pane_id = window.panes.first().map_or("", |pane| pane.id.as_str());
+            if let Some(linked) = made.get(first_pane_id) {
+                match link_window(session, socket, name, window, linked, (i == 0).then_some((window_id, index))) {
+                    Ok(()) => {}
+                    Err(error) if is_failure(&error) => problems.push(window_not_recreated(&error)),
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
             let first = (i == 0).then_some((window_id, index, pane_id));
-            let pane_ids = match create_window(session, socket, name, window, first) {
-                Ok(pane_ids) => pane_ids,
+            let (new_id, pane_ids) = match create_window(session, socket, name, window, first) {
+                Ok(made) => made,
                 Err(error) if is_failure(&error) => {
-                    problems.push(format!("{}'s {name}:{} couldn't be recreated: {error:#}", server.user, window.index));
+                    problems.push(window_not_recreated(&error));
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            problems.extend(restore_panes(session, &mut restoring, name, window, &pane_ids, printer)?);
+            made.insert(first_pane_id, new_id);
+            problems.extend(restore_panes(session, server, patterns, name, window, &pane_ids, printer)?);
         }
     }
     Ok(())
@@ -759,7 +779,15 @@ mod tests {
         assert_eq!(serde_json::from_str::<Capture>(&json).unwrap(), capture);
         assert_eq!(capture.counts(), "1 tmux server with 1 session and 3 panes");
         assert_eq!(Capture::new(Purpose::Check, "x", vec![]).counts(), "no tmux servers");
-        assert_eq!(capture.resumable(&patterns(&["rsync .*", "htop"])), ["at's work:0.1 in /data: rsync -a /data/ /backup/", "at's work:3.0 in /home/at: htop"]);
+        let resumable = ["at's work:0.1 in /data: rsync -a /data/ /backup/", "at's work:3.0 in /home/at: htop"];
+        assert_eq!(capture.resumable(&patterns(&["rsync .*", "htop"])), resumable);
+        // A window linked into a second session is in it too, but runs once.
+        let mut linked = capture.clone();
+        let mut other = linked.servers[0].sessions[0].clone();
+        other.name = "other".into();
+        other.windows.retain(|window| window.index == 3);
+        linked.servers[0].sessions.push(other);
+        assert_eq!(linked.resumable(&patterns(&["rsync .*", "htop"])), resumable);
     }
 
     #[test]

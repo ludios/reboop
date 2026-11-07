@@ -777,7 +777,8 @@ pub(crate) mod tests {
         };
         let idle = pane(0, "/home/at", Running::Idle);
         let rsync = pane(1, "/data", Running::Typed { command: "rsync -a /data/ /backup/".into() });
-        let htop = pane(0, "/home/at", Running::Typed { command: "htop".into() });
+        // Another pane than the idle one, with the same index in its window
+        let htop = Pane { id: "%2".into(), ..pane(0, "/home/at", Running::Typed { command: "htop".into() }) };
         Server {
             user: "at".into(),
             socket: "/tmp/tmux-1000/default".into(),
