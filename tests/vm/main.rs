@@ -1074,8 +1074,11 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let printed = String::from_utf8(printed)?;
     print!("{printed}");
     assert_eq!(refused, Vec::<String>::new());
-    let to_run = "\ntmux: will resume commands:\n    tester's work:0.0 in /var/tmp: sleep 601\n    tester's work:3.0 in /tmp: \"sleep 600\"\n    tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604\n";
-    assert!(printed.contains(to_run) && printed.contains(&format!("\ntmux: tester: stopped {TESTER_SOCKET}\n")), "{printed}");
+    let to_run = format!(
+        "\ntmux: `reboop tmux start {}` will resume commands:\n    tester's work:0.0 in /var/tmp: sleep 601\n    tester's work:3.0 in /tmp: \"sleep 600\"\n    tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604\n",
+        resuming.hostname
+    );
+    assert!(printed.contains(&to_run) && printed.contains(&format!("\ntmux: tester: stopped {TESTER_SOCKET}\n")), "{printed}");
     assert_eq!(tmux::capture(&mut session)?, Vec::<Server>::new());
     let (path, pending) = resume::pending(&mut session)?.ok_or_else(|| anyhow!("nothing is pending"))?;
     assert_eq!(pending.purpose, Purpose::TmuxStop);

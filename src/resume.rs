@@ -159,12 +159,17 @@ pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<S
 
 /// Tells the user that `capture` was saved at `path` (see [`save`]), and
 /// which of its commands `patterns` allow to be run again when it's brought
-/// back.
-pub fn tell_saved(path: &str, capture: &Capture, patterns: &CommandPatterns, printer: &mut Printer) {
+/// back: by `resumer`, the reboop command that the user has to run for
+/// that, or with no such command if `None`.
+pub fn tell_saved(path: &str, capture: &Capture, patterns: &CommandPatterns, resumer: Option<&str>, printer: &mut Printer) {
     printer.line(&format!("tmux: wrote {path} — {}", capture.counts()));
     let resumable = capture.resumable(patterns);
     if !resumable.is_empty() {
-        printer.line(&indented_list("tmux: will resume commands:", &resumable));
+        let heading = match resumer {
+            Some(resumer) => format!("tmux: `{resumer}` will resume commands:"),
+            None => "tmux: will resume commands:".into(),
+        };
+        printer.line(&indented_list(&heading, &resumable));
     }
 }
 
@@ -712,7 +717,7 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<S
         return Ok(vec![]);
     }
     let path = save(&mut session, &capture, true)?;
-    tell_saved(&path, &capture, &machine.resumable_commands, printer);
+    tell_saved(&path, &capture, &machine.resumable_commands, Some(&format!("reboop tmux start {hostname}")), printer);
     stop_servers(&mut session, &capture, printer)?;
     Ok(vec![])
 }
