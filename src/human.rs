@@ -73,8 +73,8 @@ pub enum Style {
     Bold,
     Dim,
     Red,
-    Yellow,
     Green,
+    Yellow,
 }
 
 impl Style {
@@ -90,8 +90,8 @@ impl Style {
             Style::Bold   => "1",
             Style::Dim    => "2",
             Style::Red    => "31",
-            Style::Yellow => "33",
             Style::Green  => "32",
+            Style::Yellow => "33",
         };
         format!("\x1b[{code}m{text}\x1b[0m")
     }
@@ -225,8 +225,8 @@ mod tests {
         assert_eq!(table(&rows, true), ["\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m", "three  \x1b[31mno\x1b[0m"]);
         assert_eq!(table(&rows, false), ["NAME   OKAY", "three  no"]);
         assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), ["a"]);
-        let rows = [vec![Style::Bold.cell("NET").aligned(Align::Center)], vec![Style::Red.cell("12.50").aligned(Align::Right)], vec![Style::Red.cell("1.0").aligned(Align::Right)]];
-        assert_eq!(table(&rows, true), [" \x1b[1mNET\x1b[0m", "\x1b[31m12.50\x1b[0m", "  \x1b[31m1.0\x1b[0m"]);
+        let rows = [vec![Style::Bold.cell("NET").aligned(Align::Center)], vec![Style::Red.cell("12.50").aligned(Align::Right)], vec![Style::Yellow.cell("1.0").aligned(Align::Right)]];
+        assert_eq!(table(&rows, true), [" \x1b[1mNET\x1b[0m", "\x1b[31m12.50\x1b[0m", "  \x1b[33m1.0\x1b[0m"]);
         let rows = [vec![Style::Plain.cell("ab").then(Style::Red, "c").then(Style::Green, ""), Style::Plain.cell("x")], vec![Style::Plain.cell("a"), Style::Plain.cell("y")]];
         assert_eq!(table(&rows, true), ["ab\x1b[31mc\x1b[0m  x", "a    y"]);
     }
