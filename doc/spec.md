@@ -142,13 +142,15 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     `ssh root@[ipv4 address of machine] -p [ssh_port]`
 
-2. Wait up to 15 minutes for the system to finish booting, running this every 2 seconds until it says neither `initializing` nor `starting`:
+2. Wait up to 3 minutes for the system to finish booting, running this every 2 seconds until it says neither `initializing` nor `starting`:
 
     `systemctl is-system-running`
 
-    Meanwhile, show which of systemd's jobs (from `systemctl list-jobs`) are running, and how many are waiting for others. If the 15 minutes pass, the error says the same.
+    Meanwhile, if stdout is a terminal, show how many of systemd's jobs (from `systemctl list-jobs`) are waiting, and which are running. If the 3 minutes pass, go on anyway, since a unit can hold startup up for hours (e.g. by retrying a request that a server has rate-limited): the state that step 3 shows is then a problem, and names those jobs.
 
 3. Collect this information and show it to the user of `reboop`:
+
+    The state from step 2, and systemd's jobs (if any): `systemctl list-jobs`
 
     `dmesg -l err,crit,alert,emerg`
 

@@ -9,7 +9,7 @@ use crate::boot::DefaultBoot;
 use crate::btrfs::{self, ScrubState};
 use crate::config::{self, Machine};
 use crate::deadline::{Deadline, Permanent, retry};
-use crate::facts::{self, Systems};
+use crate::facts::{self, Job, Systems};
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use crate::initrd::{self, Agent, UnlockError};
 use crate::passwords;
@@ -37,8 +37,10 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// boot.
 const RETURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// How long systemd gets to finish starting up once the machine accepts SSH.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long systemd gets to finish starting up once the machine accepts SSH,
+/// before the postflight goes on without it.  (A unit can hold startup up
+/// for hours, e.g. by retrying a request that a server has rate-limited.)
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 /// How often to check on systemd's starting up.
 const STARTUP_INTERVAL: Duration = Duration::from_secs(2);
@@ -448,13 +450,18 @@ fn wait_for_return(
 }
 
 /// What's wrong with how a machine came back, given its `systems`, systemd's
-/// `state` of it (from [`facts::wait_until_booted`]), and its
-/// `failed_units`.  It should have booted its system profile.
-fn postflight_problems(systems: &Systems, state: &str, failed_units: &[String]) -> Vec<String> {
+/// `state` of it (from [`facts::wait_until_booted`]), systemd's `jobs`
+/// (named if `state` is a problem, as they may be what holds startup up),
+/// and its `failed_units`.  It should have booted its system profile.
+fn postflight_problems(systems: &Systems, state: &str, jobs: &[Job], failed_units: &[String]) -> Vec<String> {
     let mut problems = Vec::new();
     // "degraded" means there are failed units, which get their own problem.
     if state != "running" && state != "degraded" {
-        problems.push(format!("systemd says the system is {state}"));
+        let mut problem = format!("systemd says the system is {state}");
+        if !jobs.is_empty() {
+            problem += &format!(", with {}", facts::jobs_summary(jobs));
+        }
+        problems.push(problem);
     }
     if !failed_units.is_empty() {
         problems.push(format!("failed units: {}", failed_units.join(", ")));
@@ -469,8 +476,8 @@ fn postflight_problems(systems: &Systems, state: &str, failed_units: &[String]) 
 }
 
 /// Waits for the machine at the other end of `session` to finish starting
-/// up, makes sure it's `hostname`, shows how it came back, and returns its
-/// problems (see [`postflight_problems`]).
+/// up (for up to [`STARTUP_TIMEOUT`]), makes sure it's `hostname`, shows how
+/// it came back, and returns its problems (see [`postflight_problems`]).
 fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> Result<Vec<String>> {
     printer.line("Waiting for systemd to finish starting up");
     let state = facts::wait_until_booted(session, STARTUP_INTERVAL, Deadline::after(STARTUP_TIMEOUT), |jobs| {
@@ -478,11 +485,15 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
     })?;
     // Not before, since a hostname from DHCP can come late in startup
     facts::ensure_hostname(session, hostname)?;
+    let jobs = facts::jobs(session)?;
     let failed_units = facts::failed_units(session)?;
     let after = facts::systems(session)?;
     let kernel_errors = facts::kernel_errors(session)?;
 
     printer.line(&format!("systemd says the system is {}", printer.bold(&state)));
+    if !jobs.is_empty() {
+        printer.line(&format!("systemd's {}", facts::jobs_summary(&jobs)));
+    }
     printer.line(&format!("Booted {} with kernel {}", printer.bold(&after.booted), printer.bold(&after.running_kernel)));
     if failed_units.is_empty() {
         printer.line("Failed units: none");
@@ -495,7 +506,7 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
     } else {
         printer.line(&indented_list("Kernel errors:", kernel_errors.trim_end().lines()));
     }
-    Ok(postflight_problems(&after, &state, &failed_units))
+    Ok(postflight_problems(&after, &state, &jobs, &failed_units))
 }
 
 /// Scrubs the btrfs filesystem mounted at `mountpoint`, or waits for the
@@ -875,16 +886,26 @@ mod tests {
     #[test]
     fn finds_postflight_problems() {
         let systems = idle_facts().systems;
-        assert_eq!(postflight_problems(&systems, "running", &[]), Vec::<String>::new());
+        assert_eq!(postflight_problems(&systems, "running", &[], &[]), Vec::<String>::new());
         let booted_older = Systems { booted: "/nix/store/bbb-nixos-system-one-26.05".into(), running_kernel: "6.18.53".into(), ..systems.clone() };
         assert_eq!(
-            postflight_problems(&booted_older, "degraded", &["a.service".into(), "b.service".into()]),
+            postflight_problems(&booted_older, "degraded", &[], &["a.service".into(), "b.service".into()]),
             [
                 "failed units: a.service, b.service",
                 "booted /nix/store/bbb-nixos-system-one-26.05, not /nix/store/aaa-nixos-system-one-26.05",
                 "booted kernel 6.18.53, not 6.18.54",
             ]
         );
-        assert_eq!(postflight_problems(&systems, "maintenance", &[]), ["systemd says the system is maintenance"]);
+        assert_eq!(postflight_problems(&systems, "maintenance", &[], &[]), ["systemd says the system is maintenance"]);
+        let jobs = [
+            Job { id: 1, unit: "multi-user.target".into(), job_type: "start".into(), state: "waiting".into() },
+            Job { id: 2, unit: "acme-order-renew-example.com.service".into(), job_type: "start".into(), state: "running".into() },
+        ];
+        assert_eq!(
+            postflight_problems(&systems, "starting", &jobs, &[]),
+            ["systemd says the system is starting, with running jobs: start acme-order-renew-example.com.service; waiting jobs: 1"]
+        );
+        // Jobs while it's running, like a timer's, aren't a problem.
+        assert_eq!(postflight_problems(&systems, "running", &jobs, &[]), Vec::<String>::new());
     }
 }
