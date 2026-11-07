@@ -375,6 +375,9 @@ const SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "fish", "ksh"];
 struct ProcessFacts {
     /// The names of its child processes
     children: Vec<String>,
+    /// The names of those that aren't in the foreground process group of
+    /// its terminal, as a typed command is and a background job isn't
+    background: Vec<String>,
     /// The last [`ARCHIVE_RECORDS`] lines of its zsh-spy archive, if it's a
     /// shell that has one
     archive: Option<String>,
@@ -388,12 +391,20 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
         return Ok((Running::Idle, if line.path.is_empty() { line.start_path.clone() } else { line.path.clone() }));
     }
     let facts = facts.ok_or_else(|| anyhow!("no facts about pid {}", line.pid))?;
-    // A child the archive doesn't account for, like a disowned job, means
-    // the shell isn't idle after all.
     let unknown = || Running::Unknown { program: facts.children.first().cloned().unwrap_or_else(|| line.current_command.clone()) };
     if let Some(tail) = &facts.archive {
         let (running, cwd) = shell_running(&parse_records(tail)?, line.pid, &line.current_command, &line.path)?;
-        return Ok(if running == Running::Idle && !facts.children.is_empty() { (unknown(), line.path.clone()) } else { (running, cwd) });
+        // A child that the archive doesn't account for, like a disowned
+        // job, means that more is running than the archive says.
+        let unaccounted = match running {
+            Running::Idle => facts.children.first(),
+            Running::Typed { .. } => facts.background.first(),
+            _ => None,
+        };
+        if let Some(program) = unaccounted {
+            return Ok((Running::Unknown { program: program.clone() }, line.path.clone()));
+        }
+        return Ok((running, cwd));
     }
     if !line.start_command.is_empty() {
         return Ok((Running::Started { command: line.start_command.clone() }, line.start_path.clone()));
@@ -405,9 +416,9 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
 }
 
 /// The [`ProcessFacts`] about each live pane's process among `lines`, by
-/// pid: its children's names, and the end of the zsh-spy archive
-/// (hist.*.jsonl) that it holds open, if any, read through its fd (so that
-/// one in another mount namespace is found).
+/// pid: its children, and the end of the zsh-spy archive (hist.*.jsonl)
+/// that it holds open, if any, read through its fd (so that one in another
+/// mount namespace is found).
 fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u32, ProcessFacts>> {
     // Once each: a window linked into several sessions lists its panes once per session.
     let pids: BTreeSet<u32> = lines.iter().filter(|line| !line.dead).map(|line| line.pid).collect();
@@ -415,8 +426,10 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
     if pids.is_empty() {
         return Ok(facts);
     }
-    // A line per pid: the pid, the base64 of its children's names (one per
-    // line), and the base64 of the archive's last lines, or "-" without one
+    // A line per pid: the pid, its terminal's foreground process group (-1
+    // if none), the base64 of its children's process groups and names (one
+    // per line), and the base64 of the archive's last lines, or "-" without
+    // one
     let script = format!(
         r#"for p in {}; do
     a=-
@@ -428,22 +441,30 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
             break;;
         esac
     done
-    printf '%s %s %s\n' "$p" "$(ps -o comm= --ppid "$p" | base64 -w0)" "$a"
+    t=$(ps -o tpgid= -p "$p" | tr -d ' ')
+    printf '%s %s %s %s\n' "$p" "${{t:--1}}" "$(ps -o pgid=,comm= --ppid "$p" | base64 -w0)" "$a"
 done"#,
         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
     );
     let output = session.run_ok(&script, QUICK)?;
     for line in output.lines() {
         let context = || format!("unexpected process facts line {:?}", human::truncate(line, COMMAND_SHOWN));
-        let [pid, children, archive] = line.splitn(3, ' ').collect::<Vec<_>>()[..] else { bail!(context()) };
+        let [pid, foreground, children, archive] = line.splitn(4, ' ').collect::<Vec<_>>()[..] else { bail!(context()) };
         let pid: u32 = pid.parse().with_context(context)?;
-        let children = String::from_utf8_lossy(&BASE64.decode(children).with_context(context)?).lines().map(String::from).collect();
-        let mut tail = None;
+        let foreground: i32 = foreground.parse().with_context(context)?;
+        let mut facts_about = ProcessFacts { children: vec![], background: vec![], archive: None };
+        for child in String::from_utf8_lossy(&BASE64.decode(children).with_context(context)?).lines() {
+            let (group, name) = child.trim_start().split_once(' ').with_context(context)?;
+            if group.parse::<i32>().with_context(context)? != foreground {
+                facts_about.background.push(name.into());
+            }
+            facts_about.children.push(name.into());
+        }
         if archive != "-" {
             let bytes = BASE64.decode(archive).with_context(context)?;
-            tail = Some(String::from_utf8(bytes).with_context(|| format!("the zsh-spy archive of pid {pid} isn't UTF-8"))?);
+            facts_about.archive = Some(String::from_utf8(bytes).with_context(|| format!("the zsh-spy archive of pid {pid} isn't UTF-8"))?);
         }
-        facts.insert(pid, ProcessFacts { children, archive: tail });
+        facts.insert(pid, facts_about);
     }
     ensure!(facts.len() == pids.len(), "expected facts about {} processes, got {}", pids.len(), facts.len());
     Ok(facts)
@@ -732,8 +753,14 @@ pub(crate) mod tests {
         parse_pane_line(&fields.join("\x1f")).unwrap()
     }
 
-    fn facts(children: &[&str], archive: Option<&str>) -> ProcessFacts {
-        ProcessFacts { children: children.iter().map(|&child| child.into()).collect(), archive: archive.map(String::from) }
+    /// Facts about a process with children in the `foreground` process
+    /// group and in `background` ones.
+    fn facts(foreground: &[&str], background: &[&str], archive: Option<&str>) -> ProcessFacts {
+        ProcessFacts {
+            children: foreground.iter().chain(background).map(|&child| child.into()).collect(),
+            background: background.iter().map(|&child| child.into()).collect(),
+            archive: archive.map(String::from),
+        }
     }
 
     #[test]
@@ -834,18 +861,20 @@ pub(crate) mod tests {
         let running = |line: &PaneLine, facts: Option<&ProcessFacts>| pane_running(line, facts).unwrap();
         let archive = r#"{"type":"command_start","id":"s.1","shell_pid":4242,"cwd":"/data","command":"htop"}"#;
         let done = format!("{archive}\n{{\"type\":\"command_end\",\"id\":\"s.1\"}}");
-        assert_eq!(running(&line("htop", ""), Some(&facts(&["htop"], Some(archive)))), (Running::Typed { command: "htop".into() }, "/data".into()));
-        assert_eq!(running(&line("zsh", ""), Some(&facts(&[], Some(&done)))), (Running::Idle, "/pane".into()));
-        // The archive says idle, but the shell has a child: a disowned job, say
-        assert_eq!(running(&line("zsh", ""), Some(&facts(&["sleep"], Some(&done)))), (Running::Unknown { program: "sleep".into() }, "/pane".into()));
+        assert_eq!(running(&line("htop", ""), Some(&facts(&["htop"], &[], Some(archive)))), (Running::Typed { command: "htop".into() }, "/data".into()));
+        assert_eq!(running(&line("zsh", ""), Some(&facts(&[], &[], Some(&done)))), (Running::Idle, "/pane".into()));
+        // The archive says idle, or that a command runs in the foreground,
+        // but the shell has a child in the background: a disowned job, say
+        assert_eq!(running(&line("zsh", ""), Some(&facts(&[], &["sleep"], Some(&done)))), (Running::Unknown { program: "sleep".into() }, "/pane".into()));
+        assert_eq!(running(&line("htop", ""), Some(&facts(&["htop"], &["sleep"], Some(archive)))), (Running::Unknown { program: "sleep".into() }, "/pane".into()));
         // A shell started by a start command (default-command, or `tmux new zsh`) goes by its archive
-        assert_eq!(running(&line("htop", "zsh"), Some(&facts(&["htop"], Some(archive)))), (Running::Typed { command: "htop".into() }, "/data".into()));
+        assert_eq!(running(&line("htop", "zsh"), Some(&facts(&["htop"], &[], Some(archive)))), (Running::Typed { command: "htop".into() }, "/data".into()));
         // Started with a command, which started in /start
-        assert_eq!(running(&line("sleep", "\"sleep 300\""), Some(&facts(&[], None))), (Running::Started { command: "\"sleep 300\"".into() }, "/start".into()));
+        assert_eq!(running(&line("sleep", "\"sleep 300\""), Some(&facts(&[], &[], None))), (Running::Started { command: "\"sleep 300\"".into() }, "/start".into()));
         // Shells without an archive: idle with no children, else unknown
-        assert_eq!(running(&line("bash", ""), Some(&facts(&[], None))), (Running::Idle, "/pane".into()));
-        assert_eq!(running(&line("bash", ""), Some(&facts(&["python3"], None))), (Running::Unknown { program: "python3".into() }, "/pane".into()));
-        assert_eq!(running(&line("htop", ""), Some(&facts(&[], None))), (Running::Unknown { program: "htop".into() }, "/pane".into()));
+        assert_eq!(running(&line("bash", ""), Some(&facts(&[], &[], None))), (Running::Idle, "/pane".into()));
+        assert_eq!(running(&line("bash", ""), Some(&facts(&["python3"], &[], None))), (Running::Unknown { program: "python3".into() }, "/pane".into()));
+        assert_eq!(running(&line("htop", ""), Some(&facts(&[], &[], None))), (Running::Unknown { program: "htop".into() }, "/pane".into()));
         assert!(pane_running(&line("zsh", ""), None).is_err());
         // A dead pane
         let fields = ["work", "", "0", "zsh", "1", "1", "{}", "0", "%7", "1", "1", "", "", "/start", "", "\"sleep 1\""];

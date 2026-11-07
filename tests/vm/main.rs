@@ -971,7 +971,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // then one in /home/tester), window 3, "jobs", started with sleep 600 in
     // /tmp, and window 5 in a directory that'll be gone; and session other,
     // with a background job, a line typed with a leading space, and a job
-    // that was disowned (which only shows as a child of the shell).
+    // that was disowned (which only shows as a child of the shell) with a
+    // resumable command in the foreground after it.
     sh(&mut session, START_TMUX)?;
     tester_tmux(&mut session)?;
     sh(
@@ -988,12 +989,14 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     type_into(&mut session, "other:0.0", "sleep 602 &")?;
     type_into(&mut session, "other:1.0", " sleep 603")?;
     type_into(&mut session, "other:2.0", "sleep 605 & disown")?;
+    type_into(&mut session, "other:2.0", "sleep 601")?;
     // zsh-spy has written about each once its command is running.
     wait_for(|| {
         let server = tester_tmux(&mut session)?;
+        let foreground = sh(&mut session, &format!("{tmux_cmd} display -p -t other:2.0 '#{{pane_current_command}}'"))?;
         Ok(matches!(pane(&server, "other:0.0")?.running, Running::Background { .. })
             && matches!(pane(&server, "other:1.0")?.running, Running::Unknown { .. })
-            && matches!(pane(&server, "other:2.0")?.running, Running::Unknown { .. }))
+            && foreground == "sleep\n")
     })?;
     let server = tester_tmux(&mut session)?;
     assert_eq!((server.user.as_str(), server.socket.as_str(), &server.error), ("tester", TESTER_SOCKET, &None));
@@ -1011,7 +1014,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert!(work.windows[0].active && work.windows[0].panes[0].active && !work.windows[0].panes[1].active, "{work:#?}");
 
     // What blocks a reboot: with tmux "block", the server; with "resume",
-    // the background job and the line typed with a leading space.
+    // the background job, the line typed with a leading space, and the
+    // disowned job.
     let machine = vm_machine(vm);
     let resuming = resuming_machine(vm, &["sleep 60[14]", "\"sleep 600\""]);
     let facts = preflight::gather(&mut session, &machine.hostname)?;
