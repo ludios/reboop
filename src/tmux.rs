@@ -439,10 +439,28 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
     if pids.is_empty() {
         return Ok(facts);
     }
-    // A line per pid: the pid, its terminal's foreground process group (-1
-    // if none), the base64 of its children's process groups and names (one
-    // per line), and the base64 of the archive's last lines, or "-" without
-    // one
+    // All at once, so that a child's process group and its parent's
+    // terminal's foreground one are from the same moment
+    let mut foregrounds: HashMap<u32, i32> = HashMap::new();
+    let mut children: HashMap<u32, Vec<(i32, String)>> = HashMap::new();
+    for line in session.run_ok("ps -e -o pid=,ppid=,pgid=,tpgid=,comm=", QUICK)?.lines() {
+        let context = || format!("unexpected ps line {line:?}");
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        ensure!(fields.len() >= 5, context());
+        let pid: u32 = fields[0].parse().with_context(context)?;
+        let ppid: u32 = fields[1].parse().with_context(context)?;
+        let group: i32 = fields[2].parse().with_context(context)?;
+        // -1 without a terminal
+        let foreground: i32 = fields[3].parse().with_context(context)?;
+        if pids.contains(&pid) {
+            foregrounds.insert(pid, foreground);
+        }
+        if pids.contains(&ppid) {
+            children.entry(ppid).or_default().push((group, fields[4..].join(" ")));
+        }
+    }
+    // A line per pid: the pid, and the base64 of the end of its archive, or
+    // "-" without one
     let script = format!(
         r#"for p in {}; do
     a=-
@@ -454,8 +472,7 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
             break;;
         esac
     done
-    t=$(ps -o tpgid= -p "$p" | tr -d ' ')
-    printf '%s %s %s %s\n' "$p" "${{t:--1}}" "$(ps -o pgid=,comm= --ppid "$p" | base64 -w0)" "$a"
+    printf '%s %s\n' "$p" "$a"
 done"#,
         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
         shell_quote(ARCHIVE_END)
@@ -463,16 +480,15 @@ done"#,
     let output = session.run_ok(&script, QUICK)?;
     for line in output.lines() {
         let context = || format!("unexpected process facts line {:?}", human::truncate(line, COMMAND_SHOWN));
-        let [pid, foreground, children, archive] = line.splitn(4, ' ').collect::<Vec<_>>()[..] else { bail!(context()) };
+        let Some((pid, archive)) = line.split_once(' ') else { bail!(context()) };
         let pid: u32 = pid.parse().with_context(context)?;
-        let foreground: i32 = foreground.parse().with_context(context)?;
+        let foreground = foregrounds.get(&pid).copied().unwrap_or(-1);
         let mut facts_about = ProcessFacts { children: vec![], background: vec![], archive: None };
-        for child in String::from_utf8_lossy(&BASE64.decode(children).with_context(context)?).lines() {
-            let (group, name) = child.trim_start().split_once(' ').with_context(context)?;
-            if group.parse::<i32>().with_context(context)? != foreground {
-                facts_about.background.push(name.into());
+        for (group, name) in children.remove(&pid).unwrap_or_default() {
+            if group != foreground {
+                facts_about.background.push(name.clone());
             }
-            facts_about.children.push(name.into());
+            facts_about.children.push(name);
         }
         if archive != "-" {
             let bytes = BASE64.decode(archive).with_context(context)?;
