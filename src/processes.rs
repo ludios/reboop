@@ -121,9 +121,16 @@ fn program_names(args: &str) -> Vec<String> {
     names
 }
 
-/// Whether a btrfs command line runs `btrfs send` or `btrfs receive`, maybe
-/// abbreviated, as btrfs-progs allows any unambiguous prefix of a command.
-fn is_btrfs_send_receive(args: &str) -> bool {
+/// btrfs's top-level commands, as of btrfs-progs 7.3
+const BTRFS_COMMANDS: &[&str] = &[
+    "subvolume", "filesystem", "balance", "device", "scrub", "check", "rescue", "restore", "inspect-internal",
+    "property", "send", "receive", "quota", "qgroup", "replace", "help", "version",
+];
+
+/// The top-level command (e.g. "send") that a btrfs command line runs, if
+/// any.  Like btrfs-progs, this takes any unambiguous prefix of a command to
+/// mean that command.
+fn btrfs_command(args: &str) -> Option<&'static str> {
     let mut words = args.split_whitespace().skip(1);
     while let Some(word) = words.next() {
         match word {
@@ -132,10 +139,15 @@ fn is_btrfs_send_receive(args: &str) -> bool {
                 words.next();
             }
             _ if word.starts_with('-') => {}
-            command => return (command.len() >= 2 && "send".starts_with(command)) || (command.len() >= 3 && "receive".starts_with(command)),
+            prefix => {
+                let mut commands = BTRFS_COMMANDS.iter().filter(|command| command.starts_with(prefix));
+                let command = commands.next().copied();
+                // btrfs refuses an ambiguous prefix.
+                return if commands.next().is_none() { command } else { None };
+            }
         }
     }
-    false
+    None
 }
 
 /// Whether an rclone command line transfers files, with copy, sync, move or
@@ -168,7 +180,7 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::Tmux)
     } else if is_any(COPY_PROGRAMS) || (is("rclone") && is_rclone_transfer(&process.args)) {
         Some(Activity::Copy)
-    } else if is("btrfs") && is_btrfs_send_receive(&process.args) {
+    } else if is("btrfs") && matches!(btrfs_command(&process.args), Some("send" | "receive")) {
         Some(Activity::BtrfsSendReceive)
     } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
         Some(Activity::Cryptsetup)
@@ -197,6 +209,19 @@ mod tests {
         assert_eq!(processes.len(), 3);
         assert_eq!(processes[2], Process { pid: 707120, ppid: 644808, user: "at".into(), args: "sshd-session: at [postauth]".into() });
         assert!(parse_ps("x 1 root foo\n").is_err());
+    }
+
+    #[test]
+    fn resolves_btrfs_commands() {
+        // Each full name means just that command (none is a prefix of another).
+        for command in BTRFS_COMMANDS {
+            assert_eq!(btrfs_command(&format!("btrfs {command} x")), Some(*command));
+        }
+        assert_eq!(btrfs_command("btrfs -q c /dev/sdb"), Some("check"));
+        assert_eq!(btrfs_command("btrfs --log debug resc zero-log /dev/sdb"), Some("rescue"));
+        assert_eq!(btrfs_command("btrfs res /dev/sdb /mnt"), None);
+        assert_eq!(btrfs_command("btrfs frobnicate"), None);
+        assert_eq!(btrfs_command("btrfs --version"), None);
     }
 
     #[test]
