@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::LazyLock;
 
 /// How much of a command a [`Verdict`] shows.
 const COMMAND_SHOWN: usize = 100;
@@ -100,7 +101,8 @@ pub enum Running {
     /// Its shell is waiting at its prompt, with nothing running.
     Idle,
     /// Its shell is running a command line that was typed into it, as
-    /// zsh-spy recorded it.
+    /// zsh-spy recorded it, perhaps one that was stopped with Ctrl-Z and
+    /// brought back with fg (see [`shell_running`]).
     Typed { command: String },
     /// The command tmux started it with in place of a shell, as tmux shows
     /// it, quoted for tmux's own command parser: e.g. `"sleep 300"` for a
@@ -109,7 +111,8 @@ pub enum Running {
     /// Jobs of its shell haven't ended, whether they run in the background
     /// (put there with &) or are stopped (as with Ctrl-Z): what each ran, as
     /// zsh-spy recorded it, or `None` for one whose line HIST_IGNORE_SPACE
-    /// hid.  (Whatever the shell runs in the foreground.)
+    /// hid.  (Whatever the shell runs in the foreground, except for a job
+    /// that counts as `Typed`: see [`shell_running`].)
     Background { jobs: Vec<Option<String>> },
     /// It's running `program`, but what was typed to start it isn't known:
     /// its shell has no zsh-spy archive, or the line was hidden from it
@@ -319,20 +322,20 @@ fn parse_pane_line(line: &str) -> Result<PaneLine> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Record {
-    CommandStart {
-        id: String,
-        shell_pid: u32,
-        cwd: String,
-        /// None if the line was hidden (HIST_IGNORE_SPACE)
-        command: Option<String>,
-    },
+    CommandStart(LineStart),
     CommandEnd {
         id: String,
+        /// The line's exit status
+        status: Option<i64>,
+        /// The jobs that the line started, by number (usually)
+        async_jobs: Option<Vec<serde_json::Value>>,
     },
     AsyncStart {
         /// The id of the command that started the job
         id: String,
         job: u64,
+        /// The job's pids, comma-separated, in the order zsh started them
+        job_pids: Option<String>,
         /// None if the command's line was hidden
         job_text: Option<String>,
     },
@@ -348,6 +351,17 @@ enum Record {
     Other,
 }
 
+/// A command_start record: a line that the shell began to run.
+#[derive(Debug, Deserialize)]
+struct LineStart {
+    id: String,
+    shell_pid: u32,
+    /// The directory it was typed in
+    cwd: String,
+    /// None if the line was hidden (HIST_IGNORE_SPACE)
+    command: Option<String>,
+}
+
 /// Parses the records in `picked`, the lines of an archive that
 /// [`PICK_RECORDS`] printed.  A line that doesn't parse is an error, rather
 /// than a command that goes unseen.
@@ -357,48 +371,108 @@ fn parse_records(picked: &str) -> Result<Vec<Record>> {
         .collect()
 }
 
-/// What the jobs that `records` show started, but not ended or lost, ran.  (By command id and job number, in whatever order the records
-/// came, since zsh-spy's traps can write them out of order.)
-fn running_jobs(records: &[Record]) -> Vec<Option<String>> {
-    // (started, ended, what it ran) by (command id, job number)
-    let mut jobs: BTreeMap<(&str, u64), (bool, bool, Option<String>)> = BTreeMap::new();
+/// A job of a shell that its archive shows started, but not ended or lost.
+struct Job<'a> {
+    /// The id of the line that started it
+    id: &'a str,
+    /// Its number in the shell's job table
+    number: u64,
+    /// Its first process, which leads its process group, if known
+    leader: Option<i32>,
+    /// What it ran, as zsh shows it, or None if its line was hidden
+    text: Option<String>,
+}
+
+/// The jobs that `records` show started, but not ended or lost.  (By
+/// command id and job number, in whatever order the records came, since
+/// zsh-spy's traps can write them out of order.)
+fn unended_jobs(records: &[Record]) -> Vec<Job<'_>> {
+    // (the job, if started; whether ended) by (command id, job number)
+    let mut jobs: BTreeMap<(&str, u64), (Option<Job>, bool)> = BTreeMap::new();
     for record in records {
         match record {
-            Record::AsyncStart { id, job, job_text } => {
-                let entry = jobs.entry((id, *job)).or_default();
-                entry.0 = true;
-                entry.2 = job_text.clone();
+            Record::AsyncStart { id, job, job_pids, job_text } => {
+                let leader = job_pids.as_deref().and_then(|pids| pids.split(',').next()?.parse().ok());
+                jobs.entry((id, *job)).or_default().0 = Some(Job { id, number: *job, leader, text: job_text.clone() });
             }
             Record::AsyncEnd { id, job } | Record::AsyncLost { id, job } => jobs.entry((id, *job)).or_default().1 = true,
             _ => {}
         }
     }
-    jobs.into_values().filter(|(started, ended, _)| *started && !ended).map(|(_, _, text)| text).collect()
+    jobs.into_values().filter(|(_, ended)| !ended).filter_map(|(job, _)| job).collect()
+}
+
+/// Whether `command`, a line typed into zsh, does nothing but bring a job
+/// back into the foreground: `fg`, `fg JOB` or `%JOB`, where JOB is like
+/// `1`, `+`, `sleep` or `?600`, or is left out.
+fn is_bare_fg(command: &str) -> bool {
+    static BARE_FG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(fg(\s+[\w%+?.-]+)?|%[\w%+?.-]*)$").unwrap());
+    BARE_FG.is_match(command.trim())
+}
+
+/// The statuses that zsh gives a line when its foreground job is stopped:
+/// 128 plus the number of SIGSTOP or of SIGTSTP (Ctrl-Z's), as on x86 and
+/// ARM Linux.
+const STOPPED: [i64; 2] = [128 + 19, 128 + 20];
+
+/// Whether `job` was stopped in the foreground of the line that started it,
+/// and that line started no other job, by the line's command_end among
+/// `records`.  A job that was put in the background with & wasn't: its line
+/// ends with the status of what ran after it.
+fn stopped_alone(records: &[Record], job: &Job) -> bool {
+    records.iter().any(|record| {
+        matches!(record, Record::CommandEnd { id, status: Some(status), async_jobs: Some(jobs) }
+            if id == job.id && STOPPED.contains(status) && *jobs == [serde_json::json!(job.number)])
+    })
 }
 
 /// What the shell with pid `pid` is running, by the `records` that
 /// [`PICK_RECORDS`] picked from its archive, and the directory to run it in
 /// again: where a typed command was typed, or else `path`, the pane's
 /// current directory.  tmux says the pane's foreground program is
-/// `program`.
-fn shell_running(records: &[Record], pid: u32, program: &str, path: &str) -> Result<(Running, String)> {
-    let jobs = running_jobs(records);
-    if !jobs.is_empty() {
-        return Ok((Running::Background { jobs }, path.into()));
-    }
-    let Some(start) = records.iter().rposition(|record| matches!(record, Record::CommandStart { .. })) else {
-        return Ok((Running::Idle, path.into()));
-    };
-    let Record::CommandStart { id, shell_pid, cwd, command } = &records[start] else { unreachable!() };
-    ensure!(shell_pid == &pid, "the archive that pid {pid} holds open has records of pid {shell_pid}");
-    let ended = records[start + 1..].iter().any(|record| matches!(record, Record::CommandEnd { id: ended } if ended == id));
-    if ended {
-        return Ok((Running::Idle, path.into()));
-    }
-    Ok(match command {
-        Some(command) => (Running::Typed { command: command.clone() }, cwd.clone()),
+/// `program`; `waited_on` is the process group of the shell's children that
+/// has its terminal, if any.
+///
+/// A job that hasn't ended makes it [`Running::Background`], unless the
+/// shell brought it back into the foreground (with a line that's nothing
+/// but `fg` or the like) after it was stopped there with Ctrl-Z, and it's
+/// the shell's only job, and its line started no other: then what runs is
+/// that line, typed where it was typed.
+fn shell_running(records: &[Record], pid: u32, waited_on: Option<i32>, program: &str, path: &str) -> Result<(Running, String)> {
+    let typed = |line: &LineStart| match &line.command {
+        Some(command) => (Running::Typed { command: command.clone() }, line.cwd.clone()),
         None => (Running::Unknown { program: program.into() }, path.into()),
-    })
+    };
+    // The line it runs: its last one, unless that has ended
+    let mut running = None;
+    let last = records.iter().enumerate().rev().find_map(|(at, record)| match record {
+        Record::CommandStart(line) => Some((at, line)),
+        _ => None,
+    });
+    if let Some((at, line)) = last {
+        ensure!(line.shell_pid == pid, "the archive that pid {pid} holds open has records of pid {}", line.shell_pid);
+        if !records[at + 1..].iter().any(|record| matches!(record, Record::CommandEnd { id, .. } if *id == line.id)) {
+            running = Some(line);
+        }
+    }
+
+    let jobs = unended_jobs(records);
+    if let [job] = jobs.as_slice()
+        && job.leader.is_some()
+        && job.leader == waited_on
+        && running.and_then(|line| line.command.as_deref()).is_some_and(is_bare_fg)
+        && stopped_alone(records, job)
+    {
+        let started = records.iter().find_map(|record| match record {
+            Record::CommandStart(line) if line.id == job.id => Some(line),
+            _ => None,
+        });
+        return Ok(started.map_or_else(|| (Running::Unknown { program: program.into() }, path.into()), typed));
+    }
+    if !jobs.is_empty() {
+        return Ok((Running::Background { jobs: jobs.into_iter().map(|job| job.text).collect() }, path.into()));
+    }
+    Ok(running.map_or_else(|| (Running::Idle, path.into()), typed))
 }
 
 /// Programs that are shells, so a pane running one with no children and no
@@ -412,6 +486,9 @@ struct ProcessFacts {
     /// The names of those that aren't in the foreground process group of
     /// its terminal, as a typed command is and a background job isn't
     background: Vec<String>,
+    /// The foreground process group of its terminal, if that's of its
+    /// children: of a typed command, or of a job brought back with fg
+    waited_on: Option<i32>,
     /// The records of its zsh-spy archive that [`PICK_RECORDS`] prints, if
     /// it's a shell that has one
     archive: Option<String>,
@@ -427,9 +504,11 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
     let facts = facts.ok_or_else(|| anyhow!("no facts about pid {}", line.pid))?;
     let unknown = || Running::Unknown { program: facts.children.first().cloned().unwrap_or_else(|| line.current_command.clone()) };
     if let Some(picked) = &facts.archive {
-        let (running, cwd) = shell_running(&parse_records(picked)?, line.pid, &line.current_command, &line.path)?;
+        let (running, cwd) = shell_running(&parse_records(picked)?, line.pid, facts.waited_on, &line.current_command, &line.path)?;
         // A child that the archive doesn't account for, like a disowned
-        // job, means that more is running than the archive says.
+        // job, means that more is running than the archive says.  (Also
+        // what's left of a job that zsh split when it was stopped, as with
+        // `sleep 5 | { sleep 60; echo x; }`, while it's brought back.)
         let unaccounted = match running {
             Running::Idle => facts.children.first(),
             Running::Typed { .. } => facts.background.first(),
@@ -504,9 +583,11 @@ done"#,
         let Some((pid, archive)) = line.split_once(' ') else { bail!(context()) };
         let pid: u32 = pid.parse().with_context(context)?;
         let foreground = foregrounds.get(&pid).copied().unwrap_or(-1);
-        let mut facts_about = ProcessFacts { children: vec![], background: vec![], archive: None };
+        let mut facts_about = ProcessFacts { children: vec![], background: vec![], waited_on: None, archive: None };
         for (group, name) in children.remove(&pid).unwrap_or_default() {
-            if group != foreground {
+            if group == foreground {
+                facts_about.waited_on = Some(group);
+            } else {
                 facts_about.background.push(name.clone());
             }
             facts_about.children.push(name);
@@ -818,11 +899,12 @@ pub(crate) mod tests {
     }
 
     /// Facts about a process with children in the `foreground` process
-    /// group and in `background` ones.
+    /// group (whose number doesn't matter here) and in `background` ones.
     fn facts(foreground: &[&str], background: &[&str], archive: Option<&str>) -> ProcessFacts {
         ProcessFacts {
             children: foreground.iter().chain(background).map(|&child| child.into()).collect(),
             background: background.iter().map(|&child| child.into()).collect(),
+            waited_on: None,
             archive: archive.map(String::from),
         }
     }
@@ -885,7 +967,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_what_a_shell_is_running() {
-        let running = |picked: &str| shell_running(&parse_records(picked).unwrap(), 4242, "zsh", "/pane").unwrap();
+        let running = |picked: &str| shell_running(&parse_records(picked).unwrap(), 4242, None, "zsh", "/pane").unwrap();
         // A command still running
         let typed = "{\"type\":\"command_start\",\"id\":\"s.1\",\"shell_pid\":4242,\"cwd\":\"/data\",\"command\":\"rsync -a /a /b\"}\n";
         assert_eq!(running(typed), (Running::Typed { command: "rsync -a /a /b".into() }, "/data".into()));
@@ -912,12 +994,66 @@ pub(crate) mod tests {
         assert_eq!(running(&hidden_job), job(vec![Some("sleep 9".into()), None]));
         // The wrong shell's archive
         let other = r#"{"type":"command_start","id":"s.1","shell_pid":1,"cwd":"/","command":"x"}"#;
-        assert!(shell_running(&parse_records(other).unwrap(), 4242, "zsh", "/pane").is_err());
+        assert!(shell_running(&parse_records(other).unwrap(), 4242, None, "zsh", "/pane").is_err());
         // A record of a known kind that doesn't parse, or a line that isn't
         // a record, even the first
         assert!(parse_records("{\"type\":\"session_start\"}\n{\"type\":\"command_start\",\"id\":\"s.1\"}").is_err());
         assert!(parse_records("\"type\":\"session_end\"}\n{\"type\":\"whatever\"}").is_err());
         assert!(parse_records("{\"type\":\"whatever\"}").is_ok());
+    }
+
+    #[test]
+    fn takes_a_job_brought_back_with_fg_for_its_line() {
+        // `sleep 600 | cat` (pids 500 and 501) typed in /data, stopped with
+        // Ctrl-Z
+        let stopped = [
+            r#"{"type":"command_start","id":"s.1","shell_pid":4242,"cwd":"/data","command":"sleep 600 | cat"}"#,
+            r#"{"type":"async_start","id":"s.1","job":1,"job_pids":"500,501","job_text":"sleep 600 | cat"}"#,
+            r#"{"type":"command_end","id":"s.1","status":148,"async_jobs":[1]}"#,
+        ]
+        .join("\n");
+        // ... then brought back by `line`, typed in /tmp
+        let after = |stopped: &str, line: &str| {
+            let start = serde_json::json!({"type": "command_start", "id": "s.2", "shell_pid": 4242, "cwd": "/tmp", "command": line});
+            format!("{stopped}\n{start}")
+        };
+        let running = |picked: &str, waited_on| shell_running(&parse_records(picked).unwrap(), 4242, waited_on, "sleep", "/pane").unwrap();
+        let typed = (Running::Typed { command: "sleep 600 | cat".into() }, "/data".to_string());
+        let job = (Running::Background { jobs: vec![Some("sleep 600 | cat".into())] }, "/pane".to_string());
+        for line in ["fg", "fg %1", "fg sleep", " %  ", "%sleep", "%?600"] {
+            assert_eq!(running(&after(&stopped, line), Some(500)), typed, "{line}");
+        }
+        assert_eq!(running(&after(&stopped.replace("148", "147"), "fg"), Some(500)), typed);
+        // Not while another group, or the shell, has the terminal
+        assert_eq!(running(&after(&stopped, "fg"), Some(501)), job);
+        assert_eq!(running(&after(&stopped, "fg"), None), job);
+        // Not when the line that brought it back does more, or might, or
+        // doesn't bring it back
+        for line in ["fg; make install", "fg && make install", "fg %1 %2", "f", "wait %1", "fg $(x)"] {
+            assert_eq!(running(&after(&stopped, line), Some(500)), job, "{line}");
+        }
+        assert_eq!(running(&after(&stopped, " fg").replace("\" fg\"", "null"), Some(500)), job);
+        // Not once that line has ended
+        assert_eq!(running(&format!("{}\n{{\"type\":\"command_end\",\"id\":\"s.2\",\"status\":0}}", after(&stopped, "fg")), Some(500)), job);
+        // Not a job put in the background with &, or one whose line went
+        // on after Ctrl-Z, or started another job too
+        assert_eq!(running(&after(&stopped.replace("148", "0"), "fg"), Some(500)), job);
+        assert_eq!(running(&after(&stopped.replace("[1]", "[1,2]"), "fg"), Some(500)), job);
+        // Not with another job that hasn't ended
+        let two = stopped.replace(
+            "\n{\"type\":\"command_end\"",
+            "\n{\"type\":\"async_start\",\"id\":\"s.1\",\"job\":2,\"job_pids\":\"600\",\"job_text\":\"sleep 9\"}\n{\"type\":\"command_end\"",
+        );
+        assert_eq!(running(&after(&two, "fg"), Some(500)), (Running::Background { jobs: vec![Some("sleep 600 | cat".into()), Some("sleep 9".into())] }, "/pane".into()));
+        // Its line hidden, or not among the records
+        let hidden = stopped.replace("\"sleep 600 | cat\"", "null");
+        assert_eq!(running(&after(&hidden, "fg"), Some(500)), (Running::Unknown { program: "sleep".into() }, "/pane".into()));
+        let unseen = stopped.split_once('\n').unwrap().1;
+        assert_eq!(running(&after(unseen, "fg"), Some(500)), (Running::Unknown { program: "sleep".into() }, "/pane".into()));
+        // A child of the shell outside the job's group (here, left by a job
+        // that zsh split) is a process that the archive doesn't account for
+        let facts = ProcessFacts { waited_on: Some(500), ..facts(&["sleep", "cat"], &["zsh"], Some(&after(&stopped, "fg"))) };
+        assert_eq!(pane_running(&line("sleep", ""), Some(&facts)).unwrap(), (Running::Unknown { program: "zsh".into() }, "/pane".into()));
     }
 
     /// The lines that [`PICK_RECORDS`], run by this machine's awk, prints

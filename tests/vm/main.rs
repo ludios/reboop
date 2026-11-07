@@ -968,11 +968,13 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let tmux_cmd = format!("tmux -S {TESTER_SOCKET}");
 
     // tester's server: session work with window 0 (a zsh pane in /var/tmp,
-    // then one in /home/tester), window 3, "jobs", started with sleep 600 in
-    // /tmp, and window 5 in a directory that'll be gone; and session other,
-    // with a background job, a line typed with a leading space, and a job
-    // that was disowned (which only shows as a child of the shell) with a
-    // resumable command in the foreground after it.
+    // whose command was stopped with Ctrl-Z and brought back with fg from
+    // /, then one in /home/tester), window 3, "jobs", started with sleep 600
+    // in /tmp, and window 5 in a directory that'll be gone; and session
+    // other, with a background job brought back with fg, a line typed with a
+    // leading space, and a job that was disowned (which only shows as a
+    // child of the shell) with a resumable command in the foreground after
+    // it.
     sh(&mut session, START_TMUX)?;
     tester_tmux(&mut session)?;
     sh(
@@ -984,19 +986,27 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
              {tmux_cmd} new-window -d -t other:1 -c /tmp && {tmux_cmd} new-window -d -t other:2 -c /tmp"
         ),
     )?;
+    let foreground = |session: &mut Session, target: &str| sh(session, &format!("{tmux_cmd} display -p -t {target} '#{{pane_current_command}}'"));
     type_into(&mut session, "work:0.0", "sleep 601")?;
+    wait_for(|| Ok(foreground(&mut session, "work:0.0")? == "sleep\n"))?;
+    sh(&mut session, &format!("{tmux_cmd} send-keys -t work:0.0 C-z"))?;
+    type_into(&mut session, "work:0.0", "cd /")?;
+    type_into(&mut session, "work:0.0", "fg")?;
     type_into(&mut session, "work:5.0", "sleep 604")?;
     type_into(&mut session, "other:0.0", "sleep 602 &")?;
+    type_into(&mut session, "other:0.0", "fg")?;
     type_into(&mut session, "other:1.0", " sleep 603")?;
     type_into(&mut session, "other:2.0", "sleep 605 & disown")?;
     type_into(&mut session, "other:2.0", "sleep 601")?;
-    // zsh-spy has written about each once its command is running.
+    // zsh-spy has written about each once its command is running (work:0.0
+    // reads as a job until fg runs).
     wait_for(|| {
         let server = tester_tmux(&mut session)?;
-        let foreground = sh(&mut session, &format!("{tmux_cmd} display -p -t other:2.0 '#{{pane_current_command}}'"))?;
-        Ok(matches!(pane(&server, "other:0.0")?.running, Running::Background { .. })
+        Ok(pane(&server, "work:0.0")?.running == Running::Typed { command: "sleep 601".into() }
+            && matches!(pane(&server, "other:0.0")?.running, Running::Background { .. })
             && matches!(pane(&server, "other:1.0")?.running, Running::Unknown { .. })
-            && foreground == "sleep\n")
+            && foreground(&mut session, "other:0.0")? == "sleep\n"
+            && foreground(&mut session, "other:2.0")? == "sleep\n")
     })?;
     let server = tester_tmux(&mut session)?;
     assert_eq!((server.user.as_str(), server.socket.as_str(), &server.error), ("tester", TESTER_SOCKET, &None));
