@@ -463,13 +463,9 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
         let not_recreated = |error: &anyhow::Error| format!("{}'s session {name} couldn't be recreated: {error:#}", server.user);
         if existing.as_ref().is_some_and(|names| names.contains(name)) {
             problems.push(format!("{}'s tmux at {socket} already has a session called {name}, which was left alone", server.user));
-            continue;
-        }
-        if let Some(first) = tmux_session.group.as_deref().and_then(|group| groups.get(group)) {
-            match run_tmux(session, socket, &format!("new-session -d -E -s {} -t {}", format_quote(name), shell_quote(&format!("={first}")))) {
-                Ok(_) => existing.get_or_insert_with(Vec::new).push(name.clone()),
-                Err(error) if is_failure(&error) => problems.push(not_recreated(&error)),
-                Err(error) => return Err(error),
+            // Its group's other sessions share its windows, still.
+            if let Some(group) = &tmux_session.group {
+                groups.entry(group).or_insert(name);
             }
             continue;
         }
@@ -481,6 +477,19 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             problems.push(not_recreated(&anyhow!("its window {} has no panes", first_window.index)));
             continue;
         };
+        if let Some(first) = tmux_session.group.as_deref().and_then(|group| groups.get(group)) {
+            // The group's windows are shared, but each session has its own
+            // active one.
+            let active = tmux_session.windows.iter().find(|window| window.active);
+            let select = active.map_or(String::new(), |window| format!(" \\; select-window -t {}", shell_quote(&format!("={name}:{}", window.index))));
+            let joined = format!("new-session -d -E -s {} -t {} -c {}{select}", format_quote(name), shell_quote(&format!("={first}")), format_quote(&first_pane.cwd));
+            match run_tmux(session, socket, &joined) {
+                Ok(_) => existing.get_or_insert_with(Vec::new).push(name.clone()),
+                Err(error) if is_failure(&error) => problems.push(not_recreated(&error)),
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
         let created = match &existing {
             // A server that doesn't start fails the whole server's restore,
             // rather than being tried again for each session.
