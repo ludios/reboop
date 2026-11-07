@@ -20,11 +20,24 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// How much of a command a [`Verdict`] shows.
 const COMMAND_SHOWN: usize = 100;
 
-/// How many records at the end of a zsh-spy archive are read: plenty for
-/// the last command line typed, which is what they're for.  (A background
-/// job whose start is further back shows up anyway, as a child of the
-/// shell.)
+/// How many records at the end of a zsh-spy archive are read, at least:
+/// enough for the background jobs of the last few commands.  (One whose
+/// start is further back shows up anyway, as a child of the shell outside
+/// its terminal's foreground process group.)  More are read if that's what
+/// it takes to reach the last command_start: see [`ARCHIVE_END`].
 const ARCHIVE_RECORDS: usize = 100;
+
+/// An awk program that prints the end of a zsh-spy archive: its last R
+/// lines, or if the last command_start is further back than that, every
+/// line from that one on, since that's what tells what the shell runs in
+/// the foreground.  (A builtin that has run for a while may have had
+/// records of many background jobs come after it.)
+const ARCHIVE_END: &str = r#"/"type":"command_start"/ { n = 0; seen = 1 }
+{ since[n++] = $0; last[NR % R] = $0 }
+END {
+    if (seen && n > R) for (i = 0; i < n; i++) print since[i]
+    else for (i = NR > R ? NR - R + 1 : 1; i <= NR; i++) print last[i % R]
+}"#;
 
 /// Regular expressions for the commands that may be resumed.  Each has to
 /// match a whole command line, like `grep -x`, so that "rsync .*" can't
@@ -378,8 +391,8 @@ struct ProcessFacts {
     /// The names of those that aren't in the foreground process group of
     /// its terminal, as a typed command is and a background job isn't
     background: Vec<String>,
-    /// The last [`ARCHIVE_RECORDS`] lines of its zsh-spy archive, if it's a
-    /// shell that has one
+    /// The end of its zsh-spy archive (see [`ARCHIVE_END`]), if it's a shell
+    /// that has one
     archive: Option<String>,
 }
 
@@ -436,7 +449,7 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
     for l in /proc/$p/fd/*; do
         case $(readlink "$l" 2>/dev/null) in
         */hist.*.jsonl)
-            t=$(tail -n {ARCHIVE_RECORDS} -- "$l") || exit 1
+            t=$(awk -v R={ARCHIVE_RECORDS} {} "$l") || exit 1
             a=$(printf %s "$t" | base64 -w0)
             break;;
         esac
@@ -444,7 +457,8 @@ fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u3
     t=$(ps -o tpgid= -p "$p" | tr -d ' ')
     printf '%s %s %s %s\n' "$p" "${{t:--1}}" "$(ps -o pgid=,comm= --ppid "$p" | base64 -w0)" "$a"
 done"#,
-        pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+        pids.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
+        shell_quote(ARCHIVE_END)
     );
     let output = session.run_ok(&script, QUICK)?;
     for line in output.lines() {
