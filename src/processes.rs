@@ -30,6 +30,10 @@ pub enum Activity {
     BtrfsSendReceive,
     /// Anything from opening a device to reencrypting it
     Cryptsetup,
+    /// Checking, repairing, making, resizing or partitioning a filesystem or
+    /// disk, or testing its blocks.  Interrupting some of these can leave a
+    /// filesystem or partition table broken.
+    DiskTool,
 }
 
 impl fmt::Display for Activity {
@@ -41,6 +45,7 @@ impl fmt::Display for Activity {
             Activity::Copy => "copy",
             Activity::BtrfsSendReceive => "btrfs-send-receive",
             Activity::Cryptsetup => "cryptsetup",
+            Activity::DiskTool => "disk-tool",
         })
     }
 }
@@ -73,6 +78,13 @@ const NIX_PROGRAMS: &[&str] = &[
 /// within one filesystem is a quick rename, but one to another filesystem
 /// copies.)
 const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv", "scp", "dd", "ddrescue", "pv"];
+
+/// Programs that check, repair, make, resize or partition a filesystem or
+/// disk, or test its blocks, besides the fsck.* and mkfs.* ones
+const DISK_TOOLS: &[&str] = &[
+    "fsck", "e2fsck", "btrfsck", "btrfs-convert", "mkfs", "mke2fs", "resize2fs", "badblocks",
+    "fdisk", "cfdisk", "sfdisk", "gdisk", "sgdisk", "parted",
+];
 
 fn parse_ps(output: &str) -> Result<Vec<Process>> {
     output
@@ -169,6 +181,7 @@ pub fn activity(process: &Process) -> Option<Activity> {
     let names = program_names(&process.args);
     let is = |name: &str| names.iter().any(|n| n == name);
     let is_any = |programs: &[&str]| names.iter().any(|n| programs.contains(&n.as_str()));
+    let btrfs = if is("btrfs") { btrfs_command(&process.args) } else { None };
     if is_any(NIX_PROGRAMS) {
         Some(Activity::Nix)
     } else if is("nix-daemon") && process.args.split_whitespace().any(|arg| arg == "--stdio") {
@@ -180,10 +193,12 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::Tmux)
     } else if is_any(COPY_PROGRAMS) || (is("rclone") && is_rclone_transfer(&process.args)) {
         Some(Activity::Copy)
-    } else if is("btrfs") && matches!(btrfs_command(&process.args), Some("send" | "receive")) {
+    } else if matches!(btrfs, Some("send" | "receive")) {
         Some(Activity::BtrfsSendReceive)
     } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
         Some(Activity::Cryptsetup)
+    } else if is_any(DISK_TOOLS) || names.iter().any(|n| n.starts_with("fsck.") || n.starts_with("mkfs.")) || matches!(btrfs, Some("check" | "rescue" | "restore")) {
+        Some(Activity::DiskTool)
     } else {
         None
     }
@@ -280,6 +295,20 @@ mod tests {
             assert_eq!(activity_of("root", args), Some(Activity::Cryptsetup), "{args}");
         }
         for args in [
+            "/nix/store/abc-util-linux-2.41.2-bin/bin/fsck -a /dev/sdb1",
+            "fsck.ext4 -f /dev/sdb1",
+            "mkfs.btrfs -d raid1 /dev/sdb /dev/sdc",
+            "resize2fs /dev/sdb1 100G",
+            "btrfs check --repair /dev/sdb",
+            "btrfs rescue zero-log /dev/sdb",
+            "btrfs rest /dev/sdb /mnt/rescued",
+            "badblocks -wsv /dev/sdb",
+            "sgdisk --zap-all /dev/sdb",
+            "parted /dev/sdb resizepart 2 100%",
+        ] {
+            assert_eq!(activity_of("root", args), Some(Activity::DiskTool), "{args}");
+        }
+        for args in [
             "man tmux",
             "less /var/log/rsync.log",
             "man cp",
@@ -295,6 +324,8 @@ mod tests {
             "btrfs s /snapshot",
             "btrfs re /backup",
             "systemd-cryptsetup attach data /dev/sdb",
+            "systemd-fsck /dev/sdb1",
+            "btrfs filesystem resize max /",
         ] {
             assert_eq!(activity_of("root", args), None, "{args}");
         }
