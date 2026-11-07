@@ -446,7 +446,7 @@ fn restore_panes(session: &mut Session, server: &Server, patterns: &CommandPatte
             // Pasted as typed (with bracketed paste, so a line break doesn't
             // run what's before it), then Enter
             Running::Typed { command } => format!(
-                "tmux -S {socket} set-buffer -b {BUFFER} -- {} && tmux -S {socket} paste-buffer -p -d -b {BUFFER} -t {pane_id} && tmux -S {socket} send-keys -t {pane_id} Enter",
+                "{BARE_TMUX} -S {socket} set-buffer -b {BUFFER} -- {} && {BARE_TMUX} -S {socket} paste-buffer -p -d -b {BUFFER} -t {pane_id} && {BARE_TMUX} -S {socket} send-keys -t {pane_id} Enter",
                 shell_quote(command)
             ),
             // Through tmux's own parser, which takes the quoting back
