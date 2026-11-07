@@ -3,6 +3,7 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use std::collections::BTreeMap;
+use unicode_width::UnicodeWidthStr;
 
 /// The units above bytes, each 1000 times the last.
 const UNITS: &[&str] = &["kB", "MB", "GB", "TB", "PB", "EB"];
@@ -123,9 +124,10 @@ impl Cell {
         self
     }
 
-    /// How many characters the text has.
-    fn chars(&self) -> usize {
-        self.spans.iter().map(|(_, text)| text.chars().count()).sum()
+    /// How many columns of a terminal the text takes: two for each wide
+    /// character, like 界, and none for a combining one.
+    fn width(&self) -> usize {
+        self.spans.iter().map(|(_, text)| text.width()).sum()
     }
 }
 
@@ -144,19 +146,19 @@ pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
 pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
     let columns = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == columns), "rows have different numbers of cells");
-    let widths: Vec<usize> = (0..columns).map(|i| rows.iter().map(|row| row[i].chars()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..columns).map(|i| rows.iter().map(|row| row[i].width()).max().unwrap_or(0)).collect();
     let mut text = String::new();
     for row in rows {
         let cells: Vec<String> = row
             .iter()
             .zip(&widths)
             .map(|(cell, &width)| {
-                // Padding counts chars, like the widths, and goes outside any
-                // escape sequences (none around empty text) so that
+                // Padding counts columns, like the widths, and goes outside
+                // any escape sequences (none around empty text) so that
                 // trim_end can remove it from the end of a row.
                 let paint = |(style, text): &(Style, String)| if color && !text.is_empty() { style.paint(text) } else { text.clone() };
                 let shown: String = cell.spans.iter().map(paint).collect();
-                let padding = width - cell.chars();
+                let padding = width - cell.width();
                 let before = match cell.align {
                     Align::Left   => 0,
                     Align::Right  => padding,
@@ -208,6 +210,9 @@ mod tests {
             vec![cell("1.5 kB/s", Align::Right), cell("0.5", Align::Right), cell("", Align::Right)],
         ];
         assert_eq!(table(&rows, false), "  net     load  x\n1.5 kB/s   0.5\n");
+        // Wide and combining characters are padded by the columns they take.
+        let rows = [vec![cell("/界界", Align::Left), cell("x", Align::Left)], vec![cell("/cafe\u{301}", Align::Left), cell("y", Align::Left)]];
+        assert_eq!(table(&rows, false), "/界界  x\n/cafe\u{301}  y\n");
     }
 
     #[test]
