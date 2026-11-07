@@ -61,7 +61,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - Is any btrfs balance or drive replace in progress?
     - Is switch-to-configuration or a nix build running?
     - Any tmux servers running (any user, not just root)?
-    - Is something copying files or disk images: rsync, cp, mv, scp, dd, ddrescue, pv, or rclone copy, copyto, copyurl, sync, move, moveto, bisync, rcat or archive?
+    - Is something copying files or disk images: rsync, cp, mv, scp, dd, ddrescue, pv, or rclone copy, copyto, copyurl, sync, move, moveto, bisync, cat, rcat or archive?
     - Is a btrfs send or receive running, or cryptsetup?
     - Is a disk tool running: fsck or fsck.*, e2fsck, btrfsck, btrfs check, rescue or restore, btrfs-convert, mkfs or mkfs.*, mke2fs, resize2fs, badblocks, or a partitioner (fdisk, cfdisk, sfdisk, gdisk, sgdisk or parted)?
     - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?

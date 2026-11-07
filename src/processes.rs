@@ -188,7 +188,7 @@ fn btrfs_command(args: &str) -> Option<&'static str> {
 /// one of these, which an option's value seldom is.  (A path after the
 /// subcommand can be, as in `rclone serve http copy`.)
 fn is_rclone_transfer(args: &str) -> bool {
-    const TRANSFERS: &[&str] = &["copy", "copyto", "copyurl", "sync", "move", "moveto", "bisync", "rcat", "archive"];
+    const TRANSFERS: &[&str] = &["copy", "copyto", "copyurl", "sync", "move", "moveto", "bisync", "cat", "rcat", "archive"];
     const LASTING: &[&str] = &["mount", "cmount", "nfsmount", "serve", "rcd"];
     let subcommand = args.split_whitespace().skip(1).find(|word| TRANSFERS.contains(word) || LASTING.contains(word));
     subcommand.is_some_and(|word| TRANSFERS.contains(&word))
@@ -300,6 +300,7 @@ mod tests {
             "pv nixos.iso",
             "rclone copy /data b2:backup --transfers 8",
             "rclone rcat remote:backup.tar",
+            "rclone cat remote:disk.img",
             "/nix/store/abc-rclone-1.71.2/bin/rclone --config /etc/rclone.conf sync -P /data remote:data",
         ] {
             assert_eq!(activity_of("root", args), Some(Activity::Copy), "{args}");
