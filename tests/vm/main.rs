@@ -1024,8 +1024,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert!(work.windows[0].active && work.windows[0].panes[0].active && !work.windows[0].panes[1].active, "{work:#?}");
 
     // What blocks a reboot: with tmux "block", the server; with "resume",
-    // the background job, the line typed with a leading space, and the
-    // disowned job.
+    // the job put in the background and brought back with fg, the line
+    // typed with a leading space, and the disowned job.
     let machine = vm_machine(vm);
     let resuming = resuming_machine(vm, &["sleep 60[14]", "\"sleep 600\""]);
     let facts = preflight::gather(&mut session, &machine.hostname)?;

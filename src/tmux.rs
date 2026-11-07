@@ -344,7 +344,9 @@ enum Record {
         id: String,
         /// The line's exit status
         status: Option<i64>,
-        /// The jobs that the line started, by number (usually)
+        /// The jobs that the line started, by their numbers in zsh's job
+        /// table, each a JSON number (or, for a key of zsh's that isn't a
+        /// number, a JSON string)
         async_jobs: Option<Vec<serde_json::Value>>,
     },
     AsyncStart {
@@ -576,9 +578,10 @@ fn pane_running(line: &PaneLine, facts: Option<&ProcessFacts>) -> Result<(Runnin
 }
 
 /// The [`ProcessFacts`] about each live pane's process among `lines`, by
-/// pid: its children, and the end of the zsh-spy archive (hist.*.jsonl)
-/// that it holds open, if any, read through its fd (so that one in another
-/// mount namespace is found).
+/// pid: its children, its terminal's foreground process group if that's
+/// theirs, and the records that [`PICK_RECORDS`] picks from the zsh-spy
+/// archive (hist.*.jsonl) that it holds open, if any, read through its fd
+/// (so that one in another mount namespace is found).
 fn process_facts(session: &mut Session, lines: &[PaneLine]) -> Result<HashMap<u32, ProcessFacts>> {
     // Once each: a window linked into several sessions lists its panes once per session.
     let pids: BTreeSet<u32> = lines.iter().filter(|line| !line.dead).map(|line| line.pid).collect();
