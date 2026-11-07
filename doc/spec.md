@@ -104,7 +104,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
 1. SSH in and:
 
-    `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have. Stop each one in the same `systemctl stop` (one transaction, with systemd 262 or later) as the units that trigger it (its `TriggeredBy=`, such as socket and timer units) and that aren't inactive or failed, so that they don't start it again.
+    `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have. Stop each one in the same `systemctl stop` (one transaction, with systemd 262 or later) as the units that trigger it (its `TriggeredBy=`, such as socket and timer units) and that aren't inactive or failed, so that they don't start it again. If stopping one fails, say which units it stopped are still stopped, and that the one that failed, and the units that trigger it, may be stopped as well, and leave it at that.
 
     Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which units it stopped are still stopped, and leave it at that.
 

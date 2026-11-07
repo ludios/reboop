@@ -880,8 +880,9 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_ne!(session.run(is_active, MINUTE)?.status, 0);
     clean_up(&mut session)?;
 
-    // Nor when systemctl fails to stop one of the stop_services, after which
-    // the ones before it, and the socket that triggers one, are left stopped.
+    // Nor when systemctl fails to stop one of the stop_services, which leaves
+    // stopped the stop_services listed before that one, and the socket that
+    // triggers one of them.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-activated --socket-property=ListenStream=/run/reboop-test-activated.sock \
                       --socket-property=RemoveOnStop=yes sleep 600 && systemctl start reboop-test-activated.service")?;
@@ -891,7 +892,9 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let mut printed = Vec::new();
     let error = bounce::bounce(&vm.ssh, &refusing, password, &mut Printer::new(&mut printed, false, None, None)).unwrap_err();
     let printed = String::from_utf8(printed)?;
-    assert!(format!("{error:#}").contains("systemctl stop reboop-test-refuse.service exited with status "), "{error:#}");
+    let failed = "couldn't finish stopping reboop-test-refuse.service (reboop-test-refuse.service, and the units that trigger it, may be stopped now): \
+                  systemctl stop reboop-test-refuse.service exited with status ";
+    assert!(format!("{error:#}").contains(failed), "{error:#}");
     let triggered = "\nStopped the units that trigger reboop-test-activated.service: reboop-test-activated.socket\n\
                      reboop-test-activated.service is stopped\n";
     assert!(printed.contains(triggered), "{printed}");

@@ -228,14 +228,19 @@ fn password_for_initrd(
 
 /// Stops `machine`'s stop_services in order, over `session`, along with the
 /// active units that trigger them (see [`reboot::stop_unit`]), adding
-/// each unit to `stopped` once it's stopped (leaving out services the
-/// machine doesn't have).  Fails, with the machine still up, if systemctl
-/// fails to stop one; `stopped` then has the units stopped before that.
-/// Returns the problems: services that systemd doesn't say stopped cleanly.
+/// each service, and the units that trigger it, to `stopped` once they're
+/// stopped (leaving out services the machine doesn't have).  Fails, with
+/// the machine still up, if stopping one fails; `stopped` then has the
+/// units stopped before that service, and the error says that that service,
+/// and the units that trigger it, may be stopped too.  Returns the problems:
+/// services that systemd doesn't say stopped cleanly.
 fn stop_services(machine: &Machine, session: &mut Session, stopped: &mut Vec<String>, printer: &mut Printer) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for service in &machine.stop_services {
-        let (outcome, triggers) = reboot::stop_unit(session, service, STOP_TIMEOUT)?;
+        // stop_unit can fail after systemctl has stopped some of the units
+        // or all of them, as when the connection breaks while it waits.
+        let failed = || format!("couldn't finish stopping {service} ({service}, and the units that trigger it, may be stopped now)");
+        let (outcome, triggers) = reboot::stop_unit(session, service, STOP_TIMEOUT).with_context(failed)?;
         if !triggers.is_empty() {
             let bold: Vec<String> = triggers.iter().map(|trigger| printer.bold(trigger)).collect();
             printer.line(&format!("Stopped the units that trigger {}: {}", printer.bold(service), bold.join(", ")));
@@ -321,9 +326,10 @@ fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &M
 /// which `luks` is for), and saves what's in its tmux servers (see
 /// [`save_for_resume`]), telling the user.  Returns the facts and the
 /// problems so far (services that didn't stop cleanly) if so; or else the
-/// reasons not to.  Whenever it doesn't return the facts (it found reasons
-/// not to, or it failed, even partway through stopping the services), it
-/// leaves the units that it stopped stopped, and lists them.
+/// reasons not to.  Whenever this function doesn't return the facts (on
+/// returning reasons not to, or an error, even one from partway through
+/// stopping the services), it lists the units that [`stop_services`]
+/// stopped, which it leaves stopped.
 fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Checked<(Facts, Vec<String>)>> {
     let hostname = &machine.hostname;
     let mut stopped = Vec::new();
@@ -622,10 +628,10 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 /// it's okay to reboot; says whether a nixos-rebuild would change it (if its
 /// check_rebuild is on), warning if so or if that couldn't be evaluated; if
 /// it has a LUKS device beneath /, gets the password from `password` and
-/// tests it; stops its stop_services; checks again, apart from load and
-/// network traffic (leaving the stop_services stopped if it's no longer
-/// okay); saves what's in its tmux servers (see [`save_for_resume`]);
-/// reboots it; answers its initrd's password prompt; waits for it to come
+/// tests it; stops its stop_services, checks again, apart from load and
+/// network traffic, and saves what's in its tmux servers (see
+/// [`stop_and_check_again`], which lists the units that it leaves stopped
+/// if it goes no further); reboots it; answers its initrd's password prompt; waits for it to come
 /// back; shows how it did; brings tmux back; and scrubs its scrub_mounts,
 /// unless a scrub found them clean lately (see [`come_back`]).
 /// Problems along the way are collected for the end.
@@ -709,10 +715,10 @@ fn wait_for_down(ssh: &Ssh, machine: &Machine, deadline: Deadline, on_retry: imp
 }
 
 /// Shuts `machine` down, telling the user about it with `printer`: checks
-/// that it's okay to shut down; stops its stop_services; checks again, apart
-/// from load and network traffic (leaving the stop_services stopped if it's
-/// no longer okay); saves what's in its tmux servers (see
-/// [`save_for_resume`]) for `reboop catch` to bring back; powers it off;
+/// that it's okay to shut down; stops its stop_services, checks again, apart
+/// from load and network traffic, and saves what's in its tmux servers for
+/// `reboop catch` to bring back (see [`stop_and_check_again`], which lists
+/// the units that it leaves stopped if it goes no further); powers it off;
 /// and waits for it to stop accepting SSH, which is as much of its going
 /// down as can be seen.  Problems along the way are collected for the end.
 ///
