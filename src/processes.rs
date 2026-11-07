@@ -164,8 +164,9 @@ fn btrfs_command(args: &str) -> Option<&'static str> {
     let mut words = args.split_whitespace().skip(1);
     while let Some(word) = words.next() {
         match word {
-            // Global options that take a value
-            "--format" | "--log" => {
+            // A global option that takes a value, maybe abbreviated, as
+            // getopt_long allows
+            _ if word.len() > 2 && ["--format", "--log", "--param"].iter().any(|option| option.starts_with(word)) => {
                 words.next();
             }
             _ if word.starts_with('-') => {}
@@ -252,6 +253,8 @@ mod tests {
         }
         assert_eq!(btrfs_command("btrfs -q c /dev/sdb"), Some("check"));
         assert_eq!(btrfs_command("btrfs --log debug resc zero-log /dev/sdb"), Some("rescue"));
+        assert_eq!(btrfs_command("btrfs --param foo=bar check /dev/sdb"), Some("check"));
+        assert_eq!(btrfs_command("btrfs --lo debug --form text receive /backup"), Some("receive"));
         assert_eq!(btrfs_command("btrfs res /dev/sdb /mnt"), None);
         assert_eq!(btrfs_command("btrfs frobnicate"), None);
         assert_eq!(btrfs_command("btrfs --version"), None);
