@@ -1029,9 +1029,17 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     resume::list(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
     let printed = String::from_utf8(printed)?;
     print!("{printed}");
-    let listing = format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 7 panes\n    other:0.0 in /tmp: a background job is still running: sleep 602\n", server.pid);
-    assert!(printed.contains(&listing), "{printed}");
-    assert!(printed.contains("\n    work:0.0 in /var/tmp: sleep 601 (resumable)\n    work:0.1 in /home/tester: idle\n    work:3.0 in /tmp: \"sleep 600\" (resumable)\n"), "{printed}");
+    let listing = [
+        format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 7 panes", server.pid),
+        "not resumable  other:0.0  /tmp                       a background job is still running: sleep 602".into(),
+        "not resumable  other:1.0  /tmp                       running sleep, but what was typed to start it is unknown".into(),
+        "not resumable  other:2.0  /tmp                       running sleep, but what was typed to start it is unknown".into(),
+        "    resumable  work:0.0   /var/tmp                   sleep 601".into(),
+        "         idle  work:0.1   /home/tester".into(),
+        "    resumable  work:3.0   /tmp                       \"sleep 600\"".into(),
+        "    resumable  work:5.0   /var/tmp/reboop-test-gone  sleep 604".into(),
+    ];
+    assert!(printed.contains(&(listing.join("\n") + "\n")), "{printed}");
     let saved = sh(&mut session, &format!("ls {}", resume::DIR))?;
     assert!(saved.lines().count() == 1 && saved.ends_with(".check.json\n"), "{saved}");
 

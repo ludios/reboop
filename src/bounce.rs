@@ -56,7 +56,7 @@ pub struct Printer<'a> {
     out: &'a mut dyn Write,
     /// Whether to show problems in red, values in bold, and timestamps
     /// dimmed.
-    color: bool,
+    pub(crate) color: bool,
     /// If progress is shown by rewriting the last line (which takes a
     /// terminal), gives the terminal's width, which can change.
     columns: Option<fn() -> usize>,

@@ -8,7 +8,7 @@
 //! going down.
 
 use crate::config::TmuxPolicy;
-use crate::human;
+use crate::human::{self, Align, Cell, Style};
 use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
@@ -16,7 +16,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
 
 /// How much of a command a [`Verdict`] shows.
 const COMMAND_SHOWN: usize = 100;
@@ -587,16 +586,6 @@ pub enum Verdict {
     Block(String),
 }
 
-impl fmt::Display for Verdict {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Verdict::Idle => f.write_str("idle"),
-            Verdict::Resume(command) => write!(f, "{command} (resumable)"),
-            Verdict::Block(why) => f.write_str(why),
-        }
-    }
-}
-
 /// What's to become of `pane`, given the commands that `patterns` allow.
 pub fn verdict(pane: &Pane, patterns: &CommandPatterns) -> Verdict {
     match &pane.running {
@@ -643,24 +632,39 @@ pub fn blockers(policy: TmuxPolicy, patterns: &CommandPatterns, servers: &[Serve
     blockers
 }
 
-/// What's in `server`, for people: a line about the server, then one per
-/// pane (indented) with its location, directory and [`Verdict`].  With
-/// `policy` block, the server's line says that it blocks.
-pub fn lines(server: &Server, policy: TmuxPolicy, patterns: &CommandPatterns) -> Vec<String> {
+/// The table row about `pane`, at `location`: what's to become of it (see
+/// [`Verdict`]): "idle" dim, "resumable" green or "not resumable" red, flush
+/// right; then its location, its directory, and the command to run again
+/// or why it can't be resumed.
+fn row(location: String, pane: &Pane, patterns: &CommandPatterns) -> Vec<Cell> {
+    let (fate, text) = match verdict(pane, patterns) {
+        Verdict::Idle            => (Style::Dim.cell("idle"),           String::new()),
+        Verdict::Resume(command) => (Style::Green.cell("resumable"),    command),
+        Verdict::Block(why)      => (Style::Red.cell("not resumable"), why),
+    };
+    vec![fate.aligned(Align::Right), Style::Plain.cell(location), Style::Plain.cell(pane.cwd.clone()), Style::Plain.cell(text)]
+}
+
+/// What's in `server`, for people, styled if `color`: a line about the
+/// server, then a table with a [`row`] per pane.  With `policy` block, the
+/// server's line says that it blocks.
+pub fn listing(server: &Server, policy: TmuxPolicy, patterns: &CommandPatterns, color: bool) -> String {
     let at = if server.socket.is_empty() { String::new() } else { format!(" at {}", server.socket) };
-    let mut lines = vec![format!("{}'s tmux server{at} (pid {})", server.user, server.pid)];
+    let mut text = format!("{}'s tmux server{at} (pid {})", server.user, server.pid);
     if let Some(error) = &server.error {
-        lines[0].push_str(&format!(": couldn't be listed: {error}"));
-        return lines;
+        text.push_str(&format!(": couldn't be listed: {error}"));
+        return text;
     }
-    lines[0].push_str(&format!(": {}", server.counts()));
+    text.push_str(&format!(": {}", server.counts()));
     if policy == TmuxPolicy::Block {
-        lines[0].push_str(" (tmux is \"block\", so the server blocks a reboot)");
+        text.push_str(" (tmux is \"block\", so the server blocks a reboot)");
     }
-    for (location, pane) in server.panes() {
-        lines.push(format!("    {location} in {}: {}", pane.cwd, verdict(pane, patterns)));
+    let rows: Vec<Vec<Cell>> = server.panes().map(|(location, pane)| row(location, pane, patterns)).collect();
+    if !rows.is_empty() {
+        text.push('\n');
+        text.push_str(human::table(&rows, color).trim_end_matches('\n'));
     }
-    lines
+    text
 }
 
 #[cfg(test)]
@@ -889,17 +893,22 @@ pub(crate) mod tests {
         let patterns = patterns(&["rsync .*"]);
         let server = test_server();
         assert_eq!(
-            lines(&server, TmuxPolicy::Resume, &patterns),
+            listing(&server, TmuxPolicy::Resume, &patterns, false),
             [
                 "at's tmux server at /tmp/tmux-1000/default (pid 1234): 1 session and 3 panes",
-                "    work:0.0 in /home/at: idle",
-                "    work:0.1 in /data: rsync -a /data/ /backup/ (resumable)",
-                "    work:3.0 in /home/at: htop (doesn't match resumable_commands)",
+                "         idle  work:0.0  /home/at",
+                "    resumable  work:0.1  /data     rsync -a /data/ /backup/",
+                "not resumable  work:3.0  /home/at  htop (doesn't match resumable_commands)",
             ]
+            .join("\n")
         );
-        assert_eq!(lines(&server, TmuxPolicy::Block, &patterns)[0], "at's tmux server at /tmp/tmux-1000/default (pid 1234): 1 session and 3 panes (tmux is \"block\", so the server blocks a reboot)");
+        let colored = listing(&server, TmuxPolicy::Resume, &patterns, true);
+        assert!(colored.contains("\n         \x1b[2midle\x1b[0m  work:0.0") && colored.contains("\n    \x1b[32mresumable\x1b[0m  ") && colored.contains("\n\x1b[31mnot resumable\x1b[0m  "), "{colored}");
+        assert!(listing(&server, TmuxPolicy::Block, &patterns, false).starts_with("at's tmux server at /tmp/tmux-1000/default (pid 1234): 1 session and 3 panes (tmux is \"block\", so the server blocks a reboot)\n"));
+        let empty = Server { sessions: vec![], ..server.clone() };
+        assert_eq!(listing(&empty, TmuxPolicy::Resume, &patterns, false), "at's tmux server at /tmp/tmux-1000/default (pid 1234): 0 sessions and 0 panes");
         let unlisted = Server { sessions: vec![], error: Some("no such file".into()), ..server };
-        assert_eq!(lines(&unlisted, TmuxPolicy::Resume, &patterns), ["at's tmux server at /tmp/tmux-1000/default (pid 1234): couldn't be listed: no such file"]);
+        assert_eq!(listing(&unlisted, TmuxPolicy::Resume, &patterns, false), "at's tmux server at /tmp/tmux-1000/default (pid 1234): couldn't be listed: no such file");
     }
 
     #[test]

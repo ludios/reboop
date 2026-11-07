@@ -591,7 +591,7 @@ fn open(ssh: &Ssh, machine: &Machine) -> Result<Session> {
 
 /// Lists what's in `machine`'s tmux servers (or in the capture `saved` on
 /// it, if given: see [`saved_path`]), telling the user: see
-/// [`tmux::lines`].  A look at the servers is saved on the machine.
+/// [`tmux::listing`].  A look at the servers is saved on the machine.
 pub fn list(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Printer) -> Result<()> {
     let mut session = open(ssh, machine)?;
     let capture = match saved {
@@ -611,7 +611,7 @@ pub fn list(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Pri
         }
     };
     for server in &capture.servers {
-        printer.line(&tmux::lines(server, machine.tmux, &machine.resumable_commands).join("\n"));
+        printer.line(&tmux::listing(server, machine.tmux, &machine.resumable_commands, printer.color));
     }
     Ok(())
 }

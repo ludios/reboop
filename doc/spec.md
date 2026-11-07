@@ -188,7 +188,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
 ## Tmux
 
-`reboop tmux list HOSTNAME` lists what Preflight finds in the machine's tmux servers (saving it as a check does): a line per server, then one per pane with its location (`SESSION:WINDOW.PANE`), directory, and what it runs, shortened to a line, as "idle", "COMMAND (resumable)", or why it would keep the machine from going down. Resumable means by the machine's `resumable_commands`; with `tmux` `block`, the server's line says that it blocks a reboot all the same.
+`reboop tmux list HOSTNAME` lists what Preflight finds in the machine's tmux servers (saving it as a check does): a line per server, then a table with a row per pane: "idle", "resumable" or "not resumable" (dim, green or red), its location (`SESSION:WINDOW.PANE`), its directory, and the command to run again (shortened to a line) or why it would keep the machine from going down. Resumable means by the machine's `resumable_commands`; with `tmux` `block`, the server's line says that it blocks a reboot all the same.
 
 `reboop tmux stop HOSTNAME` refuses if a pane runs something that isn't resumable or a server can't be listed, whatever the machine's `tmux` setting (exit status 2); otherwise saves what's in the servers as `TIME.tmux-stop.json`, points `pending` at it, says what will be run again, and kills each server (`tmux -S SOCKET kill-server`, which hangs up on the panes' processes; one that ignores SIGHUP keeps running), waiting for it to exit. For stopping and starting the servers without a reboot, e.g. around upgrading tmux. (A command typed into a pane after the capture is lost, as a reboot would lose it.)
 
