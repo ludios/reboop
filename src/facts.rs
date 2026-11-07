@@ -489,13 +489,14 @@ pub fn jobs(session: &mut Session) -> Result<Vec<Job>> {
     parse_jobs(&session.run_ok("systemctl list-jobs --no-legend --no-pager", QUICK)?)
 }
 
-/// Which of `jobs` are running, and how many are waiting for others, e.g.
-/// "running jobs: start nginx.service, start var.mount; waiting jobs: 14".
+/// How many of `jobs` are waiting to run, and which are running, e.g.
+/// "waiting jobs: 14; running jobs: start nginx.service, start var.mount".
+/// (The count comes first so that cutting the text short keeps it.)
 pub fn jobs_summary(jobs: &[Job]) -> String {
     let running: Vec<_> = jobs.iter().filter(|job| job.state == "running").map(Job::to_string).collect();
     let waiting = jobs.len() - running.len();
     let running = if running.is_empty() { "none".to_string() } else { running.join(", ") };
-    format!("running jobs: {running}; waiting jobs: {waiting}")
+    format!("waiting jobs: {waiting}; running jobs: {running}")
 }
 
 /// Whether systemd's `state` (see [`system_state`]) means that the machine
@@ -605,9 +606,9 @@ mod tests {
     fn summarizes_jobs() {
         let job = |unit: &str, job_type: &str, state: &str| Job { id: 1, unit: unit.into(), job_type: job_type.into(), state: state.into() };
         let jobs = [job("multi-user.target", "start", "waiting"), job("nginx.service", "start", "running"), job("var.mount", "stop", "running")];
-        assert_eq!(jobs_summary(&jobs), "running jobs: start nginx.service, stop var.mount; waiting jobs: 1");
-        assert_eq!(jobs_summary(&jobs[..1]), "running jobs: none; waiting jobs: 1");
-        assert_eq!(jobs_summary(&[]), "running jobs: none; waiting jobs: 0");
+        assert_eq!(jobs_summary(&jobs), "waiting jobs: 1; running jobs: start nginx.service, stop var.mount");
+        assert_eq!(jobs_summary(&jobs[..1]), "waiting jobs: 1; running jobs: none");
+        assert_eq!(jobs_summary(&[]), "waiting jobs: 0; running jobs: none");
     }
 
     #[test]

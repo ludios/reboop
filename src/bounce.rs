@@ -903,7 +903,7 @@ mod tests {
         ];
         assert_eq!(
             postflight_problems(&systems, "starting", &jobs, &[]),
-            ["systemd says the system is starting, with running jobs: start acme-order-renew-example.com.service; waiting jobs: 1"]
+            ["systemd says the system is starting, with waiting jobs: 1; running jobs: start acme-order-renew-example.com.service"]
         );
         // Jobs while it's running, like a timer's, aren't a problem.
         assert_eq!(postflight_problems(&systems, "running", &jobs, &[]), Vec::<String>::new());
