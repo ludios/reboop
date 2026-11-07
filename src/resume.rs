@@ -329,6 +329,8 @@ enum NotReady {
     /// The pane's directory is on the filesystem mounted here, not where it
     /// was.
     OtherMount(String),
+    /// Checking on it went wrong like this.
+    Unchecked(String),
 }
 
 /// Checks that the process in pane `pane_id` is in `pane`'s directory (by
@@ -346,6 +348,7 @@ pid=$1 tty=$2
 if [ {} = 1 ]; then
     i=0
     until [ "$(ps -o tpgid= -p $pid | tr -d ' ')" = "$pid" ] && stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do
+        [ -d /proc/$pid ] || exit 1
         i=$((i + 1)); [ $i -ge {} ] && exit 2; sleep 0.1
     done
 fi
@@ -366,7 +369,7 @@ m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
         2 => Err(NotReady::NoPrompt),
         3 => Err(NotReady::Elsewhere(output.stdout_text())),
         4 => Err(NotReady::OtherMount(output.stdout_text())),
-        status => return Err(Failed(format!("checking on pane {pane_id} exited with status {status}: {}", output.stderr_text())).into()),
+        status => Err(NotReady::Unchecked(format!("checking on it exited with status {status}: {}", output.stderr_text()))),
     })
 }
 
@@ -399,24 +402,15 @@ fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, w
             None => format!("{where_}: {why}"),
         };
         let typed = matches!(pane.running, Running::Typed { .. });
-        match check_pane(session, &server.socket, pane_id, pane, command.is_some() && typed)? {
-            Ok(()) => {}
-            Err(NotReady::Gone) => {
-                problems.push(problem("the pane was gone right after it was made".into()));
-                continue;
-            }
-            Err(NotReady::NoPrompt) => {
-                problems.push(problem(format!("its shell didn't reach its prompt within {}s", PROMPT_TIMEOUT.as_secs())));
-                continue;
-            }
-            Err(NotReady::Elsewhere(cwd)) => {
-                problems.push(problem(format!("its shell is in {cwd:?} (does {} exist?)", pane.cwd)));
-                continue;
-            }
-            Err(NotReady::OtherMount(mountpoint)) => {
-                problems.push(problem(format!("{} is on the filesystem mounted at {mountpoint:?}, not {:?} as before", pane.cwd, pane.mountpoint)));
-                continue;
-            }
+        if let Err(not_ready) = check_pane(session, &server.socket, pane_id, pane, command.is_some() && typed)? {
+            problems.push(problem(match not_ready {
+                NotReady::Gone => "the pane was gone right after it was made".into(),
+                NotReady::NoPrompt => format!("its shell didn't reach its prompt within {}s", PROMPT_TIMEOUT.as_secs()),
+                NotReady::Elsewhere(cwd) => format!("its shell is in {cwd:?} (does {} exist?)", pane.cwd),
+                NotReady::OtherMount(mountpoint) => format!("{} is on the filesystem mounted at {mountpoint:?}, not {:?} as before", pane.cwd, pane.mountpoint),
+                NotReady::Unchecked(why) => why,
+            }));
+            continue;
         }
         let Some(command) = &command else {
             if let Verdict::Block(why) = verdict {
@@ -452,9 +446,10 @@ fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, w
 
 /// Brings back `server`'s sessions (into the server at its socket if one's
 /// running, else into one started for it), running their commands again
-/// where `patterns` allow, telling the user.  Returns the problems.
-fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatterns, printer: &mut Printer) -> Result<Vec<String>> {
-    let mut problems = Vec::new();
+/// where `patterns` allow, telling the user, and adding the problems to
+/// `problems`: those found before a failure that ends the server's restore
+/// too.
+fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatterns, problems: &mut Vec<String>, printer: &mut Printer) -> Result<()> {
     let socket = &server.socket;
     // The sessions already there, if a server's running at the socket
     let mut existing = match run_tmux(session, socket, "list-sessions -F '#{session_name}'") {
@@ -462,19 +457,22 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
         Err(error) if is_failure(&error) => None,
         Err(error) => return Err(error),
     };
-    // The first session brought back of each session group, whose windows
-    // the group's others share
+    // The session of each session group whose windows the group's others
+    // are to share: one that's there already, or else the first brought back
     let mut groups: HashMap<&str, &str> = HashMap::new();
+    for tmux_session in &server.sessions {
+        if let Some(group) = &tmux_session.group
+            && existing.as_ref().is_some_and(|names| names.contains(&tmux_session.name))
+        {
+            groups.entry(group).or_insert(&tmux_session.name);
+        }
+    }
     let mut restoring = Restoring { server, patterns, resumed: HashSet::new() };
     for tmux_session in &server.sessions {
         let name = &tmux_session.name;
         let not_recreated = |error: &anyhow::Error| format!("{}'s session {name} couldn't be recreated: {error:#}", server.user);
         if existing.as_ref().is_some_and(|names| names.contains(name)) {
             problems.push(format!("{}'s tmux at {socket} already has a session called {name}, which was left alone", server.user));
-            // Its group's other sessions share its windows, still.
-            if let Some(group) = &tmux_session.group {
-                groups.entry(group).or_insert(name);
-            }
             continue;
         }
         let Some(first_window) = tmux_session.windows.first() else {
@@ -539,7 +537,7 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             problems.extend(restore_panes(session, &mut restoring, name, window, &pane_ids, printer)?);
         }
     }
-    Ok(problems)
+    Ok(())
 }
 
 /// Brings back what `capture` describes, running the commands that
@@ -562,8 +560,8 @@ pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatte
             continue;
         }
         printer.line(&format!("Bringing back {}'s tmux server at {}: {}", server.user, server.socket, server.counts()));
-        match restore_server(session, server, patterns, printer) {
-            Ok(found) => problems.extend(found),
+        match restore_server(session, server, patterns, &mut problems, printer) {
+            Ok(()) => {}
             Err(error) if is_failure(&error) => {
                 let problem = format!("{} couldn't be brought back: {error:#}", server.name());
                 printer.styled_line(Red, &problem);
