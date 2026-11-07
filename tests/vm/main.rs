@@ -885,7 +885,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-activated --socket-property=ListenStream=/run/reboop-test-activated.sock \
                       --socket-property=RemoveOnStop=yes sleep 600 && systemctl start reboop-test-activated.service")?;
-    sh(&mut session, "systemd-run --quiet --unit=reboop-test-refuse -p RefuseManualStop=yes -p CollectMode=inactive-or-failed sleep 600")?;
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-refuse -p RefuseManualStop=yes sleep 600")?;
     let stop_services = ["reboop-test-sleep.service", "reboop-test-activated.service", "reboop-test-refuse.service"];
     let refusing = Machine { stop_services: stop_services.map(String::from).to_vec(), ..vm_machine(vm) };
     let mut printed = Vec::new();
@@ -901,7 +901,6 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert!(printed.contains(&still_stopped), "{printed}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
     assert_ne!(session.run(is_active, MINUTE)?.status, 0);
-    sh(&mut session, "systemctl kill reboop-test-refuse.service")?;
     clean_up(&mut session)?;
 
     let before = facts::systems(&mut session)?;
