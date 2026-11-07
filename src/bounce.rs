@@ -54,8 +54,8 @@ const SCRUB_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// closed stdout is no reason to leave a machine half-bounced.
 pub struct Printer<'a> {
     out: &'a mut dyn Write,
-    /// Whether to show problems in red, values in bold, and timestamps
-    /// dimmed.
+    /// Whether to style the output: problems in red, values in bold,
+    /// timestamps dimmed, and tables' cells in their own styles.
     pub(crate) color: bool,
     /// If progress is shown by rewriting the last line (which takes a
     /// terminal), gives the terminal's width, which can change.

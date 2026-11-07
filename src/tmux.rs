@@ -632,22 +632,24 @@ pub fn blockers(policy: TmuxPolicy, patterns: &CommandPatterns, servers: &[Serve
     blockers
 }
 
-/// The table row about `pane`, at `location`: what's to become of it (see
-/// [`Verdict`]): "idle" dim, "resumable" green or "not resumable" red, flush
-/// right; then its location, its directory, and the command to run again
-/// or why it can't be resumed.
+/// The row about `pane`, at `location`, in [`listing`]'s table, with
+/// `patterns` (the machine's resumable_commands) deciding its fate.
 fn row(location: String, pane: &Pane, patterns: &CommandPatterns) -> Vec<Cell> {
     let (fate, text) = match verdict(pane, patterns) {
-        Verdict::Idle            => (Style::Dim.cell("idle"),           String::new()),
-        Verdict::Resume(command) => (Style::Green.cell("resumable"),    command),
+        Verdict::Idle            => (Style::Dim.cell("idle"),          String::new()),
+        Verdict::Resume(command) => (Style::Green.cell("resumable"),   command),
         Verdict::Block(why)      => (Style::Red.cell("not resumable"), why),
     };
     vec![fate.aligned(Align::Right), Style::Plain.cell(location), Style::Plain.cell(pane.cwd.clone()), Style::Plain.cell(text)]
 }
 
-/// What's in `server`, for people, styled if `color`: a line about the
-/// server, then a table with a [`row`] per pane.  With `policy` block, the
-/// server's line says that it blocks.
+/// What's in `server`, for people: a line about the server (saying that it
+/// blocks a reboot, if `policy` is block), then a table with a row per
+/// pane, which has "idle", "resumable" or "not resumable" (as [`verdict`]
+/// tells, given the commands that `patterns` allow), flush right; the
+/// pane's location; the pane's directory; and either the command to run
+/// again, why the pane can't be resumed, or (for an idle pane) nothing.  If
+/// `color`, the three fates are dim, green and red respectively.
 pub fn listing(server: &Server, policy: TmuxPolicy, patterns: &CommandPatterns, color: bool) -> String {
     let at = if server.socket.is_empty() { String::new() } else { format!(" at {}", server.socket) };
     let mut text = format!("{}'s tmux server{at} (pid {})", server.user, server.pid);
