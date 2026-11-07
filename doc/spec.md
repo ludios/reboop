@@ -63,7 +63,7 @@ use that master key with XChaCha20-Poly1305 to encrypt / decrypt files storing L
     - Any tmux servers running (any user, not just root)?
     - Is something copying files or disk images: rsync, cp, mv, scp, dd, ddrescue, pv, or rclone copy, copyto, copyurl, sync, move, moveto, bisync, cat, rcat or archive?
     - Is a btrfs send or receive running, or cryptsetup?
-    - Is a disk tool running: fsck or fsck.*, e2fsck, btrfsck, btrfs check, rescue or restore, btrfs-convert, mkfs or mkfs.*, mke2fs, resize2fs, badblocks, or a partitioner (fdisk, cfdisk, sfdisk, gdisk, sgdisk or parted)?
+    - Is a disk tool running: fsck or fsck.*, e2fsck, btrfsck, xfs_repair, btrfs check, rescue or restore, btrfs-convert, btrfstune, mkfs or mkfs.*, mke2fs, resize2fs, badblocks, or a partitioner (fdisk, cfdisk, sfdisk, gdisk, sgdisk or parted)?
     - Is any btrfs device missing, or have its error counters (sysfs devinfo/*/error_stats) gone above zero?
     - If the machine has smartctl: what SMART says about each whole disk beneath the btrfs filesystems' devices (`lsblk --inverse` from sysfs' devices/*, then `smartctl -n standby -H -A` on all the disks at once, each with a timeout, leaving any in standby asleep, as spinning up can take a minute, and likewise any whose power mode smartctl can't read, which it takes to be asleep): its overall health, and the counts of sectors gone bad (ATA attributes 5, 187, 197 and 198 when their names say so, as vendors put other counters there too; for NVMe, the critical warning except its temperature bit, and the media errors). Whatever smartctl could read counts, and what it couldn't is noted.
     - Inhibitor locks (logind's ListInhibitors)

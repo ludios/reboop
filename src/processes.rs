@@ -30,9 +30,10 @@ pub enum Activity {
     BtrfsSendReceive,
     /// Anything from opening a device to reencrypting it
     Cryptsetup,
-    /// Checking, repairing, making, resizing or partitioning a filesystem or
-    /// disk, or testing its blocks.  Interrupting some of these can leave a
-    /// filesystem or partition table broken.
+    /// Checking, repairing, making, converting, tuning, resizing or
+    /// partitioning a filesystem or disk, recovering files from a broken
+    /// filesystem, or testing a disk's blocks.  Interrupting some of these
+    /// can leave a filesystem or partition table broken.
     DiskTool,
 }
 
@@ -79,12 +80,20 @@ const NIX_PROGRAMS: &[&str] = &[
 /// copies.)
 const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv", "scp", "dd", "ddrescue", "pv"];
 
-/// Programs that check, repair, make, resize or partition a filesystem or
-/// disk, or test its blocks, besides the fsck.* and mkfs.* ones
+/// Programs that check, repair, make, convert, tune, resize or partition a
+/// filesystem or disk, or test a disk's blocks, besides the fsck.* and
+/// mkfs.* ones (see [`is_disk_tool`])
 const DISK_TOOLS: &[&str] = &[
-    "fsck", "e2fsck", "btrfsck", "btrfs-convert", "mkfs", "mke2fs", "resize2fs", "badblocks",
+    "fsck", "e2fsck", "btrfsck", "xfs_repair", "btrfs-convert", "btrfstune",
+    "mkfs", "mke2fs", "resize2fs", "badblocks",
     "fdisk", "cfdisk", "sfdisk", "gdisk", "sgdisk", "parted",
 ];
+
+/// Whether the program `name` (from [`program_name`]) is one of the
+/// [`DISK_TOOLS`], or an fsck.* or mkfs.* one
+fn is_disk_tool(name: &str) -> bool {
+    DISK_TOOLS.contains(&name) || name.starts_with("fsck.") || name.starts_with("mkfs.")
+}
 
 fn parse_ps(output: &str) -> Result<Vec<Process>> {
     output
@@ -219,7 +228,7 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::BtrfsSendReceive)
     } else if is("cryptsetup") || is("cryptsetup-reencrypt") {
         Some(Activity::Cryptsetup)
-    } else if is_any(DISK_TOOLS) || names.iter().any(|n| n.starts_with("fsck.") || n.starts_with("mkfs.")) || matches!(btrfs, Some("check" | "rescue" | "restore")) {
+    } else if names.iter().any(|n| is_disk_tool(n)) || matches!(btrfs, Some("check" | "rescue" | "restore")) {
         Some(Activity::DiskTool)
     } else {
         None
@@ -328,6 +337,8 @@ mod tests {
             "btrfs rescue zero-log /dev/sdb",
             "btrfs rest /dev/sdb /mnt/rescued",
             "badblocks -wsv /dev/sdb",
+            "xfs_repair /dev/sdb1",
+            "btrfstune --convert-to-block-group-tree /dev/sdb",
             "sgdisk --zap-all /dev/sdb",
             "parted /dev/sdb resizepart 2 100%",
         ] {
