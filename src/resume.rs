@@ -308,6 +308,8 @@ fn create_window(session: &mut Session, socket: &str, name: &str, window: &Windo
 
 /// Why a pane isn't as it should be.
 enum NotReady {
+    /// It's gone already, as when its shell exited at once.
+    Gone,
     /// Its shell didn't reach its prompt within [`PROMPT_TIMEOUT`].
     NoPrompt,
     /// Its process is in this directory, not the pane's.
@@ -346,11 +348,11 @@ m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
     let output = session.run(&script, PROMPT_TIMEOUT + QUICK)?;
     Ok(match output.status {
         0 => Ok(()),
-        1 => bail!("pane {pane_id} is gone"),
+        1 => Err(NotReady::Gone),
         2 => Err(NotReady::NoPrompt),
         3 => Err(NotReady::Elsewhere(output.stdout_text())),
         4 => Err(NotReady::OtherMount(output.stdout_text())),
-        status => bail!("checking on pane {pane_id} exited with status {status}: {}", output.stderr_text()),
+        status => return Err(Failed(format!("checking on pane {pane_id} exited with status {status}: {}", output.stderr_text())).into()),
     })
 }
 
@@ -385,6 +387,10 @@ fn restore_panes(session: &mut Session, restoring: &mut Restoring, name: &str, w
         let typed = matches!(pane.running, Running::Typed { .. });
         match check_pane(session, &server.socket, pane_id, pane, command.is_some() && typed)? {
             Ok(()) => {}
+            Err(NotReady::Gone) => {
+                problems.push(problem("the pane was gone right after it was made".into()));
+                continue;
+            }
             Err(NotReady::NoPrompt) => {
                 problems.push(problem(format!("its shell didn't reach its prompt within {}s", PROMPT_TIMEOUT.as_secs())));
                 continue;
@@ -470,8 +476,12 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
             continue;
         };
         let created = match &existing {
-            None => start_server(session, server, tmux_session, &first_pane.cwd)
-                .and_then(|()| run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={name}:^"))), false)),
+            // A server that doesn't start fails the whole server's restore,
+            // rather than being tried again for each session.
+            None => {
+                start_server(session, server, tmux_session, &first_pane.cwd)?;
+                run_tmux(session, socket, &format!("display -p -t {} -F '#{{window_id}} #{{window_index}} #{{pane_id}}'", shell_quote(&format!("={name}:^"))), false)
+            }
             Some(_) => run_tmux(
                 session,
                 socket,
@@ -491,8 +501,9 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
         if let Some(group) = &tmux_session.group {
             groups.insert(group, name);
         }
-        let [window_id, index, pane_id] = created.split_whitespace().collect::<Vec<_>>()[..] else { bail!("unexpected tmux output {created:?}") };
-        let index: u32 = index.parse().with_context(|| format!("unexpected tmux output {created:?}"))?;
+        let unexpected = || Failed(format!("unexpected tmux output {created:?}"));
+        let [window_id, index, pane_id] = created.split_whitespace().collect::<Vec<_>>()[..] else { return Err(unexpected().into()) };
+        let index: u32 = index.parse().map_err(|_| unexpected())?;
         for (i, window) in tmux_session.windows.iter().enumerate() {
             let first = (i == 0).then_some((window_id, index, pane_id));
             let pane_ids = match create_window(session, socket, name, window, first) {
