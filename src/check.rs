@@ -160,26 +160,31 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
     ]
 }
 
-/// A table with a row per machine, followed by a line per reason not to
-/// reboot a machine, per machine that a nixos-rebuild would change or whose
-/// configuration couldn't be evaluated, and per machine that couldn't be
-/// checked (with any further lines indented), a blank line before each
-/// machine's.
-/// The table is styled if `color`, and shows times in `zone`.
+/// A table with a row per machine, styled if `color`, with times in `zone`.
 fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> String {
     let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title).aligned(if CENTERED.contains(&title) { Center } else { Left })))];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome, zone)));
-    let mut text = human::table(&rows, color).join("\n") + "\n";
+    human::table(&rows, color).join("\n") + "\n"
+}
 
+/// The lines to go below the table: the error for each machine that
+/// couldn't be checked, and, if `all`, also each reason not to reboot a
+/// machine, and what a nixos-rebuild would change or why the machine's
+/// configuration couldn't be evaluated.  Each line starts with the
+/// machine's hostname, any further lines of a message are indented, and
+/// a blank line comes before each machine's lines.
+fn details(outcomes: &[(&Machine, Outcome)], all: bool) -> String {
+    let mut text = String::new();
     for (machine, outcome) in outcomes {
-        let details: Vec<String> = match outcome {
+        let lines: Vec<String> = match outcome {
+            Ok(_) if !all => vec![],
             Ok((facts, blockers, rebuild)) => blockers.iter().cloned().chain(rebuild.as_ref().and_then(|rebuild| rebuild.trouble(&facts.systems.default))).collect(),
             Err(error) => vec![format!("{error:#}")],
         };
-        if !details.is_empty() {
+        if !lines.is_empty() {
             text.push('\n');
-            for detail in details {
-                text.push_str(&format!("{}: {}\n", machine.hostname, detail.replace('\n', "\n    ")));
+            for line in lines {
+                text.push_str(&format!("{}: {}\n", machine.hostname, line.replace('\n', "\n    ")));
             }
         }
     }
@@ -249,9 +254,12 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
-/// `color`, with times in the local time zone), or JSON if `json`.
+/// `color`, with times in the local time zone), or JSON if `json`.  Below
+/// the table, prints the errors of the machines that couldn't be checked
+/// if `hostnames` isn't empty, and every detail (see [`details`]) if
+/// `verbose`.
 /// Returns the exit status: see [`exit_status`].
-pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
+pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
     let ssh = &Ssh::default();
@@ -267,6 +275,9 @@ pub fn run(hostnames: &[String], json: bool, color: bool) -> Result<u8> {
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
         print!("{}", table(&outcomes, color, &TimeZone::system()));
+        if verbose || !hostnames.is_empty() {
+            print!("{}", details(&outcomes, verbose));
+        }
     }
     Ok(exit_status(&outcomes))
 }
@@ -345,8 +356,11 @@ mod tests {
              two      yes                             1.00 kB/s   0.50   45%  ok                                                                          ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
              four     yes                             1.00 kB/s   0.50   45%  ok                                                                          ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
-             five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n\
-             \n\
+             five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n"
+        );
+        assert_eq!(
+            details(&outcomes, true),
+            "\n\
              one: btrfs on /: balance\n\
              one: btrfs on /: device 1 is missing\n\
              one: smart on /dev/sda (QEMU HARDDISK, serial QM00001): overall health FAILED, Reallocated_Sector_Ct=5\n\
@@ -364,6 +378,8 @@ mod tests {
              \n\
              four: couldn't evaluate the configuration: attribute 'boot' missing\n    at /etc/nixos/configuration.nix:3:5:\n"
         );
+        assert_eq!(details(&outcomes, false), "\nthree: failed to open a session: no route to host\n    second line\n");
+        assert_eq!(details(&outcomes[..2], false), "");
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
         assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);

@@ -34,6 +34,13 @@ enum ReboopCommand {
         /// Print JSON instead of a table
         #[clap(long)]
         json: bool,
+        /// Below the table, also print the reasons each machine isn't okay
+        /// to reboot, what a nixos-rebuild would change or why the
+        /// configuration couldn't be evaluated, and the error for each
+        /// machine that couldn't be checked (those errors are printed
+        /// without -v too when HOSTNAMES are given)
+        #[clap(short, long)]
+        verbose: bool,
         #[clap(flatten)]
         color: ColorOption,
     },
@@ -186,7 +193,7 @@ fn main() -> ExitCode {
         }
     };
     let result = match command {
-        ReboopCommand::Check { hostnames, json, color: ColorOption { color } } => check::run(&hostnames, json, styles(&std::io::stdout(), color)),
+        ReboopCommand::Check { hostnames, json, verbose, color: ColorOption { color } } => check::run(&hostnames, json, verbose, styles(&std::io::stdout(), color)),
         ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Catch { hostname, color: ColorOption { color } } => bounce::run_catch(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Stop { hostname, color: ColorOption { color } } => bounce::run_stop(&hostname, styles(&std::io::stdout(), color)),
@@ -221,6 +228,7 @@ mod tests {
         assert_eq!(color(&["--color", "never", "one"]), ColorChoice::Never);
         assert_eq!(color(&["--color=always", "--color=never"]), ColorChoice::Never);
         assert!(ReboopCommand::try_parse_from(["reboop", "check", "--color", "one"]).is_err());
+        assert!(matches!(ReboopCommand::try_parse_from(["reboop", "check", "-v"]).unwrap(), ReboopCommand::Check { verbose: true, .. }));
 
         match ReboopCommand::try_parse_from(["reboop", "bounce", "--color=never", "one"]).unwrap() {
             ReboopCommand::Bounce { hostname, color: ColorOption { color } } => assert_eq!((hostname.as_str(), color), ("one", ColorChoice::Never)),
