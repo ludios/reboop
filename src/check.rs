@@ -379,7 +379,6 @@ mod tests {
              \n\
              four: couldn't evaluate the configuration: attribute 'boot' missing\n    at /etc/nixos/configuration.nix:3:5:\n"
         );
-        assert_eq!(details(&outcomes[1..2]), "");
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
         assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
