@@ -182,13 +182,16 @@ fn btrfs_command(args: &str) -> Option<&'static str> {
 }
 
 /// Whether an rclone command line transfers files, with copy, sync, move or
-/// the like, rather than, e.g., mount or serve, which run until stopped.
-/// rclone takes options before and after its subcommand, some with a value,
-/// so this looks for the subcommand among all the words, as a path or a
-/// remote is seldom named exactly like one.
+/// another of `TRANSFERS`, rather than running until stopped, as mount or
+/// serve does.  rclone takes options before and after its subcommand, some
+/// with a value, so the subcommand is taken to be the first word that's
+/// one of these, which an option's value seldom is.  (A path after the
+/// subcommand can be, as in `rclone serve http copy`.)
 fn is_rclone_transfer(args: &str) -> bool {
     const TRANSFERS: &[&str] = &["copy", "copyto", "copyurl", "sync", "move", "moveto", "bisync", "rcat", "archive"];
-    args.split_whitespace().skip(1).any(|word| TRANSFERS.contains(&word))
+    const LASTING: &[&str] = &["mount", "cmount", "nfsmount", "serve", "rcd"];
+    let subcommand = args.split_whitespace().skip(1).find(|word| TRANSFERS.contains(word) || LASTING.contains(word));
+    subcommand.is_some_and(|word| TRANSFERS.contains(&word))
 }
 
 /// What `process` is doing that a reboot would interrupt, if anything.
@@ -334,7 +337,9 @@ mod tests {
             "less /var/log/rsync.log",
             "man cp",
             "rclone mount remote: /mnt/remote --vfs-cache-mode full",
-            "rclone serve webdav remote:copy",
+            "rclone mount remote: sync",
+            "rclone serve http copy",
+            "rclone serve webdav remote: --exclude sync",
             "[kworker/0:1-events]",
             "sshd: root [priv]",
             "",
