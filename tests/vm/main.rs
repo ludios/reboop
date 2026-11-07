@@ -1098,9 +1098,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // A capture pending for a reboot that hasn't happened isn't brought back.
     let boot_id = facts::boot_id(&mut session)?;
     resume::save(&mut session, &Capture::new(Purpose::Reboot, &boot_id, vec![server.clone()]), true)?;
-    let mut printed = Vec::new();
-    assert_eq!(resume::restore_pending(&mut session, &resuming, &mut Printer::new(&mut printed, false, None, None))?, None);
-    assert!(String::from_utf8(printed)?.contains(" is from this boot, so what it describes is still running; not bringing it back\n"));
+    let error = resume::restore_pending(&mut session, &resuming, &mut Printer::new(&mut Vec::new(), false, None, None)).unwrap_err();
+    assert!(error.to_string().ends_with(" is from this boot, so what it describes is still running; not bringing it back"), "{error:#}");
     assert!(resume::pending(&mut session)?.is_none());
     clean_up(&mut session)
 }

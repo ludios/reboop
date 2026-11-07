@@ -192,6 +192,6 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
 `reboop tmux stop HOSTNAME` refuses if a pane runs something that isn't resumable or a server can't be listed, whatever the machine's `tmux` setting (exit status 2); otherwise saves what's in the servers as `TIME.tmux-stop.json`, points `pending` at it, says what will be run again, and kills each server (`tmux -S SOCKET kill-server`, which hangs up on the panes' processes; one that ignores SIGHUP keeps running), waiting for it to exit. For stopping and starting the servers without a reboot, e.g. around upgrading tmux. (A command typed into a pane after the capture is lost, as a reboot would lose it.)
 
-`reboop tmux start HOSTNAME` does Postflight step 4 (exit status 1 if something couldn't be brought back). It fails if nothing is pending, or what's pending is from the current boot.
+`reboop tmux start HOSTNAME` does Postflight step 4 (exit status 1 if something couldn't be brought back). It fails if nothing is pending, or what's pending was taken for a reboot or shutdown in the current boot (unlike one taken by `reboop tmux stop`).
 
 `--saved FILE` (a file in `/var/lib/reboop/tmux` by name, or an absolute path on the machine) has `list` show, or `start` bring back, that capture instead: any of them, e.g. the last check's after a crash. A capture from this boot is brought back with it, as told to; sessions whose names are taken are left alone.
