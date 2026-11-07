@@ -117,7 +117,9 @@ fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
 /// it ("ok" if not, "stale" if so, "?" if that couldn't be evaluated, or
 /// nothing if it wasn't checked), why it needs a reboot (if it does),
 /// the kernel it runs (and the one it would boot, if different), and when
-/// that kernel was built and booted, in `zone`.
+/// that kernel was built and booted, in `zone`. If `outcome` says that
+/// `machine` couldn't be checked, the row has only the hostname and
+/// "error", in yellow.
 fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell> {
     let Ok((facts, blockers, rebuild)) = outcome else {
         let mut row = vec![Plain.cell(machine.hostname.clone()), Yellow.cell("error")];
