@@ -247,11 +247,13 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-stc -E PATH bash -c \
                       'exec -a /run/current-system/bin/switch-to-configuration bash -c \"sleep 600; true\"'")?;
 
-    // A btrfs receive and a cryptsetup, each waiting for its input
+    // A btrfs receive, a cryptsetup and an fdisk, each waiting for its input
     sh(&mut session, "mkdir /var/tmp/reboop-test-receive && truncate -s 32M /var/tmp/reboop-test-luks.img && \
+                      truncate -s 1M /var/tmp/reboop-test-fdisk.img && \
                       systemd-run --quiet --unit=reboop-test-receive -E PATH sh -c 'sleep 600 | btrfs receive /var/tmp/reboop-test-receive' && \
                       systemd-run --quiet --unit=reboop-test-cryptsetup -E PATH \
-                          sh -c 'sleep 600 | cryptsetup luksFormat --batch-mode --key-file=- /var/tmp/reboop-test-luks.img'")?;
+                          sh -c 'sleep 600 | cryptsetup luksFormat --batch-mode --key-file=- /var/tmp/reboop-test-luks.img' && \
+                      systemd-run --quiet --unit=reboop-test-fdisk -E PATH sh -c 'sleep 600 | fdisk /var/tmp/reboop-test-fdisk.img'")?;
 
     // Wait for them all to start, including the build's builder, which
     // runs as a nixbld user.
@@ -262,6 +264,7 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
         Activity::Copy,
         Activity::BtrfsSendReceive,
         Activity::Cryptsetup,
+        Activity::DiskTool,
     ]);
     let deadline = Deadline::after(MINUTE);
     loop {
