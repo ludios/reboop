@@ -657,15 +657,23 @@ pub fn blockers(policy: TmuxPolicy, patterns: &CommandPatterns, servers: &[Serve
     blockers
 }
 
-/// The row about `pane`, at `location`, in [`listing`]'s table, with
-/// `patterns` (the machine's resumable_commands) deciding its fate.
-fn row(location: String, pane: &Pane, patterns: &CommandPatterns) -> Vec<Cell> {
-    let (fate, text) = match verdict(pane, patterns) {
-        Verdict::Idle            => (Style::Dim.cell("idle"),          String::new()),
-        Verdict::Resume(command) => (Style::Green.cell("resumable"),   command),
-        Verdict::Block(why)      => (Style::Red.cell("not resumable"), why),
-    };
-    vec![fate.aligned(Align::Right), Style::Plain.cell(location), Style::Plain.cell(pane.cwd.clone()), Style::Plain.cell(text)]
+/// The rows about `server`'s panes in [`listing`]'s table (none if the
+/// server couldn't be listed), with `patterns` (the machine's
+/// resumable_commands) deciding each pane's fate.
+fn pane_rows(server: &Server, patterns: &CommandPatterns) -> Vec<Vec<Cell>> {
+    if server.error.is_some() {
+        return vec![];
+    }
+    let mut rows = Vec::new();
+    for (location, pane) in server.panes() {
+        let (fate, text) = match verdict(pane, patterns) {
+            Verdict::Idle            => (Style::Dim.cell("idle"),          String::new()),
+            Verdict::Resume(command) => (Style::Green.cell("resumable"),   command),
+            Verdict::Block(why)      => (Style::Red.cell("not resumable"), why),
+        };
+        rows.push(vec![fate.aligned(Align::Right), Style::Plain.cell(location), Style::Plain.cell(pane.cwd.clone()), Style::Plain.cell(text)]);
+    }
+    rows
 }
 
 /// The line about `server`, for people: with its sessions and panes
@@ -685,30 +693,34 @@ fn heading(server: &Server, policy: TmuxPolicy, color: bool) -> String {
     text
 }
 
-/// What's in `servers`, for people: a text per server, of a [`heading`]
-/// line, then a line per pane, in a table whose columns line up across all
-/// the servers.  A pane's row has "idle", "resumable" or "not resumable"
-/// (as [`verdict`] tells, given the commands that `patterns` allow), flush
-/// right; the pane's location; the pane's directory; and either the
-/// command to run again, why the pane can't be resumed, or (for an idle
-/// pane) nothing.  If `color`, the three fates are dim, green and red
-/// respectively, and what makes a server block a reboot is red.
+/// What's in `servers`, for people: a text per server, of a line about the
+/// server, then a line per pane of the server (none if the server couldn't
+/// be listed), in a table whose columns line up across all the servers.
+///
+/// A server's line has its sessions and panes counted (and says that the
+/// server blocks a reboot, if `policy` is block), or why the server
+/// couldn't be listed.  A pane's row has "idle", "resumable" or "not
+/// resumable" (as [`verdict`] tells, given the commands that `patterns`
+/// allow), flush right; the pane's location; the pane's directory; and
+/// either the command to run again, why the pane can't be resumed, or (for
+/// an idle pane) nothing.  If `color`, the three fates are dim, green and
+/// red respectively, and a server's line has in red what it says about the
+/// server blocking a reboot or not being listed.
 pub fn listing(servers: &[Server], policy: TmuxPolicy, patterns: &CommandPatterns, color: bool) -> Vec<String> {
-    let rows: Vec<Vec<Cell>> = servers.iter().flat_map(|server| server.panes().map(move |(location, pane)| row(location, pane, patterns))).collect();
-    let mut lines = human::table(&rows, color).into_iter();
-    let texts: Vec<String> = servers
+    let rows: Vec<Vec<Vec<Cell>>> = servers.iter().map(|server| pane_rows(server, patterns)).collect();
+    let mut lines = human::table(&rows.concat(), color).into_iter();
+    servers
         .iter()
-        .map(|server| {
+        .zip(&rows)
+        .map(|(server, rows)| {
             let mut text = heading(server, policy, color);
-            for line in lines.by_ref().take(server.panes().count()) {
+            for line in lines.by_ref().take(rows.len()) {
                 text.push('\n');
                 text.push_str(&line);
             }
             text
         })
-        .collect();
-    assert!(lines.next().is_none(), "the table has more lines than the servers have panes");
-    texts
+        .collect()
 }
 
 #[cfg(test)]
@@ -947,40 +959,40 @@ pub(crate) mod tests {
         let patterns = patterns(&["rsync .*"]);
         let server = test_server();
         let at = "at's tmux server at /tmp/tmux-1000/default (pid 1234)";
-        assert_eq!(
-            listing(std::slice::from_ref(&server), TmuxPolicy::Resume, &patterns, false),
-            [[
-                &format!("{at}: 1 session and 3 panes"),
-                "         idle  work:0.0  /home/at",
-                "    resumable  work:0.1  /data     rsync -a /data/ /backup/",
-                "not resumable  work:3.0  /home/at  htop (doesn't match resumable_commands)",
-            ]
-            .join("\n")]
-        );
+        let at_listing = [
+            &format!("{at}: 1 session and 3 panes"),
+            "         idle  work:0.0  /home/at",
+            "    resumable  work:0.1  /data     rsync -a /data/ /backup/",
+            "not resumable  work:3.0  /home/at  htop (doesn't match resumable_commands)",
+        ]
+        .join("\n");
+        assert_eq!(listing(std::slice::from_ref(&server), TmuxPolicy::Resume, &patterns, false), [at_listing.clone()]);
         let colored = listing(std::slice::from_ref(&server), TmuxPolicy::Resume, &patterns, true).concat();
         assert!(colored.contains("\n         \x1b[2midle\x1b[0m  work:0.0") && colored.contains("\n    \x1b[32mresumable\x1b[0m  ") && colored.contains("\n\x1b[31mnot resumable\x1b[0m  "), "{colored}");
         assert!(listing(std::slice::from_ref(&server), TmuxPolicy::Block, &patterns, false)[0].starts_with(&format!("{at}: 1 session and 3 panes (tmux is \"block\", so the server blocks a reboot)\n")));
         assert!(listing(std::slice::from_ref(&server), TmuxPolicy::Block, &patterns, true)[0].starts_with(&format!("{at}: 1 session and 3 panes \x1b[31m(tmux is \"block\", so the server blocks a reboot)\x1b[0m\n")));
+        // A server that couldn't be listed has just its line, even with
+        // sessions (as a capture could, if edited).
+        let unlisted = Server { error: Some("no such file".into()), ..server.clone() };
+        assert_eq!(listing(std::slice::from_ref(&unlisted), TmuxPolicy::Resume, &patterns, true), [format!("{at}: \x1b[31mcouldn't be listed: no such file\x1b[0m")]);
 
-        // The columns line up across servers, even one with only an idle
-        // pane; a server that couldn't be listed, or has no panes, has just
-        // its line.
+        // The columns line up across servers: root's pane's location and
+        // directory are padded as wide as at's, and its "resumable" as wide
+        // as at's "not resumable".
         let mut root = Server { user: "root".into(), socket: "/tmp/tmux-0/default".into(), pid: 1, ..server.clone() };
+        root.sessions[0].name = "s".into();
         root.sessions[0].windows.truncate(1);
-        root.sessions[0].windows[0].panes.truncate(1);
+        root.sessions[0].windows[0].panes = vec![pane(0, "/root", Running::Typed { command: "rsync -a /x/ /y/".into() })];
         let empty = Server { sessions: vec![], ..server.clone() };
-        let unlisted = Server { sessions: vec![], error: Some("no such file".into()), ..server.clone() };
         assert_eq!(
             listing(&[unlisted, root, empty, server], TmuxPolicy::Resume, &patterns, false),
             [
                 format!("{at}: couldn't be listed: no such file"),
-                "root's tmux server at /tmp/tmux-0/default (pid 1): 1 session and 1 pane\n         idle  work:0.0  /home/at".into(),
+                "root's tmux server at /tmp/tmux-0/default (pid 1): 1 session and 1 pane\n    resumable  s:0.0     /root     rsync -a /x/ /y/".into(),
                 format!("{at}: 0 sessions and 0 panes"),
-                listing(&[test_server()], TmuxPolicy::Resume, &patterns, false)[0].clone(),
+                at_listing,
             ]
         );
-        let unlisted = Server { sessions: vec![], error: Some("no such file".into()), ..test_server() };
-        assert_eq!(listing(&[unlisted], TmuxPolicy::Resume, &patterns, true), [format!("{at}: \x1b[31mcouldn't be listed: no such file\x1b[0m")]);
     }
 
     #[test]
