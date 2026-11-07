@@ -638,19 +638,19 @@ fn stop_unit(vm: &Vm) -> Result<()> {
 
 fn postflight_facts(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
-    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "running");
+    assert_eq!(facts::wait_until_booted(&mut session, Duration::from_secs(1), Deadline::after(MINUTE), |_| {})?, "running");
     assert_eq!(facts::failed_units(&mut session)?, Vec::<String>::new());
 
     session.run("systemd-run --quiet --unit=reboop-test-fail --wait false", MINUTE)?;
     assert_eq!(facts::failed_units(&mut session)?, vec!["reboop-test-fail.service".to_string()]);
-    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "degraded");
+    assert_eq!(facts::wait_until_booted(&mut session, Duration::from_secs(1), Deadline::after(MINUTE), |_| {})?, "degraded");
     assert_eq!(facts::system_state(&mut session)?, "degraded");
 
     sh(&mut session, "echo '<3>reboop test error' >/dev/kmsg")?;
     assert!(facts::kernel_errors(&mut session)?.contains("reboop test error"));
 
     clean_up(&mut session)?;
-    assert_eq!(facts::wait_until_booted(&mut session, MINUTE)?, "running");
+    assert_eq!(facts::wait_until_booted(&mut session, Duration::from_secs(1), Deadline::after(MINUTE), |_| {})?, "running");
     Ok(())
 }
 

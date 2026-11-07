@@ -142,9 +142,11 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     `ssh root@[ipv4 address of machine] -p [ssh_port]`
 
-2. Wait for the system to finish booting:
+2. Wait up to 15 minutes for the system to finish booting, running this every 2 seconds until it says neither `initializing` nor `starting`:
 
-    `systemctl is-system-running --wait`
+    `systemctl is-system-running`
+
+    Meanwhile, show which of systemd's jobs (from `systemctl list-jobs`) are running, and how many are waiting for others. If the 15 minutes pass, the error says the same.
 
 3. Collect this information and show it to the user of `reboop`:
 

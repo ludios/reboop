@@ -1,5 +1,6 @@
 //! Facts about a remote NixOS machine, from before and after rebooting it.
 
+use crate::deadline::Deadline;
 use crate::ssh::{QUICK, Session, shell_quote};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use jiff::Timestamp;
@@ -7,6 +8,7 @@ use jiff::fmt::strtime;
 use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -401,10 +403,11 @@ pub fn sample_network(session: &mut Session, duration: Duration) -> Result<Netwo
     network_sample(&before, &after)
 }
 
-/// The state that `systemctl is-system-running` prints, running it with
-/// `options`, for up to `timeout`.
-fn is_system_running(session: &mut Session, options: &str, timeout: Duration) -> Result<String> {
-    let output = session.run(&format!("systemctl is-system-running {options}"), timeout)?;
+/// systemd's view of the system: "running" if all is well, "degraded" if
+/// some unit failed, "stopping" if it's shutting down, or something else
+/// from systemctl(1)'s is-system-running.
+pub fn system_state(session: &mut Session) -> Result<String> {
+    let output = session.run("systemctl is-system-running", QUICK)?;
     let state = output.stdout_text().trim().to_string();
     ensure!(
         !state.is_empty() && !state.contains(char::is_whitespace),
@@ -413,19 +416,6 @@ fn is_system_running(session: &mut Session, options: &str, timeout: Duration) ->
         output.stderr_text()
     );
     Ok(state)
-}
-
-/// systemd's view of the system: "running" if all is well, "degraded" if
-/// some unit failed, "stopping" if it's shutting down, or something else
-/// from systemctl(1)'s is-system-running.
-pub fn system_state(session: &mut Session) -> Result<String> {
-    is_system_running(session, "", QUICK)
-}
-
-/// Waits for the machine to finish booting (or `timeout`) and returns its
-/// [`system_state`].
-pub fn wait_until_booted(session: &mut Session, timeout: Duration) -> Result<String> {
-    is_system_running(session, "--wait", timeout)
 }
 
 /// The names of units that have failed.
@@ -472,6 +462,13 @@ pub struct Job {
     pub state: String,
 }
 
+impl fmt::Display for Job {
+    /// e.g. "start nginx.service"
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.job_type, self.unit)
+    }
+}
+
 /// Parses `systemctl list-jobs --no-legend`: a line of "ID UNIT TYPE STATE"
 /// per job.  (Unit names can't contain spaces.)
 fn parse_jobs(output: &str) -> Result<Vec<Job>> {
@@ -490,6 +487,32 @@ fn parse_jobs(output: &str) -> Result<Vec<Job>> {
 /// systemd's jobs.
 pub fn jobs(session: &mut Session) -> Result<Vec<Job>> {
     parse_jobs(&session.run_ok("systemctl list-jobs --no-legend --no-pager", QUICK)?)
+}
+
+/// Which of `jobs` are running, and how many are waiting for others, e.g.
+/// "running jobs: start nginx.service, start var.mount; waiting jobs: 14".
+pub fn jobs_summary(jobs: &[Job]) -> String {
+    let running: Vec<_> = jobs.iter().filter(|job| job.state == "running").map(Job::to_string).collect();
+    let waiting = jobs.len() - running.len();
+    let running = if running.is_empty() { "none".to_string() } else { running.join(", ") };
+    format!("running jobs: {running}; waiting jobs: {waiting}")
+}
+
+/// Waits for the machine to finish booting, checking every `interval` until
+/// `deadline`, and returns its [`system_state`].  Each time that it finds
+/// the machine still booting, it passes systemd's jobs to `progress`.
+pub fn wait_until_booted(session: &mut Session, interval: Duration, deadline: Deadline, mut progress: impl FnMut(&[Job])) -> Result<String> {
+    loop {
+        let state = system_state(session)?;
+        // The states that `systemctl is-system-running --wait` waits through
+        if state != "initializing" && state != "starting" {
+            return Ok(state);
+        }
+        let jobs = jobs(session)?;
+        progress(&jobs);
+        ensure!(!deadline.has_passed(), "systemd is still {state} at the deadline, with {}", jobs_summary(&jobs));
+        sleep(interval.min(deadline.remaining()));
+    }
 }
 
 /// A lock that a program holds to delay or block shutdown, sleep, etc.: see
@@ -571,6 +594,15 @@ mod tests {
         assert_eq!(parse_jobs(output).unwrap(), [job(361, "reboop-test-job.service", "start", "running"), job(362, "nginx.service", "stop", "waiting")]);
         assert_eq!(parse_jobs("").unwrap(), []);
         assert!(parse_jobs("No jobs running.").is_err());
+    }
+
+    #[test]
+    fn summarizes_jobs() {
+        let job = |unit: &str, job_type: &str, state: &str| Job { id: 1, unit: unit.into(), job_type: job_type.into(), state: state.into() };
+        let jobs = [job("multi-user.target", "start", "waiting"), job("nginx.service", "start", "running"), job("var.mount", "stop", "running")];
+        assert_eq!(jobs_summary(&jobs), "running jobs: start nginx.service, stop var.mount; waiting jobs: 1");
+        assert_eq!(jobs_summary(&jobs[..1]), "running jobs: none; waiting jobs: 1");
+        assert_eq!(jobs_summary(&[]), "running jobs: none; waiting jobs: 0");
     }
 
     #[test]

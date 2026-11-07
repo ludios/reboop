@@ -40,6 +40,9 @@ const RETURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long systemd gets to finish starting up once the machine accepts SSH.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How often to check on systemd's starting up.
+const STARTUP_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How long a machine gets from being asked to shut down until it stops
 /// accepting SSH.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -477,7 +480,9 @@ fn postflight_problems(systems: &Systems, state: &str, failed_units: &[String]) 
 /// problems (see [`postflight_problems`]).
 fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> Result<Vec<String>> {
     printer.line("Waiting for systemd to finish starting up");
-    let state = facts::wait_until_booted(session, STARTUP_TIMEOUT)?;
+    let state = facts::wait_until_booted(session, STARTUP_INTERVAL, Deadline::after(STARTUP_TIMEOUT), |jobs| {
+        printer.progress(&format!("systemd's {}", facts::jobs_summary(jobs)));
+    })?;
     // Not before, since a hostname from DHCP can come late in startup
     facts::ensure_hostname(session, hostname)?;
     let failed_units = facts::failed_units(session)?;

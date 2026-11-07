@@ -241,7 +241,7 @@ pub fn blockers_ignoring_load_and_network(machine: &Machine, facts: &Facts) -> V
     }
     let seconds = NETWORK_SAMPLE.as_secs();
     for job in &facts.lasting_jobs {
-        blockers.push(format!("systemd job: {} {} ({}) for {seconds}s or more", job.job_type, job.unit, job.state));
+        blockers.push(format!("systemd job: {job} ({}) for {seconds}s or more", job.state));
     }
     if root_full(machine, facts) {
         blockers.push(format!("root filesystem: {}% used, and it's full at {}%", facts.root_used_percent, machine.root_full_percent));
