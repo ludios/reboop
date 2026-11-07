@@ -4,6 +4,7 @@
 //! precedence.
 
 use crate::ssh::Target;
+use crate::tmux::CommandPatterns;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -23,6 +24,18 @@ pub fn check_hostname(hostname: &str) -> Result<()> {
         bail!("{hostname:?} isn't a valid hostname");
     }
     Ok(())
+}
+
+/// What to do about tmux servers when a machine is to go down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TmuxPolicy {
+    /// Don't take the machine down while it has a tmux server.
+    Block,
+    /// Take it down if every pane's command is resumable, and bring the
+    /// sessions back afterwards, running those commands again: see
+    /// [`crate::tmux`].
+    Resume,
 }
 
 /// A machine and all its settings.
@@ -53,6 +66,12 @@ pub struct Machine {
     /// systemd units to stop, in order, before rebooting, e.g. "postgresql";
     /// those the machine doesn't have are skipped.
     pub stop_services: Vec<String>,
+    pub tmux: TmuxPolicy,
+    /// The commands that may be resumed (see [`crate::tmux`]), as regular
+    /// expressions, each of which has to match a whole command line.  Those
+    /// in defaults.json apply to every machine, and a machine's own are added
+    /// to them.
+    pub resumable_commands: CommandPatterns,
 }
 
 impl Machine {
@@ -79,6 +98,8 @@ struct Defaults {
     check_rebuild: Option<bool>,
     luks_signing_key: Option<String>,
     stop_services: Option<Vec<String>>,
+    tmux: Option<TmuxPolicy>,
+    resumable_commands: Option<Vec<String>>,
 }
 
 /// A line of machines.jsonl.  (serde can't combine `flatten` with
@@ -98,7 +119,12 @@ struct MachineLine {
     check_rebuild: Option<bool>,
     luks_signing_key: Option<String>,
     stop_services: Option<Vec<String>>,
+    tmux: Option<TmuxPolicy>,
+    resumable_commands: Option<Vec<String>>,
 }
+
+/// The tmux policy of machines that aren't configured with one.
+const DEFAULT_TMUX: TmuxPolicy = TmuxPolicy::Block;
 
 /// The scrub_every_days of machines that aren't configured with one.
 const DEFAULT_SCRUB_EVERY_DAYS: u32 = 14;
@@ -149,6 +175,9 @@ fn resolve(defaults: &Defaults, line: MachineLine, home: &Path) -> Result<Machin
         )
         .with_context(|| format!("bad luks_signing_key for {}", line.hostname))?,
         stop_services: line.stop_services.or(defaults.stop_services.clone()).unwrap_or_default(),
+        tmux: line.tmux.or(defaults.tmux).unwrap_or(DEFAULT_TMUX),
+        resumable_commands: CommandPatterns::new([defaults.resumable_commands.clone().unwrap_or_default(), line.resumable_commands.unwrap_or_default()].concat())
+            .with_context(|| format!("for {}", line.hostname))?,
         hostname: line.hostname,
         ipv4: line.ipv4,
     };
@@ -250,14 +279,20 @@ mod tests {
         "check_rebuild": false,
         "luks_signing_key": "~/keys/all.pub",
         "stop_services": ["postgresql"],
+        "tmux": "resume",
+        "resumable_commands": ["rsync .*"],
     }"#;
+
+    fn patterns(patterns: &[&str]) -> CommandPatterns {
+        CommandPatterns::new(patterns.iter().map(|&pattern| pattern.into()).collect()).unwrap()
+    }
 
     const HOME: &str = "/home/user";
 
     #[test]
     fn machines_override_defaults() {
         let machines = "{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\", \"ssh_port\": 2222}\n\n\
-                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"scrub_every_days\": 0, \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": [], \"check_rebuild\": true}\n";
+                        {\"hostname\": \"two\", \"ipv4\": \"10.0.0.2\", \"scrub_mounts\": [\"/\", \"/small\"], \"scrub_every_days\": 0, \"luks_signing_key\": \"/keys/two.pub\", \"stop_services\": [], \"check_rebuild\": true, \"tmux\": \"block\", \"resumable_commands\": [\"htop\"]}\n";
         let machines = parse(Some(DEFAULTS), machines, Path::new(HOME)).unwrap();
         assert_eq!(
             machines[0],
@@ -274,8 +309,13 @@ mod tests {
                 check_rebuild: false,
                 luks_signing_key: "/home/user/keys/all.pub".into(),
                 stop_services: vec!["postgresql".into()],
+                tmux: TmuxPolicy::Resume,
+                resumable_commands: patterns(&["rsync .*"]),
             }
         );
+        // A machine's resumable_commands add to the defaults' rather than replacing them.
+        assert_eq!(machines[1].tmux, TmuxPolicy::Block);
+        assert_eq!(machines[1].resumable_commands, patterns(&["rsync .*", "htop"]));
         assert_eq!(machines[1].ssh_port, 22);
         assert_eq!(machines[1].scrub_mounts, ["/", "/small"]);
         assert_eq!(machines[1].scrub_every_days, 0);
@@ -296,6 +336,8 @@ mod tests {
         assert_eq!(machines[0].root_full_percent, 97);
         assert_eq!(machines[0].scrub_every_days, 14);
         assert!(machines[0].check_rebuild);
+        assert_eq!(machines[0].tmux, TmuxPolicy::Block);
+        assert_eq!(machines[0].resumable_commands, patterns(&[]));
     }
 
     #[test]
@@ -314,6 +356,9 @@ mod tests {
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql nginx"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgres*"]}"#).is_err());
         assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "stop_services": ["postgresql", "container@db.service"]}"#).is_ok());
+        assert!(line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "tmux": "maybe"}"#).is_err());
+        let error = line(r#"{"hostname": "one", "ipv4": "10.0.0.1", "resumable_commands": ["("]}"#).unwrap_err();
+        assert!(format!("{error:#}").contains(r#""(" in resumable_commands isn't a regular expression"#), "{error:#}");
         assert!(line("{\"hostname\": \"one\", \"ipv4\": \"10.0.0.1\"}\n{\"hostname\": \"one\", \"ipv4\": \"10.0.0.2\"}").is_err());
         assert!(parse(Some(r#"{"ssh_port": 22, "extra": 1}"#), "", Path::new(HOME)).is_err());
         let error = parse(None, r#"{"hostname": "one", "ipv4": "10.0.0.1"}"#, Path::new(HOME)).unwrap_err();

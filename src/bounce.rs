@@ -15,6 +15,7 @@ use crate::initrd::{self, Agent, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
 use crate::reboot::{self, Down, Stopped};
+use crate::resume::{self, Capture, Purpose};
 use crate::ssh::{OPEN_TIMEOUT, Opening, QUICK, Session, Ssh, is_unreachable};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use jiff::Zoned;
@@ -79,14 +80,14 @@ impl<'a> Printer<'a> {
     /// `value` in bold, if in color, to stand out in a plain line.  Not for
     /// other lines, since the reset at the end would also end a red line's
     /// color, and would throw off progress's count of characters.
-    fn bold(&self, value: impl fmt::Display) -> String {
+    pub(crate) fn bold(&self, value: impl fmt::Display) -> String {
         self.paint(Bold, &value.to_string())
     }
 
     /// Prints `text` in `style` and a newline, in place of any progress on
     /// the last line.  If timestamped, the first line of `text` comes after
     /// the time, and the rest after as many spaces.
-    fn styled_line(&mut self, style: Style, text: &str) {
+    pub(crate) fn styled_line(&mut self, style: Style, text: &str) {
         if self.progress_chars > 0 {
             let _ = write!(self.out, "\r{}\r", " ".repeat(self.progress_chars));
             self.progress_chars = 0;
@@ -102,7 +103,7 @@ impl<'a> Printer<'a> {
         let _ = self.out.flush();
     }
 
-    fn line(&mut self, text: &str) {
+    pub(crate) fn line(&mut self, text: &str) {
         self.styled_line(Plain, text);
     }
 
@@ -115,7 +116,7 @@ impl<'a> Printer<'a> {
     /// Shows `text` on the last line in place of the previous progress, if
     /// rewriting, after the time if timestamped and there's room.  Runs of
     /// whitespace, like line breaks, become single spaces.
-    fn progress(&mut self, text: &str) {
+    pub(crate) fn progress(&mut self, text: &str) {
         let Some(columns) = self.columns else { return };
         // \r only goes back to the start of the last row, so the line has to
         // fit in one, with room for the cursor.
@@ -144,7 +145,7 @@ impl Drop for Printer<'_> {
 }
 
 /// `heading`, then each of `items` on an indented line.
-fn indented_list(heading: &str, items: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+pub(crate) fn indented_list(heading: &str, items: impl IntoIterator<Item = impl AsRef<str>>) -> String {
     let mut text = heading.to_string();
     for item in items {
         text.push_str("\n    ");
@@ -307,6 +308,32 @@ fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, lu
             Err(error)
         }
     }
+}
+
+/// Saves what's in the machine's tmux servers (as `facts` has it) on the
+/// machine, for taking it `down`, as the capture to bring back once it's up
+/// again (see [`resume::restore_pending`]) if there's anything in them,
+/// telling the user what that will run again.
+fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &Machine, printer: &mut Printer) -> Result<()> {
+    let purpose = match down {
+        Down::Reboot   => Purpose::Reboot,
+        Down::Shutdown => Purpose::Shutdown,
+    };
+    let capture = Capture::new(purpose, &facts.boot_id, facts.tmux.clone());
+    let path = resume::save(session, &capture, !capture.servers.is_empty())?;
+    if capture.servers.is_empty() {
+        return Ok(());
+    }
+    let when = match down {
+        Down::Reboot   => "after the reboot",
+        Down::Shutdown => "once it's up again",
+    };
+    printer.line(&format!("Saved what's in tmux to {path}, to bring back {when}: {}", capture.counts()));
+    let resumable = capture.resumable(&machine.resumable_commands);
+    if !resumable.is_empty() {
+        printer.line(&indented_list("Commands to run again then:", &resumable));
+    }
+    Ok(())
 }
 
 /// Shows on `printer`'s progress line why the last try at something
@@ -509,9 +536,11 @@ fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut
 
 /// Waits for `machine` to come back from a reboot, out of boot `old_boot_id`
 /// if that's known, unlocking its initrd with `password` (if any) if it
-/// waits there; makes sure it's `machine`; shows how it did; and scrubs
-/// those of its scrub_mounts that no scrub found clean within its
-/// scrub_every_days.  Returns the problems (none if all is well).
+/// waits there; makes sure it's `machine`; shows how it did; brings back
+/// what was in its tmux servers, if a capture of that is pending (see
+/// [`resume::restore_pending`]); and scrubs those of its scrub_mounts that
+/// no scrub found clean within its scrub_every_days.  Returns the problems
+/// (none if all is well).
 fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut password: Option<&str>, printer: &mut Printer) -> Result<Vec<String>> {
     let deadline = Deadline::after(RETURN_TIMEOUT);
     let target        = machine.target();
@@ -535,6 +564,15 @@ fn come_back(ssh: &Ssh, machine: &Machine, old_boot_id: Option<&str>, mut passwo
         }
     };
     let mut problems = postflight(&mut session, &machine.hostname, printer)?;
+    // Before the scrubs, which can take hours
+    match resume::restore_pending(&mut session, machine, printer) {
+        Ok(found) => problems.extend(found),
+        Err(error) => {
+            let problem = format!("couldn't bring tmux back: {error:#}");
+            printer.styled_line(Red, &problem);
+            problems.push(problem);
+        }
+    }
 
     for mountpoint in &machine.scrub_mounts {
         match scrub(&mut session, mountpoint, machine.scrub_every_days, printer) {
@@ -565,9 +603,10 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 /// it has a LUKS device beneath /, gets the password from `password` and
 /// tests it; stops its stop_services; checks again, apart from load and
 /// network traffic (leaving the stop_services stopped if it's no longer
-/// okay); reboots it; answers its initrd's password prompt; waits for it to
-/// come back; shows how it did; and scrubs its scrub_mounts, unless a scrub
-/// found them clean lately (see [`scrub`]).
+/// okay); saves what's in its tmux servers (see [`save_for_resume`]);
+/// reboots it; answers its initrd's password prompt; waits for it to come
+/// back; shows how it did; brings tmux back; and scrubs its scrub_mounts,
+/// unless a scrub found them clean lately (see [`come_back`]).
 /// Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
@@ -593,6 +632,7 @@ pub fn bounce(ssh: &Ssh, machine: &Machine, password: impl FnOnce() -> Result<St
         Ok(stopped) => stopped,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
+    save_for_resume(&mut session, &facts, Down::Reboot, machine, printer).with_context(not_rebooted)?;
     printer.line(&format!("Asking {hostname} to reboot"));
     // Which may have worked even if it failed, e.g. by hanging
     reboot::ask(session, Down::Reboot).with_context(|| format!("failed to ask {hostname} to reboot (if it's rebooting anyway, `reboop catch {hostname}` takes it from there)"))?;
@@ -650,9 +690,10 @@ fn wait_for_down(ssh: &Ssh, machine: &Machine, deadline: Deadline, on_retry: imp
 /// Shuts `machine` down, telling the user about it with `printer`: checks
 /// that it's okay to shut down; stops its stop_services; checks again, apart
 /// from load and network traffic (leaving the stop_services stopped if it's
-/// no longer okay); powers it off; and waits for it to stop accepting SSH,
-/// which is as much of its going down as can be seen.  Problems along the
-/// way are collected for the end.
+/// no longer okay); saves what's in its tmux servers (see
+/// [`save_for_resume`]) for `reboop catch` to bring back; powers it off;
+/// and waits for it to stop accepting SSH, which is as much of its going
+/// down as can be seen.  Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
 /// shut down.
@@ -665,10 +706,11 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Outco
     };
     let systems = &facts.systems;
     printer.line(&format!("{hostname} is okay to shut down, and will boot {} with kernel {} next time", printer.bold(&systems.default), printer.bold(&systems.default_kernel)));
-    let (_, problems) = match stop_and_check_again(machine, &mut session, Down::Shutdown, false, printer).with_context(not_stopped)? {
+    let (facts, problems) = match stop_and_check_again(machine, &mut session, Down::Shutdown, false, printer).with_context(not_stopped)? {
         Ok(stopped) => stopped,
         Err(blockers) => return Ok(Outcome::NotOkay(blockers)),
     };
+    save_for_resume(&mut session, &facts, Down::Shutdown, machine, printer).with_context(not_stopped)?;
     printer.line(&format!("Asking {hostname} to shut down"));
     reboot::ask(session, Down::Shutdown).with_context(|| format!("failed to ask {hostname} to shut down"))?;
     // So that the first try doesn't log in to the machine on its way down,
@@ -697,7 +739,7 @@ fn terminal_columns() -> usize {
 
 /// Calls `print` with a [`Printer`] to stdout that timestamps lines, is in
 /// color if `color`, and shows progress if stdout is a terminal.
-fn with_stdout_printer<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
+pub(crate) fn with_stdout_printer<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
     let mut stdout = io::stdout();
     let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
     print(&mut Printer::new(&mut stdout, color, columns, Some(time_of_day)))

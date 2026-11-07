@@ -22,7 +22,6 @@ pub enum Activity {
     /// A Nix command, a remote build or copy being served, or a builder.
     Nix,
     SwitchToConfiguration,
-    Tmux,
     /// Copying or moving files, or writing or copying a disk image, which
     /// can leave a partial copy if interrupted
     Copy,
@@ -42,7 +41,6 @@ impl fmt::Display for Activity {
         f.write_str(match self {
             Activity::Nix => "nix",
             Activity::SwitchToConfiguration => "switch-to-configuration",
-            Activity::Tmux => "tmux",
             Activity::Copy => "copy",
             Activity::BtrfsSendReceive => "btrfs-send-receive",
             Activity::Cryptsetup => "cryptsetup",
@@ -223,8 +221,6 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::Nix)
     } else if is("switch-to-configuration") {
         Some(Activity::SwitchToConfiguration)
-    } else if is("tmux") {
-        Some(Activity::Tmux)
     } else if is_any(COPY_PROGRAMS) || (is("rclone") && is_rclone_transfer(&process.args)) {
         Some(Activity::Copy)
     } else if matches!(btrfs, Some("send" | "receive")) {
@@ -301,7 +297,7 @@ mod tests {
         assert_eq!(activity_of("root", stc), Some(Activity::SwitchToConfiguration));
         let stc_wrapper = "/nix/store/abc-bash-5.3p9/bin/bash -e /nix/store/abc-nixos-system-foo/bin/switch-to-configuration boot";
         assert_eq!(activity_of("root", stc_wrapper), Some(Activity::SwitchToConfiguration));
-        assert_eq!(activity_of("at", "tmux new -s work"), Some(Activity::Tmux));
+        assert_eq!(activity_of("at", "tmux new -s work"), None);
         for args in [
             "rsync --server -logDtpre.iLsfxCIvu . /backup/",
             "cp -a /data /backup",

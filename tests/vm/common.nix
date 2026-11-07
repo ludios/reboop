@@ -60,6 +60,19 @@
     uid = 1000;
   };
 
+  # zsh-spy, which reboop reads to tell what the panes of a tmux server are
+  # running, as on the real machines; and hist_ignore_space, which hides
+  # lines typed with a leading space from it.
+  programs.zsh.interactiveShellInit = ''
+    setopt hist_ignore_space
+    source ${pkgs.fetchFromGitHub {
+      owner = "ludios";
+      repo = "zsh-spy";
+      rev = "d6b8a3012b20e5d3e2d8532f24e86a5c5af9edbf";
+      hash = "sha256-ESW3tzkmkdhXSnDlmRJlSDp6n2Elm+dTfE+LyTFSkDA=";
+    }}/zsh-spy.zsh
+  '';
+
   environment.systemPackages = with pkgs; [
     tmux
     rsync

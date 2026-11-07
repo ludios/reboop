@@ -15,15 +15,17 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use reboop::boot;
 use reboop::bounce::{self, Outcome, Printer};
 use reboop::btrfs::{self, Device, ScrubState};
-use reboop::config::Machine;
+use reboop::config::{Machine, TmuxPolicy};
 use reboop::deadline::{Deadline, Permanent};
 use reboop::facts::{self, Rebuild};
 use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
 use reboop::processes::{self, Activity};
 use reboop::reboot::{self, Down, Stopped};
+use reboop::resume::{self, Capture, Purpose};
 use reboop::smart::Smart;
 use reboop::ssh::{Session, shell_quote, wait_for_session};
+use reboop::tmux::{self, CommandPatterns, Running, Server};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -79,7 +81,7 @@ fn session_runs_commands(vm: &Vm) -> Result<()> {
     assert_eq!(big.lines().count(), 300_000);
 
     // The tools the primitives use are on the PATH.
-    sh(&mut session, "command -v systemctl btrfs findmnt ps dmesg base64 mktemp")?;
+    sh(&mut session, "command -v systemctl btrfs findmnt ps dmesg base64 mktemp ss stat stty tmux systemd-run systemd-escape")?;
     Ok(())
 }
 
@@ -219,9 +221,45 @@ fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
     Ok(())
 }
 
-/// Starts a real tmux server, owned by someone other than root.  (Transient
+/// Starts a real tmux server, owned by someone other than root, with a
+/// session "work" whose window 0 is a zsh pane in /var/tmp.  (Transient
 /// units get a minimal PATH, hence the -E PATH.)
-const START_TMUX: &str = "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d sleep 600";
+const START_TMUX: &str = "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d -s work -x 100 -y 30 -c /var/tmp";
+
+/// Where tester's tmux server (see [`START_TMUX`]) listens.
+const TESTER_SOCKET: &str = "/tmp/tmux-1000/default";
+
+/// Waits for tester's tmux server to be listed, and returns it as listed.
+fn tester_tmux(session: &mut Session) -> Result<Server> {
+    let deadline = Deadline::after(MINUTE);
+    loop {
+        if let Some(server) = tmux::capture(session)?.into_iter().find(|server| server.user == "tester") {
+            return Ok(server);
+        }
+        ensure!(!deadline.has_passed(), "tester's tmux server didn't show up");
+        sleep(Duration::from_millis(200));
+    }
+}
+
+/// Types `text` and Enter into pane `target` of tester's tmux, once the
+/// pane's shell is at its prompt.
+fn type_into(session: &mut Session, target: &str, text: &str) -> Result<()> {
+    let ready = format!("stty -F \"$(tmux -S {TESTER_SOCKET} display -p -t {target} -F '#{{pane_tty}}')\" -a | grep -q -- -icanon");
+    wait_for(|| Ok(session.run(&ready, MINUTE)?.status == 0))?;
+    sh(session, &format!("tmux -S {TESTER_SOCKET} send-keys -t {target} {} Enter", shell_quote(text))).map(drop)
+}
+
+/// The pane at `location` (like "work:0.0") in `server`.
+fn pane<'a>(server: &'a Server, location: &str) -> Result<&'a tmux::Pane> {
+    server.panes().find(|(at, _)| at == location).map(|(_, pane)| pane).ok_or_else(|| anyhow!("no pane {location} in {server:#?}"))
+}
+
+/// Makes sure the pane at `location` in `server` is in `cwd` and `running`.
+fn expect_pane(server: &Server, location: &str, cwd: &str, running: Running) -> Result<()> {
+    let pane = pane(server, location)?;
+    ensure!(pane.cwd == cwd && pane.running == running, "{location}: {pane:#?}");
+    Ok(())
+}
 
 fn activities(session: &mut Session) -> Result<BTreeSet<Activity>> {
     Ok(processes::list(session)?.iter().filter_map(processes::activity).collect())
@@ -231,7 +269,6 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     let mut session = clean_session(vm)?;
     assert_eq!(activities(&mut session)?, BTreeSet::new(), "{:#?}", processes::list(&mut session)?);
 
-    sh(&mut session, START_TMUX)?;
     // A real, slow rsync (see START_TMUX about -E PATH)
     sh(&mut session, "head -c 10M /dev/zero >/var/tmp/reboop-test-rsync && \
                       systemd-run --quiet --unit=reboop-test-rsync -E PATH rsync --bwlimit=10 /var/tmp/reboop-test-rsync /var/tmp/reboop-test-rsync-copy")?;
@@ -260,7 +297,6 @@ fn activities_are_detected(vm: &Vm) -> Result<()> {
     let expected = BTreeSet::from([
         Activity::Nix,
         Activity::SwitchToConfiguration,
-        Activity::Tmux,
         Activity::Copy,
         Activity::BtrfsSendReceive,
         Activity::Cryptsetup,
@@ -301,7 +337,19 @@ fn vm_machine(vm: &Vm) -> Machine {
         check_rebuild: true,
         luks_signing_key: "/nonexistent".into(),
         stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-nonexistent.service".into()],
+        tmux: TmuxPolicy::Block,
+        resumable_commands: patterns(&[]),
     }
+}
+
+fn patterns(patterns: &[&str]) -> CommandPatterns {
+    CommandPatterns::new(patterns.iter().map(|&pattern| pattern.into()).collect()).unwrap()
+}
+
+/// The VM as a configured machine whose tmux is "resume", with `patterns`
+/// as its resumable_commands.
+fn resuming_machine(vm: &Vm, patterns: &[&str]) -> Machine {
+    Machine { tmux: TmuxPolicy::Resume, resumable_commands: self::patterns(patterns), ..vm_machine(vm) }
 }
 
 fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
@@ -324,9 +372,9 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     assert_eq!(preflight::blockers(&easily_full, &facts), [format!("root filesystem: {used}% used, and it's full at {used}%")]);
 
     sh(&mut session, START_TMUX)?;
-    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    tester_tmux(&mut session)?;
     let blockers = preflight::blockers(&machine, &preflight::gather(&mut session, &machine.hostname)?);
-    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: pid ")), "{blockers:?}");
+    assert_eq!(blockers, [format!("tmux: tester's server at {TESTER_SOCKET} has 1 session and 1 pane (tmux is \"block\")")]);
     clean_up(&mut session)?;
 
     // Programs holding inhibitor locks, one of which only delays a reboot.
@@ -777,10 +825,10 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let machine = vm_machine(vm);
     let hostname = &machine.hostname;
     let password = || vm.luks_password().map(str::to_string);
-    // Bounces the VM, printing what it says, and returns that too.
-    let bounce_vm = || -> Result<(Outcome, String)> {
+    // Bounces the VM as `machine`, printing what it says, and returns that too.
+    let bounce_vm = |machine: &Machine| -> Result<(Outcome, String)> {
         let mut printed = Vec::new();
-        let outcome = bounce::bounce(&vm.ssh, &machine, password, &mut Printer::new(&mut printed, false, None, None));
+        let outcome = bounce::bounce(&vm.ssh, machine, password, &mut Printer::new(&mut printed, false, None, None));
         let printed = String::from_utf8(printed)?;
         print!("{printed}");
         Ok((outcome?, printed))
@@ -790,12 +838,12 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     let is_active = "systemctl is-active --quiet reboop-test-sleep.service";
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     sh(&mut session, START_TMUX)?;
-    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    tester_tmux(&mut session)?;
     let boot_id = facts::boot_id(&mut session)?;
-    let (Outcome::NotOkay(blockers), _) = bounce_vm()? else {
+    let (Outcome::NotOkay(blockers), _) = bounce_vm(&machine)? else {
         bail!("bounced despite the tmux");
     };
-    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: ")), "{blockers:?}");
+    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: tester's server at ")), "{blockers:?}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
     sh(&mut session, is_active)?;
     clean_up(&mut session)?;
@@ -805,7 +853,7 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     // since transient units get a minimal PATH.)
     sh(&mut session, r#"systemd-run --quiet --unit=reboop-test-sleep \
         -p "ExecStopPost=$(command -v systemd-run) --quiet --no-block --unit=reboop-test-job -p Type=oneshot $(command -v sleep) 600" sleep 600"#)?;
-    let (Outcome::NotOkay(blockers), printed) = bounce_vm()? else {
+    let (Outcome::NotOkay(blockers), printed) = bounce_vm(&machine)? else {
         bail!("bounced despite the job");
     };
     assert_eq!(blockers, ["systemd job: start reboop-test-job.service (running) for 5s or more"]);
@@ -828,8 +876,19 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     // configuration on disk is the old one, which only gets a warning.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
     set_evaluated_toplevel(&mut session, &before.current)?;
-    let (outcome, printed) = bounce_vm()?;
+    // And tester has a tmux with a resumable command typed into it, which
+    // the machine's tmux setting has brought back after the reboot.
+    sh(&mut session, START_TMUX)?;
+    tester_tmux(&mut session)?;
+    type_into(&mut session, "work:0.0", "sleep 601")?;
+    wait_for(|| Ok(matches!(pane(&tester_tmux(&mut session)?, "work:0.0")?.running, Running::Typed { .. })))?;
+    let (outcome, printed) = bounce_vm(&resuming_machine(vm, &["sleep 601"]))?;
     assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
+    let saving = "\nSaved what's in tmux to /var/lib/reboop/tmux/";
+    assert!(printed.contains(saving) && printed.contains(".reboot.json, to bring back after the reboot: 1 tmux server with 1 session and 1 pane\n"), "{printed}");
+    assert!(printed.contains("\nCommands to run again then:\n    tester's work:0.0 in /var/tmp: sleep 601\n"), "{printed}");
+    assert!(printed.contains("\nBringing back what was in tmux, from /var/lib/reboop/tmux/"), "{printed}");
+    assert!(printed.contains(&format!("\nBringing back tester's tmux server at {TESTER_SOCKET}: 1 session and 1 pane\nResumed tester's work:0.0 in /var/tmp: sleep 601\n")), "{printed}");
     let warning = format!("\n{hostname}: nixos-rebuild would change the system: {next} → {}\n", before.current);
     assert!(printed.contains(&warning), "{printed}");
     let stopping = format!(
@@ -850,6 +909,12 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_eq!(after.reboot_reasons(), Vec::<String>::new(), "{after:?}");
     assert_eq!(after.running_kernel, expected.default_kernel);
     assert_eq!(sh(&mut session, "cat /etc/reboop-test-variant")?, next_variant);
+    // tester's tmux is back, with the command running again, as zsh-spy
+    // recorded it being typed again; and the capture isn't pending anymore.
+    wait_for(|| Ok(matches!(pane(&tester_tmux(&mut session)?, "work:0.0")?.running, Running::Typed { .. })))?;
+    expect_pane(&tester_tmux(&mut session)?, "work:0.0", "/var/tmp", Running::Typed { command: "sleep 601".into() })?;
+    assert!(sh(&mut session, "ps -u tester -o args=")?.lines().any(|args| args == "sleep 601"));
+    assert!(resume::pending(&mut session)?.is_none());
     Ok(())
 }
 
@@ -868,11 +933,11 @@ fn stop_powers_off(vm: &Vm) -> Result<()> {
 
     // Not while someone has a tmux
     sh(&mut session, START_TMUX)?;
-    wait_for(|| Ok(activities(&mut session)?.contains(&Activity::Tmux)))?;
+    tester_tmux(&mut session)?;
     let (Outcome::NotOkay(blockers), printed) = stop_vm()? else {
         bail!("stopped despite the tmux");
     };
-    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: ")), "{blockers:?}");
+    assert!(!blockers.is_empty() && blockers.iter().all(|blocker| blocker.starts_with("tmux: tester's server at ")), "{blockers:?}");
     assert!(printed.contains(&format!("\nNot shutting down {hostname}:\n")), "{printed}");
     clean_up(&mut session)?;
 
@@ -896,6 +961,131 @@ fn stop_powers_off(vm: &Vm) -> Result<()> {
     );
     assert!(printed.contains(&stopping), "{printed}");
     Ok(())
+}
+
+fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
+    let mut session = clean_session(vm)?;
+    assert_eq!(tmux::capture(&mut session)?, Vec::<Server>::new());
+    let tmux_cmd = format!("tmux -S {TESTER_SOCKET}");
+
+    // tester's server: session work with window 0 (a zsh pane in /var/tmp,
+    // then one in /home/tester), window 3, "jobs", started with sleep 600 in
+    // /tmp, and window 5 in a directory that'll be gone; and session other,
+    // with a background job, and a line typed with a leading space.
+    sh(&mut session, START_TMUX)?;
+    tester_tmux(&mut session)?;
+    sh(
+        &mut session,
+        &format!(
+            "mkdir -p /var/tmp/reboop-test-gone && chown tester /var/tmp/reboop-test-gone && \
+             {tmux_cmd} split-window -d -h -t work:0 -c /home/tester && {tmux_cmd} new-window -d -t work:3 -n jobs -c /tmp 'sleep 600' && \
+             {tmux_cmd} new-window -d -t work:5 -c /var/tmp/reboop-test-gone && {tmux_cmd} new-session -d -s other -c /tmp && {tmux_cmd} new-window -d -t other:1 -c /tmp"
+        ),
+    )?;
+    type_into(&mut session, "work:0.0", "sleep 601")?;
+    type_into(&mut session, "work:5.0", "sleep 604")?;
+    type_into(&mut session, "other:0.0", "sleep 602 &")?;
+    type_into(&mut session, "other:1.0", " sleep 603")?;
+    // zsh-spy has written about each once its command is running.
+    wait_for(|| {
+        let server = tester_tmux(&mut session)?;
+        Ok(matches!(pane(&server, "other:0.0")?.running, Running::Background { .. }) && matches!(pane(&server, "other:1.0")?.running, Running::Unknown { .. }))
+    })?;
+    let server = tester_tmux(&mut session)?;
+    assert_eq!((server.user.as_str(), server.socket.as_str(), &server.error), ("tester", TESTER_SOCKET, &None));
+    let typed = |command: &str| Running::Typed { command: command.into() };
+    expect_pane(&server, "work:0.0", "/var/tmp", typed("sleep 601"))?;
+    expect_pane(&server, "work:0.1", "/home/tester", Running::Idle)?;
+    expect_pane(&server, "work:3.0", "/tmp", Running::Started { command: "\"sleep 600\"".into() })?;
+    expect_pane(&server, "work:5.0", "/var/tmp/reboop-test-gone", typed("sleep 604"))?;
+    expect_pane(&server, "other:0.0", "/tmp", Running::Background { jobs: vec![Some("sleep 602".into())] })?;
+    expect_pane(&server, "other:1.0", "/tmp", Running::Unknown { program: "sleep".into() })?;
+    assert_eq!(pane(&server, "work:0.0")?.mountpoint, "/");
+    let work = server.sessions.iter().find(|tmux_session| tmux_session.name == "work").unwrap();
+    assert_eq!(work.windows.iter().map(|window| (window.index, window.name.as_deref(), window.panes.len())).collect::<Vec<_>>(), [(0, None, 2), (3, Some("jobs"), 1), (5, None, 1)]);
+    assert!(work.windows[0].active && work.windows[0].panes[0].active && !work.windows[0].panes[1].active, "{work:#?}");
+
+    // What blocks a reboot: with tmux "block", the server; with "resume",
+    // the background job and the line typed with a leading space.
+    let machine = vm_machine(vm);
+    let resuming = resuming_machine(vm, &["sleep 60[14]", "\"sleep 600\""]);
+    let facts = preflight::gather(&mut session, &machine.hostname)?;
+    assert_eq!(preflight::blockers(&machine, &facts), [format!("tmux: tester's server at {TESTER_SOCKET} has 2 sessions and 6 panes (tmux is \"block\")")]);
+    assert_eq!(
+        preflight::blockers(&resuming, &facts),
+        [
+            "tmux: tester's other:0.0 in /tmp: a background job is still running: sleep 602",
+            "tmux: tester's other:1.0 in /tmp: running sleep, but what was typed to start it is unknown",
+        ]
+    );
+    // `reboop tmux list` says as much, and saves a look at the servers.
+    let mut printed = Vec::new();
+    resume::list(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
+    let printed = String::from_utf8(printed)?;
+    print!("{printed}");
+    let listing = format!("tester's tmux server at {TESTER_SOCKET} (pid {}): 2 sessions and 6 panes\n    other:0.0 in /tmp: a background job is still running: sleep 602\n", server.pid);
+    assert!(printed.contains(&listing), "{printed}");
+    assert!(printed.contains("\n    work:0.0 in /var/tmp: sleep 601 (resumable)\n    work:0.1 in /home/tester: idle\n    work:3.0 in /tmp: \"sleep 600\" (resumable)\n"), "{printed}");
+    let saved = sh(&mut session, &format!("ls {}", resume::DIR))?;
+    assert!(saved.lines().count() == 1 && saved.ends_with(".check.json\n"), "{saved}");
+
+    // `reboop tmux stop` refuses for the same reasons.
+    let mut printed = Vec::new();
+    let refused = resume::stop(&vm.ssh, &resuming, &mut Printer::new(&mut printed, false, None, None))?;
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(String::from_utf8(printed)?.contains(&format!("\nNot stopping tmux on {}:\n    tmux: tester's other:0.0", machine.hostname)));
+    tester_tmux(&mut session)?;
+    // Without those, it stops the server, having saved what's in it.
+    sh(&mut session, &format!("{tmux_cmd} kill-session -t other"))?;
+    let geometry = |session: &mut Session| sh(session, &format!("{tmux_cmd} list-panes -a -F '#{{session_name}}:#{{window_index}}.#{{pane_index}} #{{pane_left}},#{{pane_top}} #{{pane_width}}x#{{pane_height}}'"));
+    let before = geometry(&mut session)?;
+    let mut printed = Vec::new();
+    let refused = resume::stop(&vm.ssh, &resuming, &mut Printer::new(&mut printed, false, None, None))?;
+    let printed = String::from_utf8(printed)?;
+    print!("{printed}");
+    assert_eq!(refused, Vec::<String>::new());
+    let to_run = "\nCommands to run again then:\n    tester's work:0.0 in /var/tmp: sleep 601\n    tester's work:3.0 in /tmp: \"sleep 600\"\n    tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604\n";
+    assert!(printed.contains(to_run) && printed.contains(&format!("\nStopped tester's tmux server at {TESTER_SOCKET}\n")), "{printed}");
+    assert_eq!(tmux::capture(&mut session)?, Vec::<Server>::new());
+    let (path, pending) = resume::pending(&mut session)?.ok_or_else(|| anyhow!("nothing is pending"))?;
+    assert_eq!(pending.purpose, Purpose::TmuxStop);
+    assert!(path.starts_with("/var/lib/reboop/tmux/") && path.ends_with(".tmux-stop.json"), "{path}");
+
+    // `reboop tmux start` brings it all back, but for the pane whose
+    // directory is gone: the server runs in a logind session of tester's, in
+    // a unit of its own.
+    sh(&mut session, "rmdir /var/tmp/reboop-test-gone")?;
+    let mut printed = Vec::new();
+    let problems = resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
+    let printed = String::from_utf8(printed)?;
+    print!("{printed}");
+    assert_eq!(problems, ["tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604 wasn't run again: its shell is in \"/home/tester\" (does /var/tmp/reboop-test-gone exist?)"]);
+    assert!(printed.contains("\nResumed tester's work:0.0 in /var/tmp: sleep 601\n") && printed.contains("\nResumed tester's work:3.0 in /tmp: \"sleep 600\"\n"), "{printed}");
+    assert!(resume::pending(&mut session)?.is_none());
+    wait_for(|| Ok(matches!(pane(&tester_tmux(&mut session)?, "work:0.0")?.running, Running::Typed { .. })))?;
+    let server = tester_tmux(&mut session)?;
+    expect_pane(&server, "work:0.0", "/var/tmp", typed("sleep 601"))?;
+    expect_pane(&server, "work:0.1", "/home/tester", Running::Idle)?;
+    expect_pane(&server, "work:3.0", "/tmp", Running::Started { command: "\"sleep 600\"".into() })?;
+    expect_pane(&server, "work:5.0", "/home/tester", Running::Idle)?;
+    assert_eq!(server.sessions[0].windows.iter().map(|window| (window.index, window.name.as_deref())).collect::<Vec<_>>(), [(0, None), (3, Some("jobs")), (5, None)]);
+    assert_eq!(geometry(&mut session)?, before);
+    let cgroup = sh(&mut session, &format!("cat /proc/{}/cgroup", server.pid))?;
+    assert!(cgroup.contains("/reboop-tmux-tester-"), "{cgroup}");
+    assert!(sh(&mut session, "loginctl list-users")?.contains("tester"));
+    // Nothing is pending anymore, so `start` needs a saved capture, whose
+    // sessions are then already there.
+    assert!(resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut Vec::new(), false, None, None)).is_err());
+    let problems = resume::start(&vm.ssh, &resuming, Some(&path), &mut Printer::new(&mut Vec::new(), false, None, None))?;
+    assert_eq!(problems, [format!("tester's tmux at {TESTER_SOCKET} already has a session called work, which was left alone")]);
+    // A capture pending for a reboot that hasn't happened isn't brought back.
+    let boot_id = facts::boot_id(&mut session)?;
+    resume::save(&mut session, &Capture::new(Purpose::Reboot, &boot_id, vec![server.clone()]), true)?;
+    let mut printed = Vec::new();
+    assert_eq!(resume::restore_pending(&mut session, &resuming, &mut Printer::new(&mut printed, false, None, None))?, Vec::<String>::new());
+    assert!(String::from_utf8(printed)?.contains(" is from this boot, so what it describes is still running; not bringing it back\n"));
+    assert!(resume::pending(&mut session)?.is_none());
+    clean_up(&mut session)
 }
 
 /// Runs `test` against the VM called `name`, which is set up by the first
@@ -931,6 +1121,7 @@ fn main() {
         ("scrub_status_outlasts_a_locked_status_file", scrub_status_outlasts_a_locked_status_file),
         ("stop_unit", stop_unit),
         ("postflight_facts", postflight_facts),
+        ("tmux_is_captured_stopped_and_started", tmux_is_captured_stopped_and_started),
         ("systemd_boots_default_is_checked", systemd_boots_default_is_checked),
         ("luks_password_is_tested", luks_password_is_tested),
         ("catch_with_wrong_password_first", catch_with_wrong_password_first),

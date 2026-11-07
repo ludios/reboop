@@ -2,7 +2,7 @@ use anstream::AutoStream;
 use anstream::stream::RawStream;
 use clap::{ColorChoice, Parser};
 use mimalloc::MiMalloc;
-use reboop::{bounce, check, luks_password};
+use reboop::{bounce, check, luks_password, resume};
 use std::process::ExitCode;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
@@ -73,6 +73,10 @@ enum ReboopCommand {
         #[clap(flatten)]
         color: ColorOption,
     },
+    /// Show what's in a machine's tmux servers, stop them to bring them
+    /// back later, or bring them back; see `reboop tmux --help`.
+    #[clap(name = "tmux", subcommand)]
+    Tmux(TmuxCommand),
     /// Ask for a machine's LUKS password, check over SSH that it opens the
     /// LUKS device beneath /, and store it encrypted with the machine's
     /// luks_signing_key for unlocking the machine after a reboot
@@ -89,6 +93,60 @@ enum ReboopCommand {
     GetLuksPassword {
         /// A machine from machines.jsonl
         hostname: String,
+    },
+}
+
+/// What's in a machine's tmux servers: every session, window and pane, with
+/// the pane's directory and the command it's running, as zsh-spy recorded
+/// it being typed.  A bounce saves that right before the reboot and brings
+/// it back afterwards, running the commands that the machine's
+/// resumable_commands allow again, if its tmux setting is "resume".
+#[derive(clap::Subcommand, Debug)]
+enum TmuxCommand {
+    /// List what's in a machine's tmux servers: each pane's directory and
+    /// what it's running, and whether that would be run again after a
+    /// reboot.  (Saved on the machine like every look at the servers: see
+    /// --saved.)
+    /// Exits 0, or 1 if that failed.
+    #[clap(name = "list")]
+    List {
+        /// A machine from machines.jsonl
+        hostname: String,
+        /// Show a capture saved on the machine instead: a file in
+        /// /var/lib/reboop/tmux, by its name there or its path
+        #[clap(long, value_name = "FILE")]
+        saved: Option<String>,
+        #[clap(flatten)]
+        color: ColorOption,
+    },
+    /// Save what's in a machine's tmux servers and kill them, for `reboop
+    /// tmux start` to bring back (e.g. around upgrading tmux).  Refuses if
+    /// a pane runs something that isn't resumable, as a reboot would.
+    /// Exits 0 if the servers were stopped, 2 if it wasn't okay to, or 1 if
+    /// something failed.
+    #[clap(name = "stop")]
+    Stop {
+        /// A machine from machines.jsonl
+        hostname: String,
+        #[clap(flatten)]
+        color: ColorOption,
+    },
+    /// Bring back what was in a machine's tmux servers when `reboop tmux
+    /// stop` stopped them, or when reboop rebooted or shut down the machine
+    /// but didn't get to bring them back: recreate the sessions, windows and
+    /// panes, and run the commands that are resumable again.
+    /// Exits 0 if all is well, or 1 if something couldn't be brought back
+    /// or something failed.
+    #[clap(name = "start")]
+    Start {
+        /// A machine from machines.jsonl
+        hostname: String,
+        /// Bring back a capture saved on the machine instead: a file in
+        /// /var/lib/reboop/tmux, by its name there or its path
+        #[clap(long, value_name = "FILE")]
+        saved: Option<String>,
+        #[clap(flatten)]
+        color: ColorOption,
     },
 }
 
@@ -125,6 +183,9 @@ fn main() -> ExitCode {
         ReboopCommand::Bounce { hostname, color: ColorOption { color } } => bounce::run(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Catch { hostname, color: ColorOption { color } } => bounce::run_catch(&hostname, styles(&std::io::stdout(), color)),
         ReboopCommand::Stop { hostname, color: ColorOption { color } } => bounce::run_stop(&hostname, styles(&std::io::stdout(), color)),
+        ReboopCommand::Tmux(TmuxCommand::List { hostname, saved, color: ColorOption { color } }) => resume::run_list(&hostname, saved.as_deref(), styles(&std::io::stdout(), color)),
+        ReboopCommand::Tmux(TmuxCommand::Stop { hostname, color: ColorOption { color } }) => resume::run_stop(&hostname, styles(&std::io::stdout(), color)),
+        ReboopCommand::Tmux(TmuxCommand::Start { hostname, saved, color: ColorOption { color } }) => resume::run_start(&hostname, saved.as_deref(), styles(&std::io::stdout(), color)),
         ReboopCommand::SetLuksPassword { hostname, no_test_passphrase } => luks_password::set(&hostname, !no_test_passphrase).map(|()| 0),
         ReboopCommand::GetLuksPassword { hostname } => luks_password::get(&hostname).map(|()| 0),
     };
@@ -159,5 +220,13 @@ mod tests {
             command => panic!("parsed as {command:?}"),
         }
         assert!(ReboopCommand::try_parse_from(["reboop", "bounce", "one", "two"]).is_err());
+
+        match ReboopCommand::try_parse_from(["reboop", "tmux", "start", "one", "--saved", "20261107T063228Z.check.json"]).unwrap() {
+            ReboopCommand::Tmux(TmuxCommand::Start { hostname, saved, .. }) => assert_eq!((hostname.as_str(), saved.as_deref()), ("one", Some("20261107T063228Z.check.json"))),
+            command => panic!("parsed as {command:?}"),
+        }
+        assert!(matches!(ReboopCommand::try_parse_from(["reboop", "tmux", "stop", "one"]).unwrap(), ReboopCommand::Tmux(TmuxCommand::Stop { .. })));
+        assert!(ReboopCommand::try_parse_from(["reboop", "tmux", "stop", "one", "--saved", "x"]).is_err());
+        assert!(ReboopCommand::try_parse_from(["reboop", "tmux"]).is_err());
     }
 }

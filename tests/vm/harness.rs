@@ -325,6 +325,13 @@ const CLEAN_UP: &str = r#"
 systemctl stop 'reboop-test-*' 2>/dev/null
 systemctl stop 'reboop-test-*' 2>/dev/null
 systemctl reset-failed 'reboop-test-*' 2>/dev/null
+# tester's tmux servers (those reboop brought back run in units of their
+# own, in a logind session), the rest of tester's processes, what zsh-spy
+# wrote for tester, and reboop's captures of what was in tmux
+systemctl stop 'reboop-tmux-*' 2>/dev/null
+loginctl terminate-user tester 2>/dev/null
+pkill -u tester 2>/dev/null
+rm -rf /tmp/tmux-1000 /home/tester/.local/state/zsh-spy /var/lib/reboop/tmux
 for m in /mnt/reboop-test-*; do
     [ -d "$m" ] || continue
     btrfs scrub cancel "$m" >/dev/null 2>&1

@@ -8,6 +8,7 @@ use crate::human;
 use crate::processes::{self, Activity, Process};
 use crate::smart::{self, Disk, Smart};
 use crate::ssh::Session;
+use crate::tmux::{self, Server};
 use anyhow::Result;
 use jiff::Timestamp;
 use serde::Serialize;
@@ -61,6 +62,8 @@ pub struct Facts {
     pub root_used_percent: u8,
     /// Processes that a reboot would interrupt, by what they're doing.
     pub busy_processes: BTreeMap<Activity, Vec<Process>>,
+    /// Every tmux server, and what's in it: see [`tmux::capture`].
+    pub tmux: Vec<Server>,
     /// All inhibitor locks, including those that don't block a reboot.
     pub inhibitors: Vec<Inhibitor>,
     /// systemd's jobs that were there both before and after
@@ -126,6 +129,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         network_bytes_per_sec,
         root_used_percent: facts::root_used_percent(session)?,
         busy_processes,
+        tmux: tmux::capture(session)?,
         inhibitors: facts::inhibitors(session)?,
         lasting_jobs,
         btrfs,
@@ -230,6 +234,7 @@ pub fn blockers_ignoring_load_and_network(machine: &Machine, facts: &Facts) -> V
             more => blockers.push(format!("{activity}: {more} more processes")),
         }
     }
+    blockers.extend(tmux::blockers(machine.tmux, &machine.resumable_commands, &facts.tmux));
     for inhibitor in facts.inhibitors.iter().filter(|inhibitor| inhibitor.blocks_shutdown()) {
         let why = if inhibitor.why.is_empty() { String::new() } else { format!(" ({})", inhibitor.why) };
         blockers.push(format!("inhibitor: {}{why}, pid {} ({})", inhibitor.who, inhibitor.pid, inhibitor.user));
@@ -305,6 +310,7 @@ pub(crate) fn idle_facts() -> Facts {
         network_bytes_per_sec: 1_000.0,
         root_used_percent: 45,
         busy_processes: BTreeMap::new(),
+        tmux: vec![],
         inhibitors: vec![],
         lasting_jobs: vec![],
         btrfs: vec![BtrfsFacts {
@@ -337,6 +343,8 @@ pub(crate) fn test_machine() -> Machine {
         check_rebuild: true,
         luks_signing_key: "/home/user/.ssh/id_ed25519.pub".into(),
         stop_services: vec![],
+        tmux: crate::config::TmuxPolicy::Block,
+        resumable_commands: tmux::CommandPatterns::new(vec![]).unwrap(),
     }
 }
 
@@ -384,7 +392,7 @@ mod tests {
         disks.push(DiskFacts { disk: Disk { path: "/dev/sdb".into(), model: None, serial: None }, smart: Smart::Read { passed: None, warnings: BTreeMap::new(), incomplete: Some("no".into()) } });
         disks.push(DiskFacts { disk: Disk { path: "/dev/sdc".into(), model: None, serial: None }, smart: Smart::Read { passed: Some(false), warnings: BTreeMap::new(), incomplete: None } });
         disks.push(DiskFacts { disk: Disk { path: "/dev/sdd".into(), model: None, serial: None }, smart: Smart::NoAnswer { no_answer_within_secs: 10 } });
-        facts.busy_processes.insert(Activity::Tmux, vec![process(1234, 1, "at", "tmux new -s work")]);
+        facts.tmux.push(tmux::tests::test_server());
         let inhibitor = |mode: &str, why: &str| Inhibitor {
             what: "shutdown".into(),
             who: "crawl".into(),
@@ -411,7 +419,7 @@ mod tests {
                 "smart on /dev/sda (QEMU HARDDISK, serial QM00001): Current_Pending_Sector=2",
                 "smart on /dev/sdc: overall health FAILED",
                 "smart on /dev/sdd: didn't answer smartctl within 10s",
-                "tmux: pid 1234 (at): tmux new -s work",
+                "tmux: at's server at /tmp/tmux-1000/default has 1 session and 3 panes (tmux is \"block\")",
                 "inhibitor: crawl (archiving), pid 42 (at)",
                 "inhibitor: crawl, pid 42 (at)",
                 "systemd job: start nixos-upgrade.service (running) for 5s or more",

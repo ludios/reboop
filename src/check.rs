@@ -5,10 +5,13 @@ use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red}};
+use crate::config::TmuxPolicy;
 use crate::preflight::{self, DiskFacts, Facts};
 use crate::processes::Activity;
+use crate::resume::{self, Capture, Purpose};
 use crate::smart::Smart;
 use crate::ssh::{OPEN_TIMEOUT, Session, Ssh};
+use crate::tmux::{self, Running};
 use anyhow::{Result, ensure};
 use jiff::tz::TimeZone;
 use serde::Serialize;
@@ -24,13 +27,15 @@ fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
+    // A record of what was in tmux, for after a crash: see resume::DIR.
+    resume::save(&mut session, &Capture::new(Purpose::Check, &facts.boot_id, facts.tmux.clone()), false)?;
     // After the facts, which the evaluation would skew, e.g. the load
     let rebuild = machine.check_rebuild.then(|| facts::rebuild(&mut session, &facts.systems.default));
     Ok((facts, blockers, rebuild))
 }
 
 /// The activities that have columns of their own.
-const ACTIVITY_COLUMNS: [Activity; 3] = [Activity::Nix, Activity::Tmux, Activity::Copy];
+const ACTIVITY_COLUMNS: [Activity; 2] = [Activity::Nix, Activity::Copy];
 
 const HEADER: [&str; 16] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "COPY", "NET", "LOAD", "ROOT", "SMART", "OTHER", "REBUILD", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
 
@@ -82,6 +87,25 @@ fn smart_cell(facts: &Facts) -> Cell {
     }
 }
 
+/// The TMUX cell: nothing if the machine has no tmux server; with `tmux`
+/// block, how many servers it has, in red, as they block a reboot; with
+/// resume, how many panes are running something, in red if any of that (or
+/// a server that couldn't be listed) blocks a reboot, else in green.
+fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
+    if facts.tmux.is_empty() {
+        return Plain.cell("");
+    }
+    let cell = match machine.tmux {
+        TmuxPolicy::Block => Red.cell(facts.tmux.len().to_string()),
+        TmuxPolicy::Resume => {
+            let running = facts.tmux.iter().flat_map(|server| server.panes()).filter(|(_, pane)| pane.running != Running::Idle).count();
+            let blocks = !tmux::blockers(machine.tmux, &machine.resumable_commands, &facts.tmux).is_empty();
+            (if blocks { Red } else { Green }).cell(running.to_string())
+        }
+    };
+    cell.aligned(Right)
+}
+
 /// The table row about `machine`: the facts that decide whether to reboot
 /// it, red where they block a reboot, whether a nixos-rebuild would change
 /// it ("ok" if not, "stale" if so, "?" if that couldn't be evaluated, or
@@ -110,7 +134,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         if blockers.is_empty() { Green.cell("yes") } else { Red.cell("no") },
         list(Red, scrubbing.collect()),
         count(Activity::Nix),
-        count(Activity::Tmux),
+        tmux_cell(machine, facts),
         count(Activity::Copy),
         number(preflight::network_over_limit(machine, facts), human::rate(facts.network_bytes_per_sec)),
         number(preflight::load_over_limit(machine, facts), format!("{:.2}", facts.load_average_1min)),
@@ -264,8 +288,7 @@ mod tests {
         facts.btrfs[0].exclusive_operation = "balance".into();
         facts.btrfs[0].devices[0].missing = true;
         facts.disks.as_mut().unwrap()[0].smart = Smart::Read { passed: Some(false), warnings: BTreeMap::from([("Reallocated_Sector_Ct".into(), 5)]), incomplete: None };
-        let tmux = Process { pid: 1234, ppid: 1, user: "at".into(), args: "tmux new -s work".into() };
-        facts.busy_processes.insert(Activity::Tmux, vec![tmux]);
+        facts.tmux.push(tmux::tests::test_server());
         let switch = Process { pid: 1236, ppid: 1, user: "root".into(), args: "/run/current-system/bin/switch-to-configuration boot".into() };
         facts.busy_processes.insert(Activity::SwitchToConfiguration, vec![switch]);
         let reencrypt = Process { pid: 1235, ppid: 1, user: "root".into(), args: "cryptsetup reencrypt /dev/sda2".into() };
@@ -322,8 +345,8 @@ mod tests {
              one: btrfs on /: device 1 is missing\n\
              one: smart on /dev/sda (QEMU HARDDISK, serial QM00001): overall health FAILED, Reallocated_Sector_Ct=5\n\
              one: switch-to-configuration: pid 1236 (root): /run/current-system/bin/switch-to-configuration boot\n\
-             one: tmux: pid 1234 (at): tmux new -s work\n\
              one: cryptsetup: pid 1235 (root): cryptsetup reencrypt /dev/sda2\n\
+             one: tmux: at's server at /tmp/tmux-1000/default has 1 session and 3 panes (tmux is \"block\")\n\
              one: inhibitor: crawl (archiving), pid 42 (at)\n\
              one: systemd job: start nixos-upgrade.service (running) for 5s or more\n\
              one: root filesystem: 98% used, and it's full at 97%\n\
@@ -344,6 +367,28 @@ mod tests {
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
         assert_eq!(exit_status(&outcomes[..2]), 2);
         assert_eq!(exit_status(&outcomes[1..2]), 0);
+    }
+
+    #[test]
+    fn counts_tmux_by_policy() {
+        let cell = |machine: &Machine, facts: &Facts| {
+            let cell = tmux_cell(machine, facts);
+            (cell.spans[0].0, cell.spans[0].1.clone())
+        };
+        let mut facts = idle_facts();
+        let block = test_machine();
+        let resume = Machine { tmux: TmuxPolicy::Resume, resumable_commands: tmux::tests::patterns(&["rsync .*"]), ..test_machine() };
+        assert_eq!(cell(&block, &facts), (Plain, "".into()));
+        facts.tmux.push(tmux::tests::test_server());
+        assert_eq!(cell(&block, &facts), (Red, "1".into()));
+        // Two panes run something, and htop can't be resumed
+        assert_eq!(cell(&resume, &facts), (Red, "2".into()));
+        let lenient = Machine { resumable_commands: tmux::tests::patterns(&["rsync .*", "htop"]), ..resume.clone() };
+        assert_eq!(cell(&lenient, &facts), (Green, "2".into()));
+        facts.tmux[0].sessions.clear();
+        assert_eq!(cell(&lenient, &facts), (Green, "0".into()));
+        facts.tmux[0].error = Some("protocol version mismatch".into());
+        assert_eq!(cell(&lenient, &facts), (Red, "0".into()));
     }
 
     #[test]
@@ -407,7 +452,8 @@ mod tests {
         assert_eq!(report["facts"]["busy_processes"]["cryptsetup"][0]["pid"], 1235);
         assert_eq!(report["facts"]["btrfs"][0]["devices"][0]["missing"], true);
         assert_eq!(report["facts"]["inhibitors"][0]["who"], "crawl");
-        assert_eq!(report["facts"]["busy_processes"]["tmux"][0]["pid"], 1234);
+        assert_eq!(report["facts"]["tmux"][0]["pid"], 1234);
+        assert_eq!(report["facts"]["tmux"][0]["sessions"][0]["windows"][0]["panes"][1]["running"], json!({"state": "typed", "command": "rsync -a /data/ /backup/"}));
         assert_eq!(report["facts"]["btrfs"][0]["mountpoint"], "/");
         assert_eq!(report["facts"]["btrfs"][0]["scrub"]["state"], "finished");
         assert_eq!(report["facts"]["systems"]["default_kernel"], "6.18.55");

@@ -15,5 +15,7 @@ pub mod passwords;
 pub mod preflight;
 pub mod processes;
 pub mod reboot;
+pub mod resume;
 pub mod smart;
 pub mod ssh;
+pub mod tmux;
