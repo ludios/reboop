@@ -523,8 +523,10 @@ fn postflight(session: &mut Session, hostname: &str, printer: &mut Printer) -> R
 /// the filesystem clean less than `every_days` days ago by that record, and
 /// btrfs-progs' own record agrees that it ended clean: then just says so.
 /// Returns the problems: a scrub that didn't end clean, or a failure to
-/// record how it went (none if all is well).
+/// record how it went (none if all is well).  Fails if no btrfs filesystem
+/// is mounted at `mountpoint`, rather than scrub the one beneath it.
 fn scrub(session: &mut Session, mountpoint: &str, every_days: u32, printer: &mut Printer) -> Result<Vec<String>> {
+    ensure!(btrfs::is_mounted_at(session, mountpoint)?, "no btrfs filesystem is mounted there");
     let latest = btrfs::scrub_status(session, mountpoint)?;
     if latest.is_clean()
         && let Some(ago) = btrfs::last_clean_scrub(session, &latest.uuid)?

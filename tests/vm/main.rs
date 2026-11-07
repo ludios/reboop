@@ -404,6 +404,9 @@ fn btrfs_root_is_idle(vm: &Vm) -> Result<()> {
     let filesystems = btrfs::filesystems(&mut session)?;
     assert_eq!(filesystems.len(), 1, "{filesystems:?}");
     assert_eq!(filesystems[0].mountpoint, "/");
+    assert!(btrfs::is_mounted_at(&mut session, "/")?);
+    assert!(!btrfs::is_mounted_at(&mut session, "/root")?);
+    assert!(!btrfs::is_mounted_at(&mut session, "/reboop-test-missing")?);
     assert_eq!(btrfs::exclusive_operation(&mut session, &filesystems[0])?, "none");
     let scrub = btrfs::scrub_status(&mut session, "/")?;
     assert_ne!(scrub.state, ScrubState::Running);

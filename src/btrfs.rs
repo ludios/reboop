@@ -53,6 +53,15 @@ pub fn filesystems(session: &mut Session) -> Result<Vec<Filesystem>> {
     parse_findmnt(&output.stdout_text())
 }
 
+/// Whether a btrfs filesystem is mounted at `mountpoint` itself, rather
+/// than `mountpoint` being a plain directory, or a missing path.
+pub fn is_mounted_at(session: &mut Session, mountpoint: &str) -> Result<bool> {
+    let output = session.run(&format!("findmnt --types btrfs --mountpoint {}", shell_quote(mountpoint)), QUICK)?;
+    // findmnt exits 1 when nothing matches.
+    ensure!(output.status <= 1, "findmnt exited with status {}: {}", output.status, output.stderr_text());
+    Ok(output.status == 0)
+}
+
 /// The exclusive operation (balance, device replace, add, remove, resize…)
 /// in progress on `filesystem`, or "none".  Includes "balance paused".
 pub fn exclusive_operation(session: &mut Session, filesystem: &Filesystem) -> Result<String> {
