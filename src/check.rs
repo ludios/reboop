@@ -169,7 +169,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
 fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> String {
     let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title).aligned(if CENTERED.contains(&title) { Center } else { Left })))];
     rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome, zone)));
-    let mut text: String = human::table(&rows, color).into_iter().map(|line| line + "\n").collect();
+    let mut text = human::table(&rows, color).join("\n") + "\n";
 
     for (machine, outcome) in outcomes {
         let details: Vec<String> = match outcome {
