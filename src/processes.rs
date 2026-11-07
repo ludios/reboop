@@ -23,7 +23,8 @@ pub enum Activity {
     Nix,
     SwitchToConfiguration,
     Tmux,
-    /// Copying or moving files, which leaves a partial copy if interrupted
+    /// Copying or moving files, or writing or copying a disk image, which
+    /// leaves a partial copy if interrupted
     Copy,
     /// Interrupting a receive leaves a partial subvolume behind.
     BtrfsSendReceive,
@@ -68,9 +69,10 @@ const NIX_PROGRAMS: &[&str] = &[
     "nixos-rebuild",
 ];
 
-/// Programs that copy or move files.  (A move within one filesystem is a
-/// quick rename, but one to another filesystem copies.)
-const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv"];
+/// Programs that copy or move files, or write or copy disk images.  (A move
+/// within one filesystem is a quick rename, but one to another filesystem
+/// copies.)
+const COPY_PROGRAMS: &[&str] = &["rsync", "cp", "mv", "scp", "dd", "ddrescue", "pv"];
 
 fn parse_ps(output: &str) -> Result<Vec<Process>> {
     output
@@ -214,7 +216,15 @@ mod tests {
         let stc_wrapper = "/nix/store/abc-bash-5.3p9/bin/bash -e /nix/store/abc-nixos-system-foo/bin/switch-to-configuration boot";
         assert_eq!(activity_of("root", stc_wrapper), Some(Activity::SwitchToConfiguration));
         assert_eq!(activity_of("at", "tmux new -s work"), Some(Activity::Tmux));
-        for args in ["rsync --server -logDtpre.iLsfxCIvu . /backup/", "cp -a /data /backup", "/run/current-system/sw/bin/mv /mnt/a/big /mnt/b/"] {
+        for args in [
+            "rsync --server -logDtpre.iLsfxCIvu . /backup/",
+            "cp -a /data /backup",
+            "/run/current-system/sw/bin/mv /mnt/a/big /mnt/b/",
+            "scp -t /var/tmp/",
+            "dd if=nixos.iso of=/dev/sdb bs=4M status=progress",
+            "ddrescue /dev/sdb sdb.img sdb.map",
+            "pv nixos.iso",
+        ] {
             assert_eq!(activity_of("root", args), Some(Activity::Copy), "{args}");
         }
         for args in [
