@@ -218,8 +218,10 @@ fn wait_for_mounts(session: &mut Session, printer: &mut Printer) -> Result<bool>
 
 /// Starts `server`'s user's tmux server at its socket, with its first
 /// session, `first`, of `width` by `height`, whose first window starts in
-/// `cwd`: inside a logind session of the user's (as a login would give
-/// them), in a transient unit that lasts as long as the server does.
+/// `cwd`: from a transient unit that logs the user in through PAM, which
+/// puts the server in a logind session scope of the user's, as a login
+/// would, where it stays once the unit is done, like a tmux left behind by
+/// logging out.
 fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, width: u32, height: u32, cwd: &str) -> Result<()> {
     let socket_dir = server.socket.rsplit_once('/').map_or(".", |(dir, _)| dir);
     let script = format!(
@@ -232,7 +234,7 @@ fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, wid
     let unit = format!("reboop-tmux-$(systemd-escape -- {})-$(date +%s%N)", shell_quote(&server.user));
     let description = format!("reboop: {}'s tmux server at {}", server.user, server.socket);
     let start = format!(
-        "unit={unit} && systemd-run --quiet --unit=\"$unit\" --uid={} -p PAMName=login -p ExitType=cgroup -p CollectMode=inactive-or-failed --description={} /bin/sh -c {} || exit 1
+        "unit={unit} && systemd-run --quiet --unit=\"$unit\" --uid={} -p PAMName=login --description={} /bin/sh -c {} || exit 1
 i=0; until tmux -S {} has-session -t {} 2>/dev/null; do i=$((i + 1)); [ $i -ge {} ] && {{ systemctl status --no-pager \"$unit\" 2>&1; exit 1; }}; sleep 0.2; done",
         shell_quote(&server.user),
         shell_quote(&description),

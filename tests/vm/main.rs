@@ -1051,8 +1051,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert!(path.starts_with("/var/lib/reboop/tmux/") && path.ends_with(".tmux-stop.json"), "{path}");
 
     // `reboop tmux start` brings it all back, but for the pane whose
-    // directory is gone: the server runs in a logind session of tester's, in
-    // a unit of its own.
+    // directory is gone: the server runs in a logind session of tester's.
     sh(&mut session, "rmdir /var/tmp/reboop-test-gone")?;
     let mut printed = Vec::new();
     let problems = resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
@@ -1070,7 +1069,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     assert_eq!(server.sessions[0].windows.iter().map(|window| (window.index, window.name.as_deref())).collect::<Vec<_>>(), [(0, None), (3, Some("jobs")), (5, None)]);
     assert_eq!(geometry(&mut session)?, before);
     let cgroup = sh(&mut session, &format!("cat /proc/{}/cgroup", server.pid))?;
-    assert!(cgroup.contains("/reboop-tmux-tester-"), "{cgroup}");
+    assert!(cgroup.contains("/user-1000.slice/session-") && cgroup.trim_end().ends_with(".scope"), "{cgroup}");
     assert!(sh(&mut session, "loginctl list-users")?.contains("tester"));
     // Nothing is pending anymore, so `start` needs a saved capture, whose
     // sessions are then already there.
