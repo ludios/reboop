@@ -93,6 +93,13 @@ impl Capture {
         Capture { captured_at: Timestamp::now(), boot_id: boot_id.into(), purpose, servers }
     }
 
+    /// Whether it was taken for a reboot or shutdown during the boot
+    /// `boot_id`: then if that's the current boot, the machine didn't go
+    /// down after all.
+    pub fn outlived(&self, boot_id: &str) -> bool {
+        self.purpose != Purpose::TmuxStop && self.boot_id == boot_id
+    }
+
     /// Its file name in [`DIR`], like "20261107T063228.512Z.reboot.json",
     /// which sorts by time.
     pub fn file_name(&self) -> String {
@@ -580,7 +587,7 @@ pub fn restore_pending(session: &mut Session, machine: &Machine, printer: &mut P
     // First, so that a restore that's cut short isn't repeated on top of
     // itself; the capture stays in DIR for `reboop tmux start --saved`.
     forget_pending(session)?;
-    if capture.purpose != Purpose::TmuxStop && capture.boot_id == facts::boot_id(session)? {
+    if capture.outlived(&facts::boot_id(session)?) {
         bail!("{path} is from this boot, so what it describes is still running; not bringing it back");
     }
     printer.line(&format!("Bringing back what was in tmux, from {path}"));
@@ -735,6 +742,15 @@ mod tests {
         assert_eq!(capture.file_name(), "20261107T063228.512Z.tmux-stop.json");
         assert_eq!(saved_path("20261107T063228.512Z.check.json"), "/var/lib/reboop/tmux/20261107T063228.512Z.check.json");
         assert_eq!(saved_path("/tmp/x.json"), "/tmp/x.json");
+    }
+
+    #[test]
+    fn tells_whether_a_reboot_or_shutdown_happened_after_a_capture() {
+        assert!(Capture::new(Purpose::Reboot, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
+        assert!(Capture::new(Purpose::Shutdown, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
+        assert!(!Capture::new(Purpose::Reboot, "4f6f3fbb", vec![]).outlived("9d1c2e07"));
+        // `reboop tmux stop` doesn't take the machine down
+        assert!(!Capture::new(Purpose::TmuxStop, "4f6f3fbb", vec![]).outlived("4f6f3fbb"));
     }
 
     #[test]
