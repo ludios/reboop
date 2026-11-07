@@ -157,6 +157,17 @@ pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<S
     Ok(format!("{DIR}/{name}"))
 }
 
+/// Tells the user that `capture` was saved at `path` (see [`save`]), and
+/// which of its commands `patterns` allow to be run again when it's brought
+/// back.
+pub fn tell_saved(path: &str, capture: &Capture, patterns: &CommandPatterns, printer: &mut Printer) {
+    printer.line(&format!("tmux: wrote {path} — {}", capture.counts()));
+    let resumable = capture.resumable(patterns);
+    if !resumable.is_empty() {
+        printer.line(&indented_list("tmux: will resume commands:", &resumable));
+    }
+}
+
 /// The path of a saved capture given as an absolute path, or by its name in
 /// [`DIR`].
 pub fn saved_path(name_or_path: &str) -> String {
@@ -415,7 +426,8 @@ fn restore_panes(session: &mut Session, server: &Server, patterns: &CommandPatte
     let mut problems = Vec::new();
     for (pane, pane_id) in window.panes.iter().zip(pane_ids) {
         let verdict = tmux::verdict(pane, patterns);
-        let where_ = format!("{}'s {} in {}", server.user, location(name, window.index, pane.index), pane.cwd);
+        let place = format!("{} in {}", location(name, window.index, pane.index), pane.cwd);
+        let where_ = format!("{}'s {place}", server.user);
         let command = match &verdict {
             Verdict::Resume(command) => Some(command.clone()),
             Verdict::Idle | Verdict::Block(_) => None,
@@ -437,7 +449,7 @@ fn restore_panes(session: &mut Session, server: &Server, patterns: &CommandPatte
         }
         let Some(command) = &command else {
             if let Verdict::Block(why) = verdict {
-                printer.line(&format!("Left {where_} idle: {why}"));
+                printer.line(&format!("tmux: {}: left {place} idle: {why}", server.user));
             }
             continue;
         };
@@ -455,7 +467,7 @@ fn restore_panes(session: &mut Session, server: &Server, patterns: &CommandPatte
         };
         let output = session.run(&run, QUICK)?;
         if output.status == 0 {
-            printer.line(&format!("Resumed {where_}: {command}"));
+            printer.line(&format!("tmux: {}: resumed {place}: {command}", server.user));
         } else {
             problems.push(problem(format!("tmux failed: {}", output.stderr_text())));
         }
@@ -476,6 +488,8 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
         Err(error) if is_failure(&error) => None,
         Err(error) => return Err(error),
     };
+    let verb = if existing.is_some() { "adding to" } else { "creating" };
+    printer.line(&format!("tmux: {}: {verb} {socket}: {}", server.user, server.counts()));
     // The session of each session group whose windows the group's others
     // are to share: one that's there already, or else the first brought back
     let mut groups: HashMap<&str, &str> = HashMap::new();
@@ -578,7 +592,7 @@ fn restore_server(session: &mut Session, server: &Server, patterns: &CommandPatt
 pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatterns, printer: &mut Printer) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     if capture.servers.is_empty() {
-        printer.line("There were no tmux servers to bring back");
+        printer.line("tmux: no servers to bring back");
         return Ok(problems);
     }
     if !wait_for_mounts(session, printer)? {
@@ -591,7 +605,6 @@ pub fn restore(session: &mut Session, capture: &Capture, patterns: &CommandPatte
             problems.push(format!("{} couldn't be listed when captured ({error}), so there's nothing to bring back", server.name()));
             continue;
         }
-        printer.line(&format!("Bringing back {}'s tmux server at {}: {}", server.user, server.socket, server.counts()));
         match restore_server(session, server, patterns, &mut problems, printer) {
             Ok(()) => {}
             Err(error) if is_failure(&error) => {
@@ -622,7 +635,7 @@ pub fn restore_pending(session: &mut Session, machine: &Machine, printer: &mut P
     if capture.outlived(&facts::boot_id(session)?) {
         bail!("{path} was taken for a reboot or shutdown during this boot, which didn't happen; not bringing it back");
     }
-    printer.line(&format!("Bringing back what was in tmux, from {path}"));
+    printer.line(&format!("tmux: read {path}"));
     Ok(Some(restore(session, &capture, &machine.resumable_commands, printer)?))
 }
 
@@ -641,7 +654,7 @@ fn stop_servers(session: &mut Session, capture: &Capture, printer: &mut Printer)
         if output.status != 0 {
             bail!("{} (pid {}) didn't exit within {}s", server.name(), server.pid, STOP_TIMEOUT.as_secs());
         }
-        printer.line(&format!("Stopped {}'s tmux server at {}", server.user, server.socket));
+        printer.line(&format!("tmux: {}: stopped {}", server.user, server.socket));
     }
     Ok(())
 }
@@ -699,11 +712,7 @@ pub fn stop(ssh: &Ssh, machine: &Machine, printer: &mut Printer) -> Result<Vec<S
         return Ok(vec![]);
     }
     let path = save(&mut session, &capture, true)?;
-    printer.line(&format!("Saved what's in {hostname}'s tmux to {path}, for `reboop tmux start {hostname}` to bring back: {}", capture.counts()));
-    let resumable = capture.resumable(&machine.resumable_commands);
-    if !resumable.is_empty() {
-        printer.line(&indented_list("Commands to run again then:", &resumable));
-    }
+    tell_saved(&path, &capture, &machine.resumable_commands, printer);
     stop_servers(&mut session, &capture, printer)?;
     Ok(vec![])
 }
@@ -719,7 +728,7 @@ pub fn start(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Pr
         Some(saved) => {
             let path = saved_path(saved);
             let capture = load(&mut session, &path)?;
-            printer.line(&format!("Bringing back what was in tmux, from {path}"));
+            printer.line(&format!("tmux: read {path}"));
             restore(&mut session, &capture, &machine.resumable_commands, printer)?
         }
         None => restore_pending(&mut session, machine, printer)?

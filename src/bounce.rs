@@ -300,15 +300,7 @@ fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &M
         // servers that are gone now, which aren't to be brought back.
         return resume::forget_outlived(session, &facts.boot_id);
     }
-    let when = match down {
-        Down::Reboot   => "after the reboot",
-        Down::Shutdown => "once it's up again",
-    };
-    printer.line(&format!("Saved what's in tmux to {path}, to bring back {when}: {}", capture.counts()));
-    let resumable = capture.resumable(&machine.resumable_commands);
-    if !resumable.is_empty() {
-        printer.line(&indented_list("Commands to run again then:", &resumable));
-    }
+    resume::tell_saved(&path, &capture, &machine.resumable_commands, printer);
     Ok(())
 }
 

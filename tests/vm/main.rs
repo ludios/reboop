@@ -884,17 +884,17 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     wait_for(|| Ok(matches!(pane(&tester_tmux(&mut session)?, "work:0.0")?.running, Running::Typed { .. })))?;
     let (outcome, printed) = bounce_vm(&resuming_machine(vm, &["sleep 601"]))?;
     assert!(matches!(&outcome, Outcome::Done(problems) if problems.is_empty()), "{outcome:?}");
-    assert!(printed.contains(".reboot.json, to bring back after the reboot: 1 tmux server with 1 session and 1 pane\n"), "{printed}");
-    assert!(printed.contains("\nBringing back what was in tmux, from /var/lib/reboop/tmux/"), "{printed}");
-    assert!(printed.contains(&format!("\nBringing back tester's tmux server at {TESTER_SOCKET}: 1 session and 1 pane\nResumed tester's work:0.0 in /var/tmp: sleep 601\n")), "{printed}");
+    assert!(printed.contains(".reboot.json — 1 tmux server with 1 session and 1 pane\n"), "{printed}");
+    assert!(printed.contains("\ntmux: read /var/lib/reboop/tmux/"), "{printed}");
+    assert!(printed.contains(&format!("\ntmux: tester: creating {TESTER_SOCKET}: 1 session and 1 pane\ntmux: tester: resumed work:0.0 in /var/tmp: sleep 601\n")), "{printed}");
     let warning = format!("\n{hostname}: nixos-rebuild would change the system: {next} → {}\n", before.current);
     assert!(printed.contains(&warning), "{printed}");
     let stopping = format!(
         "\nreboop-test-sleep.service is stopped\nThere's no reboop-test-nonexistent.service to stop\n\
-         Checking again whether {hostname} is okay to reboot\nSaved what's in tmux to /var/lib/reboop/tmux/"
+         Checking again whether {hostname} is okay to reboot\ntmux: wrote /var/lib/reboop/tmux/"
     );
     assert!(printed.contains(&stopping), "{printed}");
-    assert!(printed.contains(&format!("\nCommands to run again then:\n    tester's work:0.0 in /var/tmp: sleep 601\nAsking {hostname} to reboot\n")), "{printed}");
+    assert!(printed.contains(&format!("\ntmux: will resume commands:\n    tester's work:0.0 in /var/tmp: sleep 601\nAsking {hostname} to reboot\n")), "{printed}");
     if vm.manifest.initrd.is_some() {
         assert!(printed.contains("\nThe stored LUKS password opens /dev/vda2\n"));
     } else {
@@ -1074,8 +1074,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let printed = String::from_utf8(printed)?;
     print!("{printed}");
     assert_eq!(refused, Vec::<String>::new());
-    let to_run = "\nCommands to run again then:\n    tester's work:0.0 in /var/tmp: sleep 601\n    tester's work:3.0 in /tmp: \"sleep 600\"\n    tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604\n";
-    assert!(printed.contains(to_run) && printed.contains(&format!("\nStopped tester's tmux server at {TESTER_SOCKET}\n")), "{printed}");
+    let to_run = "\ntmux: will resume commands:\n    tester's work:0.0 in /var/tmp: sleep 601\n    tester's work:3.0 in /tmp: \"sleep 600\"\n    tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604\n";
+    assert!(printed.contains(to_run) && printed.contains(&format!("\ntmux: tester: stopped {TESTER_SOCKET}\n")), "{printed}");
     assert_eq!(tmux::capture(&mut session)?, Vec::<Server>::new());
     let (path, pending) = resume::pending(&mut session)?.ok_or_else(|| anyhow!("nothing is pending"))?;
     assert_eq!(pending.purpose, Purpose::TmuxStop);
@@ -1089,7 +1089,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let printed = String::from_utf8(printed)?;
     print!("{printed}");
     assert_eq!(problems, ["tester's work:5.0 in /var/tmp/reboop-test-gone: sleep 604 wasn't run again: its shell is in \"/home/tester\" (does /var/tmp/reboop-test-gone exist?)"]);
-    assert!(printed.contains("\nResumed tester's work:0.0 in /var/tmp: sleep 601\n") && printed.contains("\nResumed tester's work:3.0 in /tmp: \"sleep 600\"\n"), "{printed}");
+    assert!(printed.contains("\ntmux: tester: resumed work:0.0 in /var/tmp: sleep 601\n") && printed.contains("\ntmux: tester: resumed work:3.0 in /tmp: \"sleep 600\"\n"), "{printed}");
     assert!(resume::pending(&mut session)?.is_none());
     wait_for(|| Ok(matches!(pane(&tester_tmux(&mut session)?, "work:0.0")?.running, Running::Typed { .. })))?;
     let server = tester_tmux(&mut session)?;
@@ -1107,7 +1107,10 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     // Nothing is pending anymore, so `start` needs a saved capture, whose
     // sessions are then already there.
     assert!(resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut Vec::new(), false, None, None)).is_err());
-    let problems = resume::start(&vm.ssh, &resuming, Some(&path), &mut Printer::new(&mut Vec::new(), false, None, None))?;
+    let mut printed = Vec::new();
+    let problems = resume::start(&vm.ssh, &resuming, Some(&path), &mut Printer::new(&mut printed, false, None, None))?;
+    let printed = String::from_utf8(printed)?;
+    assert!(printed.contains(&format!("\ntmux: tester: adding to {TESTER_SOCKET}: ")), "{printed}");
     let left_alone = |name: &str| format!("tester's tmux at {TESTER_SOCKET} already has a session called {name}, which was left alone");
     assert_eq!(problems, [left_alone("work"), left_alone("zlinked")]);
     // A capture pending for a reboot that hasn't happened isn't brought back.
