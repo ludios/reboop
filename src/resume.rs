@@ -303,8 +303,9 @@ enum NotReady {
 /// filesystem mounted where it was.
 fn wait_for_prompt(session: &mut Session, socket: &str, pane_id: &str, pane: &Pane) -> Result<Result<(), NotReady>> {
     let script = format!(
-        r#"set -- $(tmux -S {} display -p -t {pane_id} -F '#{{pane_pid}} #{{pane_tty}}') || exit 1
+        r#"set -- $(tmux -S {} display -p -t {pane_id} -F '#{{pane_pid}} #{{pane_tty}}' 2>/dev/null)
 pid=$1 tty=$2
+[ -n "$tty" ] || exit 1
 i=0; until stty -F "$tty" -a 2>/dev/null | grep -q -- '-icanon'; do i=$((i + 1)); [ $i -ge {} ] && exit 2; sleep 0.1; done
 cwd=$(readlink /proc/$pid/cwd) || cwd=
 [ "$cwd" = {cwd} ] || {{ printf '%s' "$cwd"; exit 3; }}
@@ -318,6 +319,7 @@ m=$(findmnt -T {cwd} -n -o TARGET 2>/dev/null | head -n1)
     let output = session.run(&script, PROMPT_TIMEOUT + QUICK)?;
     Ok(match output.status {
         0 => Ok(()),
+        1 => bail!("pane {pane_id} is gone"),
         2 => Err(NotReady::NoPrompt),
         3 => Err(NotReady::Elsewhere(output.stdout_text())),
         4 => Err(NotReady::OtherMount(output.stdout_text())),
