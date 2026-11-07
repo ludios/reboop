@@ -18,29 +18,60 @@ pub enum Stopped {
     NotLoaded,
 }
 
+/// The units that trigger systemd unit `unit` (its TriggeredBy=, such as
+/// socket, timer and path units) and that could start it now: those that
+/// aren't inactive or failed.
+fn active_triggers(session: &mut Session, unit: &str) -> Result<Vec<String>> {
+    let triggers = session.run_ok(&format!("systemctl show --property=TriggeredBy --value -- {}", shell_quote(unit)), QUICK)?;
+    let triggers: Vec<&str> = triggers.split_whitespace().collect();
+    if triggers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let words: Vec<String> = triggers.iter().map(|trigger| shell_quote(trigger)).collect();
+    // This exits with 0 only if one of them is active, but prints the state
+    // of each, in order, either way.
+    let output = session.run(&format!("systemctl is-active -- {}", words.join(" ")), QUICK)?;
+    let states = output.stdout_text();
+    let states: Vec<&str> = states.lines().collect();
+    ensure!(
+        states.len() == triggers.len(),
+        "systemctl is-active {} exited with status {} and printed {states:?}: {}",
+        triggers.join(" "),
+        output.status,
+        output.stderr_text()
+    );
+    let active = triggers.iter().zip(states).filter(|(_, state)| !matches!(*state, "inactive" | "failed"));
+    Ok(active.map(|(trigger, _)| trigger.to_string()).collect())
+}
+
 /// Stops systemd unit `unit` (e.g. "postgresql.service"), along with the
-/// units that would start it again (its TriggeredBy=: sockets, timers and
-/// paths), waiting up to `timeout` for them all to stop.  (A socket left
-/// listening would start `unit` again as soon as a client connects, and
-/// that start cancels the stop if `unit` is still stopping.)
+/// active units that trigger it (see [`active_triggers`]), waiting up to
+/// `timeout` for them all to stop.  It stops the triggers because a socket
+/// that's still listening would start `unit` again once a client connects,
+/// and that start cancels the stop if `unit` is still stopping.  systemctl
+/// stops them all in one transaction (with systemd 262 or later; before
+/// that, in one transaction per unit), and in that transaction, a socket,
+/// timer or path unit whose own stop is pending doesn't start `unit`.
 ///
-/// Returns what it found of `unit`, and the triggering units, which are now
-/// stopped as well.
+/// Returns how `unit` stopped (or that the machine has no such unit), and
+/// the triggering units that it stopped too.
 pub fn stop_unit(session: &mut Session, unit: &str, timeout: Duration) -> Result<(Stopped, Vec<String>)> {
-    let unit_word = shell_quote(unit);
-    let triggers = session.run_ok(&format!("systemctl show --property=TriggeredBy --value -- {unit_word}"), QUICK)?;
-    let triggers: Vec<String> = triggers.split_whitespace().map(String::from).collect();
-    let mut units = triggers.clone();
-    units.push(unit.to_string());
-    let words: Vec<String> = units.iter().map(|unit| shell_quote(unit)).collect();
+    let triggers = active_triggers(session, unit)?;
+    let mut units: Vec<&str> = triggers.iter().map(String::as_str).collect();
+    units.push(unit);
+    let words: Vec<String> = units.iter().map(|name| shell_quote(name)).collect();
     let output = session.run(&format!("systemctl stop -- {}", words.join(" ")), timeout)?;
     match output.status {
         0 => {}
-        // "program is not installed", in systemctl's LSB-style exit codes
-        5 => return Ok((Stopped::NotLoaded, triggers)),
+        // "program is not installed", in systemctl's LSB-style exit codes.
+        // That's `unit`, as the triggers are active, and so loaded.
+        5 => {
+            ensure!(triggers.is_empty(), "systemctl stop says there's no {unit}, though {} would start it", triggers.join(", "));
+            return Ok((Stopped::NotLoaded, Vec::new()));
+        }
         status => bail!("systemctl stop {} exited with status {status}: {}", units.join(" "), output.stderr_text()),
     }
-    let result = session.run_ok(&format!("systemctl show --property=Result --value -- {unit_word}"), QUICK)?;
+    let result = session.run_ok(&format!("systemctl show --property=Result --value -- {}", shell_quote(unit)), QUICK)?;
     let stopped = match result.trim_end() {
         "success" => Stopped::Cleanly,
         other => Stopped::Uncleanly(other.to_string()),

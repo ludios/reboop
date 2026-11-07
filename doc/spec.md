@@ -104,11 +104,11 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
 1. SSH in and:
 
-    `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have.
+    `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have. Stop each one in the same `systemctl stop` (one transaction, with systemd 262 or later) as the units that trigger it (its `TriggeredBy=`, such as socket and timer units) and that aren't inactive or failed, so that they don't start it again.
 
-    Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which stop_services are still stopped, and leave it at that.
+    Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which units it stopped are still stopped, and leave it at that.
 
-    Save what that check found in the tmux servers on the machine, as `/var/lib/reboop/tmux/TIME.reboot.json` (`.shutdown.json` for a stop; TIME to the millisecond), written whole and synced, and if there's anything in them, point `/var/lib/reboop/tmux/pending` at it, and say what will be run again; if there isn't, remove `pending` if it points to a capture taken for a reboot or shutdown during this boot, which didn't happen, and whose servers are gone now. If that fails, say which stop_services are still stopped, and leave it at that. (Every `reboop check` and `reboop tmux list` saves a `TIME.check.json` there too, without `pending`, though a check goes on if that fails; the last 200 captures are kept, for root only, plus the pending one.)
+    Save what that check found in the tmux servers on the machine, as `/var/lib/reboop/tmux/TIME.reboot.json` (`.shutdown.json` for a stop; TIME to the millisecond), written whole and synced, and if there's anything in them, point `/var/lib/reboop/tmux/pending` at it, and say what will be run again; if there isn't, remove `pending` if it points to a capture taken for a reboot or shutdown during this boot, which didn't happen, and whose servers are gone now. If that fails, say which units it stopped are still stopped, and leave it at that. (Every `reboop check` and `reboop tmux list` saves a `TIME.check.json` there too, without `pending`, though a check goes on if that fails; the last 200 captures are kept, for root only, plus the pending one.)
 
     `shutdown -r now`
 

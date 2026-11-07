@@ -627,6 +627,15 @@ fn stop_unit(vm: &Vm) -> Result<()> {
     let output = session.run("systemctl is-active reboop-test-activated.socket reboop-test-activated.service", MINUTE)?;
     assert_eq!(output.stdout_text(), "inactive\ninactive\n");
 
+    // One whose socket has failed (here, on being stopped), so it can't
+    // start the service, and isn't stopped again, or listed.
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-failed-socket --socket-property=ListenStream=/run/reboop-test-failed-socket.sock \
+                      --socket-property=RemoveOnStop=yes --socket-property=ExecStopPost=/run/current-system/sw/bin/false sleep 600 \
+                      && systemctl start reboop-test-failed-socket.service && systemctl stop reboop-test-failed-socket.socket")?;
+    let output = session.run("systemctl is-active reboop-test-failed-socket.socket", MINUTE)?;
+    assert_eq!(output.stdout_text(), "failed\n");
+    assert_eq!(reboot::stop_unit(&mut session, "reboop-test-failed-socket.service", MINUTE)?, (Stopped::Cleanly, vec![]));
+
     // One that ignores SIGTERM, so systemd has to kill it, once it's
     // ignoring it.  (See START_TMUX about -E PATH.)
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-stubborn -E PATH -p TimeoutStopSec=2 \
@@ -872,15 +881,24 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     clean_up(&mut session)?;
 
     // Nor when systemctl fails to stop one of the stop_services, after which
-    // the ones before it are left stopped.
+    // the ones before it, and the socket that triggers one, are left stopped.
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-activated --socket-property=ListenStream=/run/reboop-test-activated.sock \
+                      --socket-property=RemoveOnStop=yes sleep 600 && systemctl start reboop-test-activated.service")?;
     sh(&mut session, "systemd-run --quiet --unit=reboop-test-refuse -p RefuseManualStop=yes -p CollectMode=inactive-or-failed sleep 600")?;
-    let refusing = Machine { stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-refuse.service".into()], ..vm_machine(vm) };
+    let stop_services = ["reboop-test-sleep.service", "reboop-test-activated.service", "reboop-test-refuse.service"];
+    let refusing = Machine { stop_services: stop_services.map(String::from).to_vec(), ..vm_machine(vm) };
     let mut printed = Vec::new();
     let error = bounce::bounce(&vm.ssh, &refusing, password, &mut Printer::new(&mut printed, false, None, None)).unwrap_err();
     let printed = String::from_utf8(printed)?;
     assert!(format!("{error:#}").contains("systemctl stop reboop-test-refuse.service exited with status "), "{error:#}");
-    assert!(printed.contains(&format!("\nStill stopped on {hostname}:\n    reboop-test-sleep.service\n")), "{printed}");
+    let triggered = "\nStopped the units that trigger reboop-test-activated.service: reboop-test-activated.socket\n\
+                     reboop-test-activated.service is stopped\n";
+    assert!(printed.contains(triggered), "{printed}");
+    let still_stopped = format!(
+        "\nStill stopped on {hostname}:\n    reboop-test-sleep.service\n    reboop-test-activated.socket\n    reboop-test-activated.service\n"
+    );
+    assert!(printed.contains(&still_stopped), "{printed}");
     assert_eq!(facts::boot_id(&mut session)?, boot_id);
     assert_ne!(session.run(is_active, MINUTE)?.status, 0);
     sh(&mut session, "systemctl kill reboop-test-refuse.service")?;

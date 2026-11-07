@@ -225,7 +225,7 @@ fn password_for_initrd(
 }
 
 /// Stops `machine`'s stop_services in order, over `session`, along with the
-/// units that would start them again (see [`reboot::stop_unit`]), adding
+/// active units that trigger them (see [`reboot::stop_unit`]), adding
 /// each unit to `stopped` once it's stopped (leaving out services the
 /// machine doesn't have).  Fails, with the machine still up, if systemctl
 /// fails to stop one; `stopped` then has the units stopped before that.
@@ -235,8 +235,8 @@ fn stop_services(machine: &Machine, session: &mut Session, stopped: &mut Vec<Str
     for service in &machine.stop_services {
         let (outcome, triggers) = reboot::stop_unit(session, service, STOP_TIMEOUT)?;
         if !triggers.is_empty() {
-            let triggers: Vec<String> = triggers.iter().map(|trigger| printer.bold(trigger)).collect();
-            printer.line(&format!("Stopped what would start {} again: {}", printer.bold(service), triggers.join(", ")));
+            let bold: Vec<String> = triggers.iter().map(|trigger| printer.bold(trigger)).collect();
+            printer.line(&format!("Stopped the units that trigger {}: {}", printer.bold(service), bold.join(", ")));
         }
         stopped.extend(triggers);
         match outcome {
