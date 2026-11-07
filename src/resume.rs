@@ -610,8 +610,8 @@ pub fn list(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Pri
             capture
         }
     };
-    for server in &capture.servers {
-        printer.line(&tmux::listing(server, machine.tmux, &machine.resumable_commands, printer.color));
+    for text in tmux::listing(&capture.servers, machine.tmux, &machine.resumable_commands, printer.color) {
+        printer.line(&text);
     }
     Ok(())
 }

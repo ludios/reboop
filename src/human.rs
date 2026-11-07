@@ -140,14 +140,15 @@ pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
     Style::Plain.cell(date).then(Style::Dim, "T").then(Style::Plain, time_of_day)
 }
 
-/// Lays out `rows` of cells in columns, two spaces apart, without trailing
-/// spaces, each cell aligned its own way, and in the cells' styles if
-/// `color`.  All rows must have the same number of cells.
-pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
+/// Lays out `rows` of cells in columns, two spaces apart, each cell aligned
+/// its own way, and in the cells' styles if `color`.  All rows must have
+/// the same number of cells.  Returns a line per row, without trailing
+/// spaces or a newline.
+pub fn table(rows: &[Vec<Cell>], color: bool) -> Vec<String> {
     let columns = rows.first().map_or(0, Vec::len);
     assert!(rows.iter().all(|row| row.len() == columns), "rows have different numbers of cells");
     let widths: Vec<usize> = (0..columns).map(|i| rows.iter().map(|row| row[i].width()).max().unwrap_or(0)).collect();
-    let mut text = String::new();
+    let mut lines = Vec::new();
     for row in rows {
         let cells: Vec<String> = row
             .iter()
@@ -167,10 +168,9 @@ pub fn table(rows: &[Vec<Cell>], color: bool) -> String {
                 " ".repeat(before) + &shown + &" ".repeat(padding - before)
             })
             .collect();
-        text.push_str(cells.join("  ").trim_end());
-        text.push('\n');
+        lines.push(cells.join("  ").trim_end().to_string());
     }
-    text
+    lines
 }
 
 #[cfg(test)]
@@ -201,30 +201,30 @@ mod tests {
     fn lays_out_tables() {
         let rows = [vec!["name", "kernel", "okay"], vec!["one", "6.18.54 → 6.18.55", "no"], vec!["three", "", ""]];
         let rows: Vec<Vec<Cell>> = rows.iter().map(|row| row.iter().map(|&text| Style::Plain.cell(text)).collect()).collect();
-        assert_eq!(table(&rows, false), "name   kernel             okay\none    6.18.54 → 6.18.55  no\nthree\n");
+        assert_eq!(table(&rows, false), ["name   kernel             okay", "one    6.18.54 → 6.18.55  no", "three"]);
         assert_eq!(table(&rows, true), table(&rows, false));
-        assert_eq!(table(&[], true), "");
+        assert_eq!(table(&[], true), Vec::<String>::new());
         let cell = |text: &str, align| Style::Plain.cell(text).aligned(align);
         let rows = [
             vec![cell("net", Align::Center), cell("load", Align::Left), cell("x", Align::Left)],
             vec![cell("1.5 kB/s", Align::Right), cell("0.5", Align::Right), cell("", Align::Right)],
         ];
-        assert_eq!(table(&rows, false), "  net     load  x\n1.5 kB/s   0.5\n");
+        assert_eq!(table(&rows, false), ["  net     load  x", "1.5 kB/s   0.5"]);
         // Wide and combining characters are padded by the columns they take.
         let rows = [vec![cell("/界界", Align::Left), cell("x", Align::Left)], vec![cell("/cafe\u{301}", Align::Left), cell("y", Align::Left)]];
-        assert_eq!(table(&rows, false), "/界界  x\n/cafe\u{301}  y\n");
+        assert_eq!(table(&rows, false), ["/界界  x", "/cafe\u{301}  y"]);
     }
 
     #[test]
     fn styles_tables() {
         let rows = [vec![Style::Bold.cell("NAME"), Style::Bold.cell("OKAY")], vec![Style::Plain.cell("three"), Style::Red.cell("no")]];
-        assert_eq!(table(&rows, true), "\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m\nthree  \x1b[31mno\x1b[0m\n");
-        assert_eq!(table(&rows, false), "NAME   OKAY\nthree  no\n");
-        assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), "a\n");
+        assert_eq!(table(&rows, true), ["\x1b[1mNAME\x1b[0m   \x1b[1mOKAY\x1b[0m", "three  \x1b[31mno\x1b[0m"]);
+        assert_eq!(table(&rows, false), ["NAME   OKAY", "three  no"]);
+        assert_eq!(table(&[vec![Style::Plain.cell("a"), Style::Red.cell("")]], true), ["a"]);
         let rows = [vec![Style::Bold.cell("NET").aligned(Align::Center)], vec![Style::Red.cell("12.50").aligned(Align::Right)], vec![Style::Red.cell("1.0").aligned(Align::Right)]];
-        assert_eq!(table(&rows, true), " \x1b[1mNET\x1b[0m\n\x1b[31m12.50\x1b[0m\n  \x1b[31m1.0\x1b[0m\n");
+        assert_eq!(table(&rows, true), [" \x1b[1mNET\x1b[0m", "\x1b[31m12.50\x1b[0m", "  \x1b[31m1.0\x1b[0m"]);
         let rows = [vec![Style::Plain.cell("ab").then(Style::Red, "c").then(Style::Green, ""), Style::Plain.cell("x")], vec![Style::Plain.cell("a"), Style::Plain.cell("y")]];
-        assert_eq!(table(&rows, true), "ab\x1b[31mc\x1b[0m  x\na    y\n");
+        assert_eq!(table(&rows, true), ["ab\x1b[31mc\x1b[0m  x", "a    y"]);
     }
 
     #[test]
