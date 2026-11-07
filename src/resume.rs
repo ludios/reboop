@@ -136,10 +136,10 @@ pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<S
     let name = capture.file_name();
     let json = serde_json::to_string_pretty(capture)?;
     let link = if pending { format!("ln -sfn {name} {PENDING}\n") } else { String::new() };
-    // Written whole and synced, so that a crash right after leaves either
-    // the capture or nothing
+    // Written whole and synced before it's named, so that a crash leaves
+    // either the capture or nothing
     let script = format!(
-        "set -e\numask 077\nmkdir -p {DIR}\ntmp=$(mktemp {DIR}/.capture.XXXXXX)\nprintf %s {} >\"$tmp\"\nmv \"$tmp\" {DIR}/{name}\n{link}sync {DIR}/{name} {DIR}\n\
+        "set -e\numask 077\nmkdir -p {DIR}\ntmp=$(mktemp {DIR}/.capture.XXXXXX)\ntrap 'rm -f \"$tmp\"' EXIT\nprintf %s {} >\"$tmp\"\nsync \"$tmp\"\nmv \"$tmp\" {DIR}/{name}\n{link}sync {DIR}\n\
          keep=$(readlink {PENDING} 2>/dev/null || true)\nls -1 {DIR}/*.json | head -n -{KEEP} | grep -vxF \"{DIR}/$keep\" | xargs -r rm -f",
         shell_quote(&json)
     );
@@ -169,9 +169,10 @@ pub fn pending(session: &mut Session) -> Result<Option<(String, Capture)>> {
     Ok(Some((path.clone(), load(session, &path)?)))
 }
 
-/// Removes [`PENDING`], keeping the capture it pointed to.
+/// Removes [`PENDING`] for good (syncing [`DIR`]), keeping the capture it
+/// pointed to.
 pub fn forget_pending(session: &mut Session) -> Result<()> {
-    session.run_ok(&format!("rm -f {PENDING}"), QUICK).map(drop)
+    session.run_ok(&format!("rm -f {PENDING} && sync {DIR}"), QUICK).map(drop)
 }
 
 /// Something about bringing a server back failed on the machine, as opposed
