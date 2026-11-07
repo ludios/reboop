@@ -871,6 +871,21 @@ fn bounce_into_new_default_configuration(vm: &Vm) -> Result<()> {
     assert_ne!(session.run(is_active, MINUTE)?.status, 0);
     clean_up(&mut session)?;
 
+    // Nor when systemctl fails to stop one of the stop_services, after which
+    // the ones before it are left stopped.
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-sleep sleep 600")?;
+    sh(&mut session, "systemd-run --quiet --unit=reboop-test-refuse -p RefuseManualStop=yes -p CollectMode=inactive-or-failed sleep 600")?;
+    let refusing = Machine { stop_services: vec!["reboop-test-sleep.service".into(), "reboop-test-refuse.service".into()], ..vm_machine(vm) };
+    let mut printed = Vec::new();
+    let error = bounce::bounce(&vm.ssh, &refusing, password, &mut Printer::new(&mut printed, false, None, None)).unwrap_err();
+    let printed = String::from_utf8(printed)?;
+    assert!(format!("{error:#}").contains("systemctl stop reboop-test-refuse.service exited with status "), "{error:#}");
+    assert!(printed.contains(&format!("\nStill stopped on {hostname}:\n    reboop-test-sleep.service\n")), "{printed}");
+    assert_eq!(facts::boot_id(&mut session)?, boot_id);
+    assert_ne!(session.run(is_active, MINUTE)?.status, 0);
+    sh(&mut session, "systemctl kill reboop-test-refuse.service")?;
+    clean_up(&mut session)?;
+
     let before = facts::systems(&mut session)?;
     let systems = &vm.manifest.systems;
     let (next, next_variant) = if before.current == systems.base { (&systems.alt, "alt") } else { (&systems.base, "base") };

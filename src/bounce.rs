@@ -225,13 +225,12 @@ fn password_for_initrd(
 }
 
 /// Stops `machine`'s stop_services in order, over `session`, along with the
-/// units that would start them again (see [`reboot::stop_unit`]).  Fails,
-/// with the machine still up, if systemctl fails to stop one.  Returns the
-/// units that are stopped now (leaving out services the machine doesn't
-/// have), and the problems: services that systemd doesn't say stopped
-/// cleanly.
-fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer) -> Result<(Vec<String>, Vec<String>)> {
-    let mut stopped = Vec::new();
+/// units that would start them again (see [`reboot::stop_unit`]), adding
+/// each unit to `stopped` once it's stopped (leaving out services the
+/// machine doesn't have).  Fails, with the machine still up, if systemctl
+/// fails to stop one; `stopped` then has the units stopped before that.
+/// Returns the problems: services that systemd doesn't say stopped cleanly.
+fn stop_services(machine: &Machine, session: &mut Session, stopped: &mut Vec<String>, printer: &mut Printer) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for service in &machine.stop_services {
         let (outcome, triggers) = reboot::stop_unit(session, service, STOP_TIMEOUT)?;
@@ -254,7 +253,7 @@ fn stop_services(machine: &Machine, session: &mut Session, printer: &mut Printer
         }
         stopped.push(service.clone());
     }
-    Ok((stopped, problems))
+    Ok(problems)
 }
 
 /// What a check of a machine found: what was wanted if it's okay to take
@@ -320,35 +319,29 @@ fn save_for_resume(session: &mut Session, facts: &Facts, down: Down, machine: &M
 /// which `luks` is for), and saves what's in its tmux servers (see
 /// [`save_for_resume`]), telling the user.  Returns the facts and the
 /// problems so far (services that didn't stop cleanly) if so; or else the
-/// reasons not to, leaving the stop_services stopped and saying so (as a
-/// failure to save does too).
+/// reasons not to.  Whenever it doesn't return the facts (it found reasons
+/// not to, or it failed, even partway through stopping the services), it
+/// leaves the units that it stopped stopped, and lists them.
 fn stop_and_check_again(machine: &Machine, session: &mut Session, down: Down, luks: bool, printer: &mut Printer) -> Result<Checked<(Facts, Vec<String>)>> {
     let hostname = &machine.hostname;
-    let (stopped, problems) = stop_services(machine, session, printer)?;
-    let still_stopped = |printer: &mut Printer| {
-        if !stopped.is_empty() {
-            printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
-        }
-    };
-    printer.line(&format!("Checking again whether {hostname} is okay to {}", down.verb()));
-    match check_again(machine, session, luks) {
-        Ok((facts, blockers)) if blockers.is_empty() => {
-            if let Err(error) = save_for_resume(session, &facts, down, machine, printer) {
-                still_stopped(printer);
-                return Err(error);
-            }
-            Ok(Ok((facts, problems)))
-        }
-        Ok((_, blockers)) => {
+    let mut stopped = Vec::new();
+    let mut stop_and_check = || -> Result<Checked<(Facts, Vec<String>)>> {
+        let problems = stop_services(machine, session, &mut stopped, printer)?;
+        printer.line(&format!("Checking again whether {hostname} is okay to {}", down.verb()));
+        let (facts, blockers) = check_again(machine, session, luks)?;
+        if !blockers.is_empty() {
             printer.styled_line(Red, &indented_list(&format!("Not {} {hostname} after all:", down.gerund()), &blockers));
-            still_stopped(printer);
-            Ok(Err(blockers))
+            return Ok(Err(blockers));
         }
-        Err(error) => {
-            still_stopped(printer);
-            Err(error)
-        }
+        save_for_resume(session, &facts, down, machine, printer)?;
+        Ok(Ok((facts, problems)))
+    };
+    let checked = stop_and_check();
+    let going_down = matches!(checked, Ok(Ok(_)));
+    if !going_down && !stopped.is_empty() {
+        printer.styled_line(Red, &indented_list(&format!("Still stopped on {hostname}:"), &stopped));
     }
+    checked
 }
 
 /// Shows on `printer`'s progress line why the last try at something
