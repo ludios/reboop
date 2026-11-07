@@ -73,6 +73,7 @@ pub enum Style {
     Bold,
     Dim,
     Red,
+    Yellow,
     Green,
 }
 
@@ -85,11 +86,12 @@ impl Style {
     /// `text` in this style, with ANSI escape sequences.
     pub fn paint(self, text: &str) -> String {
         let code = match self {
-            Style::Plain => return text.to_string(),
-            Style::Bold  => "1",
-            Style::Dim   => "2",
-            Style::Red   => "31",
-            Style::Green => "32",
+            Style::Plain  => return text.to_string(),
+            Style::Bold   => "1",
+            Style::Dim    => "2",
+            Style::Red    => "31",
+            Style::Yellow => "33",
+            Style::Green  => "32",
         };
         format!("\x1b[{code}m{text}\x1b[0m")
     }

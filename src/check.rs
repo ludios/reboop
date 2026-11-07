@@ -4,7 +4,7 @@
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine};
 use crate::facts::{self, Inhibitor, Rebuild};
-use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red}};
+use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
 use crate::config::TmuxPolicy;
 use crate::preflight::{self, DiskFacts, Facts};
 use crate::processes::Activity;
@@ -120,7 +120,7 @@ fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
 /// that kernel was built and booted, in `zone`.
 fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell> {
     let Ok((facts, blockers, rebuild)) = outcome else {
-        let mut row = vec![Plain.cell(machine.hostname.clone()), Red.cell("error")];
+        let mut row = vec![Plain.cell(machine.hostname.clone()), Yellow.cell("error")];
         row.resize(HEADER.len(), Plain.cell(""));
         return row;
     };
@@ -383,7 +383,7 @@ mod tests {
         let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
         assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
-        assert_eq!(styles(&outcomes[2])[..2], [Plain, Red]);
+        assert_eq!(styles(&outcomes[2])[..2], [Plain, Yellow]);
         assert_eq!(styles(&outcomes[3])[11], Plain);
         assert_eq!(exit_status(&outcomes), 1);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
