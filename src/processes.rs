@@ -138,6 +138,16 @@ fn is_btrfs_send_receive(args: &str) -> bool {
     false
 }
 
+/// Whether an rclone command line transfers files, with copy, sync, move or
+/// the like, rather than, e.g., mount or serve, which run until stopped.
+/// rclone takes options before and after its subcommand, some with a value,
+/// so this looks for the subcommand among all the words, as a path or a
+/// remote is seldom named exactly like one.
+fn is_rclone_transfer(args: &str) -> bool {
+    const TRANSFERS: &[&str] = &["copy", "copyto", "copyurl", "sync", "move", "moveto", "bisync", "rcat", "archive"];
+    args.split_whitespace().skip(1).any(|word| TRANSFERS.contains(&word))
+}
+
 /// What `process` is doing that a reboot would interrupt, if anything.
 pub fn activity(process: &Process) -> Option<Activity> {
     // Builders run as the nixbld users.
@@ -156,7 +166,7 @@ pub fn activity(process: &Process) -> Option<Activity> {
         Some(Activity::SwitchToConfiguration)
     } else if is("tmux") {
         Some(Activity::Tmux)
-    } else if is_any(COPY_PROGRAMS) {
+    } else if is_any(COPY_PROGRAMS) || (is("rclone") && is_rclone_transfer(&process.args)) {
         Some(Activity::Copy)
     } else if is("btrfs") && is_btrfs_send_receive(&process.args) {
         Some(Activity::BtrfsSendReceive)
@@ -224,6 +234,9 @@ mod tests {
             "dd if=nixos.iso of=/dev/sdb bs=4M status=progress",
             "ddrescue /dev/sdb sdb.img sdb.map",
             "pv nixos.iso",
+            "rclone copy /data b2:backup --transfers 8",
+            "rclone rcat remote:backup.tar",
+            "/nix/store/abc-rclone-1.71.2/bin/rclone --config /etc/rclone.conf sync -P /data remote:data",
         ] {
             assert_eq!(activity_of("root", args), Some(Activity::Copy), "{args}");
         }
@@ -245,6 +258,8 @@ mod tests {
             "man tmux",
             "less /var/log/rsync.log",
             "man cp",
+            "rclone mount remote: /mnt/remote --vfs-cache-mode full",
+            "rclone serve webdav remote:copy",
             "[kworker/0:1-events]",
             "sshd: root [priv]",
             "",
