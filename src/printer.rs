@@ -138,13 +138,15 @@ fn terminal_columns() -> usize {
     if result == 0 && size.ws_col > 0 { size.ws_col.into() } else { 80 }
 }
 
-/// Calls `print` with a [`Printer`] that writes to stdout, timestamps lines,
-/// styles the output if `color`, and shows progress if stdout is a
-/// terminal.  Returns what `print` returns.
-pub(crate) fn with_stdout<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
-    let mut stdout = io::stdout();
-    let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
-    print(&mut Printer::new(&mut stdout, color, columns, Some(time_of_day)))
+impl Printer<'_> {
+    /// Calls `print` with a [`Printer`] that writes to stdout, timestamps
+    /// lines, styles the output if `color`, and shows progress if stdout is a
+    /// terminal.  Returns what `print` returns.
+    pub(crate) fn with_stdout<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
+        let mut stdout = io::stdout();
+        let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
+        print(&mut Printer::new(&mut stdout, color, columns, Some(time_of_day)))
+    }
 }
 
 /// What `print` printed to a [`Printer`] with these settings (see

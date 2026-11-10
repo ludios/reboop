@@ -14,7 +14,7 @@ use crate::human::{self, Style::{Bold, Red}};
 use crate::initrd::{self, Agent, UnlockError};
 use crate::passwords;
 use crate::preflight::{self, Facts};
-use crate::printer::{self, Printer, indented_list};
+use crate::printer::{Printer, indented_list};
 use crate::reboot::{self, Down, Stopped};
 use crate::resume::{self, Capture, Purpose};
 use crate::ssh::{OPEN_TIMEOUT, Opening, QUICK, Session, Ssh, is_unreachable};
@@ -654,7 +654,7 @@ pub fn run(hostname: &str, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
     let password = || passwords::load(&config::passwords_dir()?, hostname, &passwords::master_key(&machine.luks_signing_key)?);
-    Ok(printer::with_stdout(color, |printer| bounce(&Ssh::default(), machine, password, printer))?.exit_status())
+    Ok(Printer::with_stdout(color, |printer| bounce(&Ssh::default(), machine, password, printer))?.exit_status())
 }
 
 /// Shuts down the configured machine `hostname` (see [`stop`]), in color if
@@ -662,7 +662,7 @@ pub fn run(hostname: &str, color: bool) -> Result<u8> {
 pub fn run_stop(hostname: &str, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
-    Ok(printer::with_stdout(color, |printer| stop(&Ssh::default(), machine, printer))?.exit_status())
+    Ok(Printer::with_stdout(color, |printer| stop(&Ssh::default(), machine, printer))?.exit_status())
 }
 
 /// Catches the configured machine `hostname` (see [`catch`]), with its
@@ -679,7 +679,7 @@ pub fn run_catch(hostname: &str, color: bool) -> Result<u8> {
     } else {
         None
     };
-    let problems = printer::with_stdout(color, |printer| catch(&Ssh::default(), machine, password.as_deref(), printer))?;
+    let problems = Printer::with_stdout(color, |printer| catch(&Ssh::default(), machine, password.as_deref(), printer))?;
     Ok(if problems.is_empty() { 0 } else { 1 })
 }
 
