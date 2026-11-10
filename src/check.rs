@@ -2,10 +2,9 @@
 //! and the facts behind the answers.
 
 use crate::btrfs::{Device, ScrubState};
-use crate::config::{self, Machine};
+use crate::config::{self, Machine, TmuxPolicy};
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
-use crate::config::TmuxPolicy;
 use crate::preflight::{self, DiskFacts, Facts};
 use crate::processes::Activity;
 use crate::resume::{self, Capture, Purpose};
