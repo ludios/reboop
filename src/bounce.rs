@@ -635,9 +635,10 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 /// tests it; stops its stop_services, checks again, apart from load and
 /// network traffic, and saves what's in its tmux servers (see
 /// [`stop_and_check_again`], which lists the units that it leaves stopped
-/// if it goes no further); reboots it; answers its initrd's password prompt; waits for it to come
-/// back; shows how it did; brings tmux back; and scrubs its scrub_mounts,
-/// unless a scrub found them clean lately (see [`come_back`]).
+/// if it goes no further); reboots it; answers its initrd's password
+/// prompt; waits for it to come back; shows how it did; brings tmux back;
+/// and scrubs its scrub_mounts, unless a scrub found them clean lately (see
+/// [`come_back`]).
 /// Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
