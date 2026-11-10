@@ -158,26 +158,29 @@ pub fn save(session: &mut Session, capture: &Capture, pending: bool) -> Result<S
 }
 
 /// Tells the user that `capture`, taken on `machine`, was saved at `path`
-/// (see [`save`]), and which of its commands the machine's
-/// resumable_commands allow to be run again when it's brought back.  Names
-/// the reboop command that the user has to run to bring it back, unless it
-/// was taken for a reboot by `reboop bounce`, which brings it back itself.
+/// (see [`save`]); which reboop command the user has to run to bring tmux
+/// back, unless `capture` was taken for a reboot by `reboop bounce`, which
+/// brings tmux back itself; and which of the commands in `capture` the
+/// machine's resumable_commands allow to be run again when tmux is brought
+/// back.
 pub fn tell_saved(path: &str, capture: &Capture, machine: &Machine, printer: &mut Printer) {
     printer.line(&format!("tmux: wrote {path} — {}", capture.counts()));
-    let resumable = capture.resumable(&machine.resumable_commands);
-    if resumable.is_empty() {
-        return;
-    }
     let hostname = &machine.hostname;
-    let heading = match capture.purpose {
-        // `reboop bounce` brings it back itself, and if it's cut short, its
+    let command = match capture.purpose {
+        // `reboop bounce` brings tmux back itself, and if it's cut short, its
         // error names `reboop catch`.
-        Purpose::Reboot   => "tmux: will resume commands:".into(),
-        Purpose::Shutdown => format!("tmux: `reboop catch {hostname}` will resume commands:"),
-        Purpose::TmuxStop => format!("tmux: `reboop tmux start {hostname}` will resume commands:"),
+        Purpose::Reboot   => None,
+        Purpose::Shutdown => Some(format!("`reboop catch {hostname}`")),
+        Purpose::TmuxStop => Some(format!("`reboop tmux start {hostname}`")),
         Purpose::Check    => unreachable!("a check's capture isn't saved to be brought back"),
     };
-    printer.line(&indented_list(&heading, &resumable));
+    let resumable = capture.resumable(&machine.resumable_commands);
+    match (command, resumable.is_empty()) {
+        (None,          true)  => {}
+        (Some(command), true)  => printer.line(&format!("tmux: {command} will bring tmux back")),
+        (None,          false) => printer.line(&indented_list("tmux: will resume commands:", &resumable)),
+        (Some(command), false) => printer.line(&indented_list(&format!("tmux: {command} will resume commands:"), &resumable)),
+    }
 }
 
 /// The path of a saved capture given as an absolute path, or by its name in
@@ -852,8 +855,11 @@ mod tests {
         assert_eq!(told(&machine, Purpose::Reboot),   format!("{wrote}tmux: will resume commands{htop}"));
         assert_eq!(told(&machine, Purpose::Shutdown), format!("{wrote}tmux: `reboop catch one` will resume commands{htop}"));
         assert_eq!(told(&machine, Purpose::TmuxStop), format!("{wrote}tmux: `reboop tmux start one` will resume commands{htop}"));
-        // With no command to run again, only the capture is told of.
-        assert_eq!(told(&test_machine(), Purpose::TmuxStop), wrote);
+        // With no command to run again, only the reboop command that brings
+        // tmux back is named, if there is one.
+        assert_eq!(told(&test_machine(), Purpose::Reboot),   wrote);
+        assert_eq!(told(&test_machine(), Purpose::Shutdown), format!("{wrote}tmux: `reboop catch one` will bring tmux back\n"));
+        assert_eq!(told(&test_machine(), Purpose::TmuxStop), format!("{wrote}tmux: `reboop tmux start one` will bring tmux back\n"));
     }
 
     #[test]
