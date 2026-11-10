@@ -1,19 +1,18 @@
-//! Telling the user how a command is going: in lines, which may be
-//! timestamped and styled, and in progress, which rewrites the last line of
-//! a terminal.
+//! Telling the user how a command is going, with lines (which can be
+//! timestamped and styled) and, on a terminal, with a line of progress that
+//! is rewritten in place.
 
 use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use jiff::Zoned;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 
-/// Tells the user how a command is going.  Write errors are ignored, since a
-/// closed stdout is no reason to stop partway, like with a machine
-/// half-bounced.
+/// Tells the user how a command is going.  Write errors are ignored: a
+/// command whose stdout is closed should still finish what it started.
 pub struct Printer<'a> {
     out: &'a mut dyn Write,
-    /// Whether to style the output: problems in red, values in bold,
-    /// timestamps dimmed, and tables' cells in their own styles.
+    /// Whether to style the output: for example, problems in red, values in
+    /// bold, and timestamps dimmed.
     pub(crate) color: bool,
     /// If progress is shown by rewriting the last line (which takes a
     /// terminal), gives the terminal's width, which can change.
@@ -26,6 +25,15 @@ pub struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
+    /// A printer that writes to `out`, and:
+    ///
+    /// - styles the output if `color`;
+    /// - shows progress only if `columns` is given, by rewriting the last
+    ///   line, cut to fit in one row of the terminal; `columns` returns the
+    ///   terminal's width, and is called for each update of progress, since
+    ///   the width can change;
+    /// - starts each line with a timestamp only if `clock` is given; `clock`
+    ///   returns the time of day, like "12:03:16".
     pub fn new(out: &'a mut dyn Write, color: bool, columns: Option<fn() -> usize>, clock: Option<fn() -> String>) -> Printer<'a> {
         Printer { out, color, columns, clock, progress_chars: 0 }
     }
@@ -42,9 +50,10 @@ impl<'a> Printer<'a> {
         self.paint(Bold, &value.to_string())
     }
 
-    /// Prints `text` in `style` and a newline, in place of any progress on
-    /// the last line.  If timestamped, the first line of `text` comes after
-    /// the time, and the rest after as many spaces.
+    /// Prints `text` (in `style`, if in color) and a newline, in place of any
+    /// progress on the last line.  If timestamped, the first line of `text`
+    /// comes after the time and a space, and each later line of `text` comes
+    /// after the same number of spaces, so that the lines of `text` line up.
     pub(crate) fn styled_line(&mut self, style: Style, text: &str) {
         if self.progress_chars > 0 {
             let _ = write!(self.out, "\r{}\r", " ".repeat(self.progress_chars));
@@ -61,6 +70,7 @@ impl<'a> Printer<'a> {
         let _ = self.out.flush();
     }
 
+    /// Prints `text` unstyled (see [`Printer::styled_line`]).
     pub(crate) fn line(&mut self, text: &str) {
         self.styled_line(Plain, text);
     }
@@ -71,9 +81,12 @@ impl<'a> Printer<'a> {
         self.styled_line(Red, &format!("{bar}\n!!! {text} !!!\n{bar}"));
     }
 
-    /// Shows `text` on the last line in place of the previous progress, if
-    /// rewriting, after the time if timestamped and there's room.  Runs of
-    /// whitespace, like line breaks, become single spaces.
+    /// If progress is shown (see [`Printer::new`]), shows `text` on the last
+    /// line in place of the previous progress, after the time if timestamped
+    /// and if that leaves room for some of `text`.  Whitespace at either end
+    /// of `text` is dropped, each run of whitespace inside it (like a line
+    /// break) becomes one space, and what's left is cut short with an
+    /// ellipsis if it doesn't fit in the row.
     pub(crate) fn progress(&mut self, text: &str) {
         let Some(columns) = self.columns else { return };
         // \r only goes back to the start of the last row, so the line has to
@@ -125,9 +138,9 @@ fn terminal_columns() -> usize {
     if result == 0 && size.ws_col > 0 { size.ws_col.into() } else { 80 }
 }
 
-/// Calls `print` with a [`Printer`] to stdout that timestamps lines, is in
-/// color if `color`, and shows progress if stdout is a terminal.  Returns
-/// what `print` returns.
+/// Calls `print` with a [`Printer`] that writes to stdout, timestamps lines,
+/// styles the output if `color`, and shows progress if stdout is a
+/// terminal.  Returns what `print` returns.
 pub(crate) fn with_stdout<T>(color: bool, print: impl FnOnce(&mut Printer) -> T) -> T {
     let mut stdout = io::stdout();
     let columns = stdout.is_terminal().then_some(terminal_columns as fn() -> usize);
