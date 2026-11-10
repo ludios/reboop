@@ -638,8 +638,7 @@ fn show_done(hostname: &str, how: &str, problems: &[String], printer: &mut Print
 /// if it goes no further); reboots it; answers its initrd's password
 /// prompt; waits for it to come back; shows how it did; brings tmux back;
 /// and scrubs its scrub_mounts, unless a scrub found them clean lately (see
-/// [`come_back`]).
-/// Problems along the way are collected for the end.
+/// [`come_back`]).  Problems along the way are collected for the end.
 ///
 /// Errors say whether they happened before or after asking the machine to
 /// reboot; after, it may be down, e.g. waiting at its initrd.
