@@ -1154,6 +1154,8 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let cgroup = sh(&mut session, &format!("cat /proc/{}/cgroup", server.pid))?;
     assert!(cgroup.contains("/user-1000.slice/session-") && cgroup.trim_end().ends_with(".scope"), "{cgroup}");
     assert!(sh(&mut session, "loginctl list-users")?.contains("tester"));
+    // It has a login's umask, not the one its socket's directory was made with.
+    assert_eq!(sh(&mut session, &format!("grep '^Umask:' /proc/{}/status", server.pid))?, "Umask:\t0022\n");
     // Nothing is pending anymore, so `start` needs a saved capture, whose
     // sessions are then already there.
     assert!(resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut Vec::new(), false, None, None)).is_err());

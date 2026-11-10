@@ -285,11 +285,14 @@ fn wait_for_mounts(session: &mut Session, printer: &mut Printer) -> Result<bool>
 /// session, `first`, whose first window starts in `cwd`: from a transient
 /// unit that logs the user in through PAM, which puts the server in a
 /// logind session scope of the user's, as a login would, where it stays
-/// once the unit is done, like a tmux left behind by logging out.
+/// once the unit is done, like a tmux left behind by logging out.  The
+/// socket's directory (if missing) is made accessible to the user only,
+/// with `umask 077` in a subshell, so that this umask doesn't reach the
+/// server and its panes, which keep the login's umask.
 fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, cwd: &str) -> Result<()> {
     let socket_dir = server.socket.rsplit_once('/').map_or(".", |(dir, _)| dir);
     let script = format!(
-        "umask 077 && mkdir -p {} && exec tmux -S {} new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {}",
+        "(umask 077 && mkdir -p {}) && exec tmux -S {} new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {}",
         shell_quote(socket_dir),
         shell_quote(&server.socket),
         format_quote(&first.name),
