@@ -2,11 +2,11 @@
 //! after a reboot, or after `reboop tmux stop`: the captures that reboop
 //! saves on the machine, and recreating what one of them describes.
 
-use crate::bounce::{Printer, indented_list};
 use crate::config::{self, Machine, TmuxPolicy};
 use crate::deadline::Deadline;
 use crate::facts;
 use crate::human::Style::Red;
+use crate::printer::{self, Printer, indented_list};
 use crate::ssh::{OPEN_TIMEOUT, QUICK, Session, Ssh, shell_quote};
 use crate::tmux::{self, CommandPatterns, Pane, Running, Server, TmuxSession, Verdict, Window, count, location};
 use anyhow::{Context, Result, anyhow, bail};
@@ -771,7 +771,7 @@ pub fn start(ssh: &Ssh, machine: &Machine, saved: Option<&str>, printer: &mut Pr
 fn with_machine<T>(hostname: &str, color: bool, command: impl FnOnce(&Ssh, &Machine, &mut Printer) -> Result<T>) -> Result<T> {
     let machines = config::load(&config::config_dir()?)?;
     let machine = config::find(&machines, hostname)?;
-    crate::bounce::with_stdout_printer(color, |printer| command(&Ssh::default(), machine, printer))
+    printer::with_stdout(color, |printer| command(&Ssh::default(), machine, printer))
 }
 
 /// `reboop tmux list`: see [`list`].  Returns the exit status: 0.
@@ -798,6 +798,7 @@ pub fn run_start(hostname: &str, saved: Option<&str>, color: bool) -> Result<u8>
 mod tests {
     use super::*;
     use crate::preflight::test_machine;
+    use crate::printer::printed;
     use crate::tmux::tests::{patterns, test_server};
 
     #[test]
@@ -843,9 +844,7 @@ mod tests {
     #[test]
     fn names_the_command_that_brings_a_capture_back() {
         let told = |machine: &Machine, purpose| {
-            let mut out = Vec::new();
-            tell_saved("/x.json", &Capture::new(purpose, "4f6f3fbb", vec![test_server()]), machine, &mut Printer::new(&mut out, false, None, None));
-            String::from_utf8(out).unwrap()
+            printed(false, None, None, |printer| tell_saved("/x.json", &Capture::new(purpose, "4f6f3fbb", vec![test_server()]), machine, printer))
         };
         let machine = Machine { resumable_commands: patterns(&["htop"]), ..test_machine() };
         let wrote = "tmux: wrote /x.json — 1 tmux server with 1 session and 3 panes\n";

@@ -13,6 +13,7 @@ pub mod initrd;
 pub mod luks_password;
 pub mod passwords;
 pub mod preflight;
+pub mod printer;
 pub mod processes;
 pub mod reboot;
 pub mod resume;
