@@ -222,9 +222,10 @@ fn network_sample_sees_traffic(vm: &Vm) -> Result<()> {
 }
 
 /// Starts a real tmux server, owned by someone other than root, with a
-/// session "work" whose window 0 is a zsh pane in /var/tmp.  (Transient
-/// units get a minimal PATH, hence the -E PATH.)
-const START_TMUX: &str = "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p RemainAfterExit=yes --uid=tester tmux new-session -d -s work -x 100 -y 30 -c /var/tmp";
+/// umask of 0027 (which isn't a unit's default), and with a session "work"
+/// whose window 0 is a zsh pane in /var/tmp.  (Transient units get a minimal
+/// PATH, hence the -E PATH.)
+const START_TMUX: &str = "systemd-run --quiet --unit=reboop-test-tmux -E PATH -p UMask=0027 -p RemainAfterExit=yes --uid=tester tmux new-session -d -s work -x 100 -y 30 -c /var/tmp";
 
 /// Where tester's tmux server (see [`START_TMUX`]) listens.
 const TESTER_SOCKET: &str = "/tmp/tmux-1000/default";
@@ -1057,6 +1058,7 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     })?;
     let server = tester_tmux(&mut session)?;
     assert_eq!((server.user.as_str(), server.socket.as_str(), &server.error), ("tester", TESTER_SOCKET, &None));
+    assert_eq!(server.umask.as_deref(), Some("0027"));
     let typed = |command: &str| Running::Typed { command: command.into() };
     expect_pane(&server, "work:0.0", "/var/tmp", typed("sleep 601"))?;
     expect_pane(&server, "work:0.1", "/home/tester", Running::Idle)?;
@@ -1133,7 +1135,9 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
 
     // `reboop tmux start` brings it all back, but for the pane whose
     // directory is gone: the server runs in a logind session of tester's.
-    sh(&mut session, "rmdir /var/tmp/reboop-test-gone")?;
+    // The directory of the server's socket is gone too, as it is after a
+    // boot that empties /tmp.
+    sh(&mut session, "rmdir /var/tmp/reboop-test-gone && rm -rf /tmp/tmux-1000")?;
     let mut printed = Vec::new();
     let problems = resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut printed, false, None, None))?;
     let printed = String::from_utf8(printed)?;
@@ -1154,8 +1158,11 @@ fn tmux_is_captured_stopped_and_started(vm: &Vm) -> Result<()> {
     let cgroup = sh(&mut session, &format!("cat /proc/{}/cgroup", server.pid))?;
     assert!(cgroup.contains("/user-1000.slice/session-") && cgroup.trim_end().ends_with(".scope"), "{cgroup}");
     assert!(sh(&mut session, "loginctl list-users")?.contains("tester"));
-    // It has a login's umask, not the one its socket's directory was made with.
-    assert_eq!(sh(&mut session, &format!("grep '^Umask:' /proc/{}/status", server.pid))?, "Umask:\t0022\n");
+    // The restored server has the umask that the stopped server had, not
+    // the one that the directory of its socket was made with, which only
+    // tester can get into.
+    assert_eq!(server.umask.as_deref(), Some("0027"));
+    assert_eq!(sh(&mut session, "stat -c '%a %U' /tmp/tmux-1000")?, "700 tester\n");
     // Nothing is pending anymore, so `start` needs a saved capture, whose
     // sessions are then already there.
     assert!(resume::start(&vm.ssh, &resuming, None, &mut Printer::new(&mut Vec::new(), false, None, None)).is_err());

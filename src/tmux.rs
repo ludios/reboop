@@ -189,6 +189,11 @@ pub struct Server {
     /// [`capture`])
     pub socket: String,
     pub pid: u32,
+    /// Its process's umask, which its panes inherit, in octal as
+    /// /proc/PID/status shows it, like "0022"; `None` if that isn't known
+    /// (as in a capture that was saved before reboop recorded it)
+    #[serde(default)]
+    pub umask: Option<String>,
     /// Empty if there's an `error`
     pub sessions: Vec<TmuxSession>,
     /// Why its sessions couldn't be listed, if they couldn't: e.g. the
@@ -711,17 +716,24 @@ fn list_sessions(session: &mut Session, listing: &str) -> Result<Vec<TmuxSession
     Ok(assemble(lines, runnings, mountpoints))
 }
 
+/// Whether `umask` is a umask as /proc/PID/status shows one: 1 to 4 octal
+/// digits.
+pub fn is_umask(umask: &str) -> bool {
+    (1..=4).contains(&umask.len()) && umask.bytes().all(|byte| (b'0'..=b'7').contains(&byte))
+}
+
 /// Lists what's in the tmux server with pid `pid` at `socket`, or returns
 /// `None` if it's gone.  Whatever keeps its sessions from being listed is
 /// its `error` instead.
 fn capture_server(session: &mut Session, socket: String, pid: u32) -> Result<Option<Server>> {
     let format: Vec<String> = PANE_FIELDS.iter().map(|field| format!("#{{{field}}}")).collect();
-    // The user, then the listing; or what's wrong, with status 3
+    // A line with the user and the server's umask (nothing, if the kernel
+    // doesn't show it), then the listing; or what's wrong, with status 3
     let script = format!(
         r#"ids=$(stat -c '%U %u' /proc/{pid} 2>/dev/null) || {{ echo gone; exit 0; }}
 set -- $ids
 [ "$1" = UNKNOWN ] && set -- "$2"
-printf '%s\n' "$1"
+printf '%s %s\n' "$1" "$(sed -n 's/^Umask:[[:space:]]*//p' /proc/{pid}/status 2>/dev/null)"
 answering=$(tmux -S {socket} display -p '#{{pid}}') || exit 2
 [ "$answering" = {pid} ] || {{ echo "another server (pid $answering) answers at its socket"; exit 3; }}
 exec tmux -S {socket} list-panes -a -F {}"#,
@@ -733,10 +745,13 @@ exec tmux -S {socket} list-panes -a -F {}"#,
     if output.status == 0 && stdout == "gone\n" {
         return Ok(None);
     }
-    let Some((user, rest)) = stdout.split_once('\n') else {
+    let Some((owner, rest)) = stdout.split_once('\n') else {
         bail!("couldn't tell whose tmux server pid {pid} is: {}", output.stderr_text());
     };
-    let mut server = Server { user: user.into(), socket, pid, sessions: vec![], error: None };
+    let (user, umask) = owner.split_once(' ').ok_or_else(|| anyhow!("unexpected line about the tmux server pid {pid}: {owner:?}"))?;
+    ensure!(umask.is_empty() || is_umask(umask), "unexpected umask of the tmux server pid {pid}: {umask:?}");
+    let umask = (!umask.is_empty()).then(|| umask.to_string());
+    let mut server = Server { user: user.into(), socket, pid, umask, sessions: vec![], error: None };
     let listed = match output.status {
         0 => list_sessions(session, rest),
         3 => Err(anyhow!("{}", rest.trim_end())),
@@ -770,7 +785,7 @@ pub fn capture(session: &mut Session) -> Result<Vec<Server>> {
         let pid: u32 = pid.parse().with_context(|| format!("unexpected ps line {line:?}"))?;
         if servers.iter().all(|server| server.pid != pid) {
             let error = Some("ss doesn't list its socket (is it in another network namespace, like a container's?)".into());
-            servers.push(Server { user: user.into(), socket: String::new(), pid, sessions: vec![], error });
+            servers.push(Server { user: user.into(), socket: String::new(), pid, umask: None, sessions: vec![], error });
         }
     }
     Ok(servers)
@@ -935,6 +950,7 @@ pub(crate) mod tests {
             user: "at".into(),
             socket: "/tmp/tmux-1000/default".into(),
             pid: 1234,
+            umask: Some("0027".into()),
             sessions: vec![TmuxSession { name: "work".into(), group: None, windows: vec![window(0, None, vec![idle, rsync]), window(3, Some("top"), vec![htop])] }],
             error: None,
         }
@@ -1309,7 +1325,13 @@ pub(crate) mod tests {
         assert_eq!(json(Running::Idle), serde_json::json!({"state": "idle"}));
         assert_eq!(json(Running::Typed { command: "htop".into() }), serde_json::json!({"state": "typed", "command": "htop"}));
         assert_eq!(json(Running::Background { jobs: vec![None] }), serde_json::json!({"state": "background", "jobs": [null]}));
-        let server: Server = serde_json::from_value(serde_json::to_value(test_server()).unwrap()).unwrap();
+        let mut json_server = serde_json::to_value(test_server()).unwrap();
+        let server: Server = serde_json::from_value(json_server.clone()).unwrap();
         assert_eq!(server, test_server());
+        // A capture saved before the umask was recorded
+        json_server.as_object_mut().unwrap().remove("umask");
+        assert_eq!(serde_json::from_value::<Server>(json_server).unwrap(), Server { umask: None, ..test_server() });
+        assert!(is_umask("0022") && is_umask("777") && is_umask("0"));
+        assert!(!is_umask("") && !is_umask("00022") && !is_umask("0o22") && !is_umask("8") && !is_umask("22; x"));
     }
 }

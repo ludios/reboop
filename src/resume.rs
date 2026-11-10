@@ -286,13 +286,23 @@ fn wait_for_mounts(session: &mut Session, printer: &mut Printer) -> Result<bool>
 /// unit that logs the user in through PAM, which puts the server in a
 /// logind session scope of the user's, as a login would, where it stays
 /// once the unit is done, like a tmux left behind by logging out.  The
-/// socket's directory (if missing) is made accessible to the user only,
-/// with `umask 077` in a subshell, so that this umask doesn't reach the
-/// server and its panes, which keep the login's umask.
+/// server gets the umask that `server` was captured with, if the capture has
+/// it, or else the one that the unit gives it.  Any directory that's missing
+/// on the way to the socket is made accessible to the user only, with
+/// `umask 077` in a subshell, so that this umask doesn't reach the server
+/// (and through it, its panes).
 fn start_server(session: &mut Session, server: &Server, first: &TmuxSession, cwd: &str) -> Result<()> {
     let socket_dir = server.socket.rsplit_once('/').map_or(".", |(dir, _)| dir);
+    let mut set_umask = String::new();
+    if let Some(umask) = &server.umask {
+        // It goes into a shell script, and a capture can be edited.
+        if !tmux::is_umask(umask) {
+            return Err(Failed(format!("the capture has {umask:?} as the server's umask")).into());
+        }
+        set_umask = format!("umask {umask} && ");
+    }
     let script = format!(
-        "(umask 077 && mkdir -p {}) && exec tmux -S {} new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {}",
+        "(umask 077 && mkdir -p {}) && {set_umask}exec tmux -S {} new-session -d -s {} -x {STAGING_SIZE} -y {STAGING_SIZE} -c {}",
         shell_quote(socket_dir),
         shell_quote(&server.socket),
         format_quote(&first.name),
