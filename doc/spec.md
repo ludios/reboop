@@ -64,7 +64,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
     - Is any btrfs scrub running?
     - Is any btrfs balance or drive replace in progress?
-    - Is switch-to-configuration or a nix build running?
+    - Is switch-to-configuration, a Nix command or a Nix build running?
     - Every tmux server (any user's, at any socket: `ss -xlpH` lists the sockets with their processes; a `tmux: server` process that ss shows no socket for, as in a container's network namespace, is noted as unlistable), and what's in it, with `tmux -S SOCKET list-panes -a` as root, after checking that the server answering at the socket is the one ss showed: the server's umask (from /proc/PID/status), and each session (and its session group, if any), window (index; name, unless automatic-rename is on; layout, size included; whether active) and pane (index; tmux's id; whether active), and what the pane is running (nothing, if it's dead, as remain-on-exit keeps panes): the jobs its shell started that haven't ended, whether in the background or stopped (async_start records not matched by as many async_end or async_lost records in the zsh-spy archive, hist.*.jsonl, that the shell holds open, found through /proc/PID/fd), whatever's in the foreground, except for a job that was stopped with Ctrl-Z and brought back with fg: that counts as the command line that started the job, typed where that line was typed, if all of these hold: the job is the shell's only job that hasn't ended; the terminal's foreground process group is the job's (led by the first of the pids in its async_start's job_pids); the line the shell runs (its last command_start, without a command_end) is nothing but `fg`, `fg JOB` or `%JOB`, where JOB is made of letters, digits and `_%+?.-` or is left out, both as typed and with its aliases expanded (a shell function named fg isn't seen through); zsh-spy found the job stopped (its async_start's job_state is "suspended"); and the line that started the job ended stopped, having started that job alone (that line's command_end has status 128 + SIGTSTP or 128 + SIGSTOP, and its async_jobs lists only the job). So a job put in the background with & still counts as a job that hasn't ended once fg brings it into the foreground, as does a loop or function stopped with Ctrl-Z until the command that it was running when stopped ends (zsh gives that command a process group of its own); else the command line typed into the shell, the archive's last command_start without a command_end; else idle. Without an archive: the command tmux started the pane with (`#{pane_start_command}`), or idle if the pane's program is a shell without child processes; and unknown when a program is in the foreground but there's no archive, or the archive's line is hidden (HIST_IGNORE_SPACE), or is nothing but fg (as when the job it brought back isn't known), or the shell has a child process the archive doesn't account for: any child while the archive says the shell is idle, or, while a typed command runs, a child outside the terminal's foreground process group (like a disowned job). The pane's directory is where a typed command was typed (as typed, so perhaps through a symlink), where a started command was started, or else the pane's current one; also where the filesystem it's on is mounted (`findmnt -T`), for checking it's back. Of an archive, which is read through /proc/PID/fd, only these records (lines) are used: those from the last command_start on; and from before that, however far back, the async_start, async_end and async_lost records of each job that hasn't ended (by command id and job number, one with more async_starts than async_ends and async_losts, since zsh can give a job the number of one that ended during the same line), the command_start and command_end of the line that started such a job, and the records of a job whose async_end or async_lost was written before its async_start, if that async_start comes after the last command_start. A server whose panes can't be listed (e.g. its tmux is another version, or a record in an archive can't be parsed) is noted as such, which keeps the machine from going down either way.
     - Is a copy program running: rsync, cp, mv, scp, dd, ddrescue, pv, or `rclone` with one of the subcommands copy, copyto, copyurl, sync, move, moveto, bisync, cat, rcat or archive?
     - Is a btrfs send or receive running, or cryptsetup?
@@ -79,16 +79,16 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
     - The NixOS configuration we're currently on
     - The Linux kernel we're currenty on
     - The NixOS configuration and kernel we expect to boot into by default
-    - What the boot loader will boot by default: systemd-boot's default entry (`bootctl list`, which includes one-shot entries), or GRUB's in each /boot with a grub/grub.cfg (mirroredBoots), including grub-reboot's next_entry
+    - What the boot loader will boot by default: systemd-boot's default entry (`bootctl list`, which includes one-shot entries), or GRUB's in each /boot with a grub/grub.cfg (mirroredBoots), including grub-reboot's next_entry; and whether the UEFI firmware will do something else at the next boot (its BootNext variable is set, or OsIndications asks it to open its setup)
     - The kernel, kernel modules and initrd the machine booted with, the systemd PID 1 runs (switching re-executes it), and the system profile's, so `reboop check` can say why a reboot is needed: "new system" if the profile isn't the current configuration, and "new X" or "rebuilt X" for each part the profile has another version or build of (a kernel's modules and initrd come with it)
     - After the rest, if check_rebuild is on: whether `nixos-rebuild switch` or `boot` would change the system profile, i.e. whether the configuration evaluates to another toplevel than the profile's: `nix-instantiate --eval --raw --option allow-import-from-derivation false -A config.system.build.toplevel.outPath '<nixpkgs/nixos>'`, niced, as the OOM killer's first pick (`choom -n 1000`), within 3 minutes. Nothing is built (a configuration that imports from a derivation fails), though sources the configuration fetches (e.g. with `builtins.fetchTarball`) get downloaded into the store. Only that default way of building is supported: if nixos-rebuild would build /etc/nixos/flake.nix, `<nixos-system>` or /etc/nixos/system.nix instead, or looking for `<nixos-system>` fails (within 30 seconds), or NIX_PATH is empty in the session, it's a failure, as is an evaluation that fails. `reboop check` shows "ok", "stale", "?" for a failure, or nothing if it's off, and below the table, says what it would change or why it failed (with `-v`, or when machines are named, as in `reboop check HOSTNAME`); `reboop bounce` warns about either but goes ahead. It's no reason not to reboot.
 
 2. Decide whether the machine is okay to reboot.
 
-    - If the boot loader's default doesn't boot the system profile, or its kernel or initrd is missing, or it has the initrd take a static address (ip=) other than the machine's ipv4, no.
+    - If neither systemd-boot's default entry nor a GRUB menu is found, or the boot loader's default (in any one of the mirrored /boots) doesn't boot the system profile, or its kernel or initrd is missing, or the firmware will do something else at the next boot, no.
     - If any btrfs scrub is running, we can't; Linux will hang on shutdown due to the scrub.
     - If any btrfs balance or drive replace is running, no.
-    - If switch-to-configuration or a nix build running, no.
+    - If switch-to-configuration, a Nix command or a Nix build is running, no.
     - If any tmux server is running and the machine's `tmux` is `block`, no. If it's `resume`: no if a pane runs a command that none of the machine's `resumable_commands` matches as a whole, or a command whose directory is gone, or what a pane runs is unknown, or a pane's shell has a job that hasn't ended (in the background, stopped, or brought back into the foreground, unless it counts as the line that started it: see above), or a server couldn't be listed; idle panes and resumable commands are fine, to be brought back after the reboot (see Tmux below). A command that's a reason not to reboot by the rules above (a copy, say) still is, whatever it matches.
     - If a copy program is running, no.
     - If a btrfs send or receive, cryptsetup or a disk tool is running, no.
@@ -97,16 +97,18 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
     - If an inhibitor lock asks for no shutdown (mode block or block-weak), no.
     - If a systemd job has lasted 5 seconds, no.
     - If the root filesystem is root_full_percent (97%) used or more, no.
-    - If more than 1MB/s being transferred over the network, no.
-    - If load average over the last minute > 1, no.
+    - If more than max_network_transfer_bytes_per_sec is being transferred over the network, no.
+    - If the load average over the last minute is above max_load_average_1min, no.
 
 ## Reboot
 
 1. SSH in and:
 
+    If there's a LUKS device beneath / (only one is supported), check that the stored LUKS password opens it, and that the boot loader's default doesn't have the initrd take static IPv4 addresses (ip=) of which none is the machine's ipv4. If either check fails, say so, and leave it at that.
+
     `systemctl stop` each of stop_services, in order, skipping any the machine doesn't have. Stop each one in the same `systemctl stop` (one transaction, with systemd 262 or later) as the units that trigger it (its `TriggeredBy=`, such as socket and timer units) and that aren't inactive or failed, so that they don't start it again. If stopping one fails, say which units it stopped are still stopped, and that the one that failed, and the units that trigger it, may be stopped as well, and leave it at that.
 
-    Check again as in Preflight, except for network traffic and load average, which stopping services changes. If it's no longer okay to reboot, say so, and which units it stopped are still stopped, and leave it at that.
+    Check again as in Preflight, except for network traffic and load average, which stopping services changes, and with LUKS, check the initrd's addresses again. If it's no longer okay to reboot, say so, and which units it stopped are still stopped, and leave it at that.
 
     Save what that check found in the tmux servers on the machine, as `/var/lib/reboop/tmux/TIME.reboot.json` (`.shutdown.json` for a stop; TIME to the millisecond), written whole and synced, and if there's anything in them, point `/var/lib/reboop/tmux/pending` at it, and say what will be run again; if there isn't, remove `pending` if it points to a capture taken for a reboot or shutdown during this boot, which didn't happen, and whose servers are gone now. If that fails, say which units it stopped are still stopped, and leave it at that. (Every `reboop check` and `reboop tmux list` saves a `TIME.check.json` there too, without `pending`, though a check goes on if that fails; the last 200 captures are kept, for root only, plus the pending one.)
 
@@ -188,7 +190,7 @@ A machine's settings replace the defaults, except `resumable_commands`, which ar
 
 ## Stop
 
-`reboop stop HOSTNAME` does Preflight and Reboot step 1 with `systemctl poweroff` in place of the reboot, then keeps trying ssh_port once every 15 seconds until the machine stops accepting SSH, which is as much of its going down as can be seen from outside.
+`reboop stop HOSTNAME` does Preflight (without the rebuild check) and Reboot step 1 (without the LUKS checks), with `systemctl poweroff` in place of the reboot, then keeps trying ssh_port once every 15 seconds until the machine stops accepting SSH, which is as much of its going down as can be seen from outside.
 
 ## Tmux
 
