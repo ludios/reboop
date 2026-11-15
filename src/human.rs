@@ -133,6 +133,16 @@ impl Cell {
     }
 }
 
+/// How many columns of a terminal `text` takes (as [`Cell`] counts them),
+/// leaving out the escape sequences that [`Style::paint`] puts in.
+pub fn styled_width(text: &str) -> usize {
+    let mut pieces = text.split('\x1b');
+    let first = pieces.next().unwrap_or_default();
+    // Each later piece starts with the rest of an escape sequence, which
+    // ends with "m".
+    first.width() + pieces.map(|piece| piece.split_once('m').map_or(piece, |(_, after)| after).width()).sum::<usize>()
+}
+
 /// A cell showing `time` in `zone` to the minute, without the year, like
 /// "12-31T23:59", the "T" dim to set apart the date and the time of day.
 pub fn minute(time: Timestamp, zone: &TimeZone) -> Cell {
@@ -229,6 +239,9 @@ mod tests {
         assert_eq!(table(&rows, true), [" \x1b[1mNET\x1b[0m", "\x1b[31m12.50\x1b[0m", "  \x1b[33m1.0\x1b[0m"]);
         let rows = [vec![Style::Plain.cell("ab").then(Style::Red, "c").then(Style::Green, ""), Style::Plain.cell("x")], vec![Style::Plain.cell("a"), Style::Plain.cell("y")]];
         assert_eq!(table(&rows, true), ["ab\x1b[31mc\x1b[0m  x", "a    y"]);
+        assert_eq!(table(&rows, true).iter().map(|line| styled_width(line)).collect::<Vec<_>>(), [6, 6]);
+        assert_eq!(styled_width(&Style::Red.paint("界 m")), 4);
+        assert_eq!(styled_width(""), 0);
     }
 
     #[test]

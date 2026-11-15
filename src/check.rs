@@ -6,6 +6,7 @@ use crate::config::{self, Machine, TmuxPolicy};
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
 use crate::preflight::{self, DiskFacts, Facts};
+use crate::printer::{self, LiveText};
 use crate::processes::Activity;
 use crate::resume::{self, Capture, Purpose};
 use crate::smart::Smart;
@@ -15,7 +16,10 @@ use anyhow::{Result, ensure};
 use jiff::tz::TimeZone;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::io::{self, IsTerminal};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// The facts about a machine, the reasons not to reboot it (none if it's
@@ -23,20 +27,94 @@ use tracing::warn;
 /// is on), or why it couldn't be checked.
 type Outcome = Result<(Facts, Vec<String>, Option<Rebuild>)>;
 
+/// How far the check of a machine has got.
+enum Progress {
+    /// Its facts aren't in yet.
+    Gathering,
+    /// Its facts and the reasons not to reboot it are in, and whether a
+    /// nixos-rebuild would change it is being evaluated.
+    Evaluating(Facts, Vec<String>),
+    /// It's done, as [`Outcome`] says.
+    Done(Outcome),
+}
+
+impl Progress {
+    /// The outcome of a check that's done.
+    fn into_outcome(self) -> Outcome {
+        let Progress::Done(outcome) = self else { panic!("the check isn't done") };
+        outcome
+    }
+}
+
+/// News about the check of a machine.
+enum Update {
+    /// How far it has got now.
+    Progress(Progress),
+    /// Something that went wrong without spoiling the check, to tell the user.
+    Warning(String),
+}
+
 /// Checks `machine` over `ssh` (see [`Outcome`]), and saves what's in its
-/// tmux servers on it, for after a crash, only warning if that fails.
-fn check_machine(ssh: &Ssh, machine: &Machine) -> Outcome {
+/// tmux servers on it, for after a crash.  Tells `report` if that fails,
+/// with a warning, and if a nixos-rebuild evaluation follows the facts,
+/// tells `report` the facts first.
+fn check_machine(ssh: &Ssh, machine: &Machine, report: &impl Fn(Update)) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
+    if machine.check_rebuild {
+        report(Update::Progress(Progress::Evaluating(facts.clone(), blockers.clone())));
+    }
     // A record of what was in tmux, for after a crash (see resume::DIR),
     // which isn't worth losing the facts over if it can't be written
     if let Err(error) = resume::save(&mut session, &Capture::new(Purpose::Check, &facts.boot_id, facts.tmux.clone()), false) {
-        warn!("couldn't save what's in tmux on {}: {error:#}", machine.hostname);
+        report(Update::Warning(format!("couldn't save what's in tmux on {}: {error:#}", machine.hostname)));
     }
     // After the facts, which the evaluation would skew, e.g. the load
     let rebuild = machine.check_rebuild.then(|| facts::rebuild(&mut session, &facts.systems.default));
     Ok((facts, blockers, rebuild))
+}
+
+/// How often a spinner turns, and the table showing it is redrawn.
+const SPIN: Duration = Duration::from_millis(100);
+
+/// What a spinner shows, one after the other.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Checks `machines` at the same time (see [`check_machine`]).  Calls
+/// `update` with each machine's index in `machines` and each [`Update`]
+/// about it, in the order of the updates about each machine, the last
+/// being the [`Progress::Done`]; and with `None` whenever [`SPIN`] goes by
+/// without an update.  Returns once every check is done.
+fn check_all(machines: &[&Machine], mut update: impl FnMut(Option<(usize, Update)>)) {
+    let ssh = &Ssh::default();
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        let threads: Vec<_> = machines
+            .iter()
+            .enumerate()
+            .map(|(index, &machine)| {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    let report = |update| sender.send((index, update)).expect("updates are received until every check is done");
+                    let outcome = check_machine(ssh, machine, &report);
+                    report(Update::Progress(Progress::Done(outcome)));
+                })
+            })
+            .collect();
+        // So that the channel disconnects once every thread is done
+        drop(sender);
+        loop {
+            match receiver.recv_timeout(SPIN) {
+                Ok(message) => update(Some(message)),
+                Err(RecvTimeoutError::Timeout) => update(None),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        for thread in threads {
+            thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    });
 }
 
 /// The activities that have columns of their own.
@@ -118,14 +196,28 @@ fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
 /// it ("ok" if not, "stale" if so, "?" if that couldn't be evaluated, or
 /// nothing if it wasn't checked), why it needs a reboot (if it does),
 /// the kernel it runs (and the one it would boot, if different), and when
-/// that kernel was built and booted, in `zone`. If `outcome` says that
-/// `machine` couldn't be checked, the row has only the hostname and
-/// "error", in yellow.
-fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell> {
-    let Ok((facts, blockers, rebuild)) = outcome else {
-        let mut row = vec![Plain.cell(machine.hostname.clone()), Yellow.cell("error")];
+/// that kernel was built and booted, in `zone`.  Where `progress` says the
+/// check isn't done, `spinner` stands in for what's yet to come: in the
+/// OKAY cell of a row with only the hostname before the facts are in, and
+/// in the REBUILD cell during the evaluation.  If `progress` says that
+/// `machine` couldn't be checked, the row has only the hostname and "error",
+/// in yellow.
+fn table_row(machine: &Machine, progress: &Progress, spinner: char, zone: &TimeZone) -> Vec<Cell> {
+    let short_row = |okay: Cell| {
+        let mut row = vec![Plain.cell(machine.hostname.clone()), okay];
         row.resize(HEADER.len(), Plain.cell(""));
-        return row;
+        row
+    };
+    let (facts, blockers, rebuild) = match progress {
+        Progress::Gathering => return short_row(Plain.cell(spinner)),
+        Progress::Done(Err(_)) => return short_row(Yellow.cell("error")),
+        Progress::Evaluating(facts, blockers) => (facts, blockers, Plain.cell(spinner)),
+        Progress::Done(Ok((facts, blockers, rebuild))) => (facts, blockers, match rebuild {
+            Some(Rebuild::Fresh { .. }) => Green.cell("ok"),
+            Some(Rebuild::Stale { .. }) => Plain.cell("stale"),
+            Some(Rebuild::Failed { .. }) => Plain.cell("?"),
+            None => Plain.cell(""),
+        }),
     };
     let list = |style: Style, items: Vec<&str>| if items.is_empty() { Plain.cell("") } else { style.cell(items.join(",")) };
     let scrubbing = facts.btrfs.iter().filter(|fs| fs.scrub.state == ScrubState::Running).map(|fs| fs.filesystem.mountpoint.as_str());
@@ -150,12 +242,7 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         smart_cell(facts),
         list(Red, other_reasons(facts).iter().map(String::as_str).collect()),
-        match rebuild {
-            Some(Rebuild::Fresh { .. }) => Green.cell("ok"),
-            Some(Rebuild::Stale { .. }) => Plain.cell("stale"),
-            Some(Rebuild::Failed { .. }) => Plain.cell("?"),
-            None => Plain.cell(""),
-        },
+        rebuild,
         list(Plain, reboot_reasons.iter().map(String::as_str).collect()),
         Plain.cell(kernel),
         systems.running_kernel_built_at.map_or(Plain.cell("?"), |time| human::minute(time, zone)),
@@ -163,10 +250,12 @@ fn table_row(machine: &Machine, outcome: &Outcome, zone: &TimeZone) -> Vec<Cell>
     ]
 }
 
-/// A table with a row per machine, styled if `color`, with times in `zone`.
-fn table(outcomes: &[(&Machine, Outcome)], color: bool, zone: &TimeZone) -> String {
+/// A table with a row per machine, checked as far as its [`Progress`]
+/// says (see [`table_row`] for `spinner`), styled if `color`, with times in
+/// `zone`.
+fn table(checks: &[(&Machine, Progress)], spinner: char, color: bool, zone: &TimeZone) -> String {
     let mut rows = vec![Vec::from(HEADER.map(|title| Bold.cell(title).aligned(if CENTERED.contains(&title) { Center } else { Left })))];
-    rows.extend(outcomes.iter().map(|(machine, outcome)| table_row(machine, outcome, zone)));
+    rows.extend(checks.iter().map(|(machine, progress)| table_row(machine, progress, spinner, zone)));
     human::table(&rows, color).join("\n") + "\n"
 }
 
@@ -256,28 +345,51 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
-/// `color`, with times in the local time zone), or JSON if `json`.  Below
-/// the table, if `verbose` or if `hostnames` isn't empty, prints the
-/// [`details`].  Returns the exit status: see [`exit_status`].
+/// `color`, with times in the local time zone), or JSON if `json`.  On a
+/// terminal, the table is shown from the start and redrawn as the checks
+/// go, with a spinner in what's yet to come.  Below the table, if `verbose`
+/// or if `hostnames` isn't empty, prints the [`details`].  Then warns about
+/// what went wrong without spoiling a check.  Returns the exit status: see
+/// [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
-    let ssh = &Ssh::default();
-    let outcomes: Vec<(&Machine, Outcome)> = thread::scope(|scope| {
-        let threads: Vec<_> = machines.iter().map(|&machine| (machine, scope.spawn(move || check_machine(ssh, machine)))).collect();
-        threads
-            .into_iter()
-            .map(|(machine, thread)| (machine, thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))))
-            .collect()
+    let zone = TimeZone::system();
+    let mut stdout = io::stdout();
+    let mut live = (!json && stdout.is_terminal()).then(|| LiveText::new(&mut stdout, printer::terminal_size));
+    let mut checks: Vec<(&Machine, Progress)> = machines.iter().map(|&machine| (machine, Progress::Gathering)).collect();
+    // Held until the table is done, as they'd break up the live one
+    let mut warnings = Vec::new();
+    let start = Instant::now();
+    check_all(&machines, |update| {
+        match update {
+            Some((index, Update::Progress(progress))) => checks[index].1 = progress,
+            Some((_, Update::Warning(warning))) => warnings.push(warning),
+            None => {}
+        }
+        if let Some(live) = &mut live {
+            let turns = start.elapsed().as_millis() / SPIN.as_millis();
+            let spinner = SPINNER[(turns % SPINNER.len() as u128) as usize];
+            live.draw(&table(&checks, spinner, color, &zone));
+        }
     });
+
+    if !json {
+        let table = table(&checks, SPINNER[0], color, &zone);
+        match live {
+            Some(live) => live.finish(&table),
+            None => print!("{table}"),
+        }
+    }
+    let outcomes: Vec<(&Machine, Outcome)> = checks.into_iter().map(|(machine, progress)| (machine, progress.into_outcome())).collect();
     if json {
         let reports: Vec<_> = outcomes.iter().map(|(machine, outcome)| json_report(machine, outcome)).collect();
         println!("{}", serde_json::to_string_pretty(&reports)?);
-    } else {
-        print!("{}", table(&outcomes, color, &TimeZone::system()));
-        if verbose || !hostnames.is_empty() {
-            print!("{}", details(&outcomes));
-        }
+    } else if verbose || !hostnames.is_empty() {
+        print!("{}", details(&outcomes));
+    }
+    for warning in warnings {
+        warn!("{warning}");
     }
     Ok(exit_status(&outcomes))
 }
@@ -342,15 +454,15 @@ mod tests {
         let fresh = Rebuild::Fresh { toplevel: idle_facts().systems.default, nix_path: "nixpkgs=/var/nixpkgs".into() };
         let error = "error:\n       … while evaluating the attribute 'config'\n\n       error: attribute 'boot' missing\n       at /etc/nixos/configuration.nix:3:5:";
         let failed = Rebuild::Failed { error: error.into(), nix_path: Some("nixpkgs=/var/nixpkgs".into()) };
-        let outcomes = [
-            (&machines[0], blocked_outcome()),
-            (&machines[1], idle_outcome(Some(fresh))),
-            (&machines[2], Err(anyhow!("no route to host\nsecond line").context("failed to open a session"))),
-            (&machines[3], idle_outcome(Some(failed))),
-            (&machines[4], idle_outcome(None)),
+        let checks = vec![
+            (&machines[0], Progress::Done(blocked_outcome())),
+            (&machines[1], Progress::Done(idle_outcome(Some(fresh)))),
+            (&machines[2], Progress::Done(Err(anyhow!("no route to host\nsecond line").context("failed to open a session")))),
+            (&machines[3], Progress::Done(idle_outcome(Some(failed)))),
+            (&machines[4], Progress::Done(idle_outcome(None))),
         ];
         assert_eq!(
-            table(&outcomes, false, &TimeZone::UTC),
+            table(&checks, '⠋', false, &TimeZone::UTC),
             "MACHINE  OKAY   SCRUB  NIX  TMUX  COPY     NET      LOAD   ROOT  SMART                                 OTHER                                 REBUILD  REBOOT                      KERNEL             BUILT        BOOTED\n\
              one      no                    1        12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  stale    new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
              two      yes                             1.00 kB/s   0.50   45%  ok                                                                          ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
@@ -358,6 +470,14 @@ mod tests {
              four     yes                             1.00 kB/s   0.50   45%  ok                                                                          ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
              five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n"
         );
+        let styles = |(machine, progress): &(&Machine, Progress)| table_row(machine, progress, '⠋', &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
+        assert_eq!(styles(&checks[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&checks[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&checks[2])[..2], [Plain, Yellow]);
+        assert_eq!(styles(&checks[3])[11], Plain);
+        assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
+
+        let outcomes: Vec<_> = checks.into_iter().map(|(machine, progress)| (machine, progress.into_outcome())).collect();
         assert_eq!(
             details(&outcomes),
             "\n\
@@ -378,15 +498,21 @@ mod tests {
              \n\
              four: couldn't evaluate the configuration: attribute 'boot' missing\n    at /etc/nixos/configuration.nix:3:5:\n"
         );
-        let styles = |(machine, outcome): &(&Machine, Outcome)| table_row(machine, outcome, &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
-        assert_eq!(styles(&outcomes[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
-        assert_eq!(styles(&outcomes[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
-        assert_eq!(styles(&outcomes[2])[..2], [Plain, Yellow]);
-        assert_eq!(styles(&outcomes[3])[11], Plain);
         assert_eq!(exit_status(&outcomes), 1);
-        assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
         assert_eq!(exit_status(&outcomes[..2]), 2);
         assert_eq!(exit_status(&outcomes[1..2]), 0);
+    }
+
+    #[test]
+    fn shows_checks_under_way() {
+        let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }];
+        let checks = [(&machines[0], Progress::Gathering), (&machines[1], Progress::Evaluating(idle_facts(), vec![]))];
+        assert_eq!(
+            table(&checks, '⠙', false, &TimeZone::UTC),
+            "MACHINE  OKAY  SCRUB  NIX  TMUX  COPY     NET     LOAD  ROOT  SMART  OTHER  REBUILD  REBOOT  KERNEL   BUILT        BOOTED\n\
+             one      ⠙\n\
+             two      yes                           1.00 kB/s  0.50   45%  ok            ⠙                6.18.54  09-25T14:35  09-30T08:27\n"
+        );
     }
 
     #[test]
