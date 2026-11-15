@@ -75,7 +75,8 @@ fn check_machine(ssh: &Ssh, machine: &Machine, report: &impl Fn(Update)) -> Outc
     Ok((facts, blockers, rebuild))
 }
 
-/// How often a spinner turns, and the table showing it is redrawn.
+/// How often a spinner turns, and at most how often the table showing it is
+/// redrawn.
 const SPIN: Duration = Duration::from_millis(100);
 
 /// What a spinner shows, one after the other.
@@ -361,16 +362,22 @@ pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Resu
     // Held until the table is done, as they'd break up the live one
     let mut warnings = Vec::new();
     let start = Instant::now();
+    let mut drawn_at: Option<Instant> = None;
     check_all(&machines, |update| {
         match update {
             Some((index, Update::Progress(progress))) => checks[index].1 = progress,
             Some((_, Update::Warning(warning))) => warnings.push(warning),
             None => {}
         }
-        if let Some(live) = &mut live {
+        // Updates that come sooner are drawn with the next one, or after
+        // SPIN without one.
+        if let Some(live) = &mut live
+            && drawn_at.is_none_or(|at| at.elapsed() >= SPIN)
+        {
             let turns = start.elapsed().as_millis() / SPIN.as_millis();
             let spinner = SPINNER[(turns % SPINNER.len() as u128) as usize];
             live.draw(&table(&checks, spinner, color, &zone));
+            drawn_at = Some(Instant::now());
         }
     });
 
