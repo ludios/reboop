@@ -135,7 +135,7 @@ fn time_of_day() -> String {
 /// The width and height of the terminal on stdout, in columns and rows,
 /// with 80 columns in place of an unknown width, and 24 rows in place of
 /// an unknown height.
-pub(crate) fn terminal_size() -> (usize, usize) {
+fn terminal_size() -> (usize, usize) {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCGWINSZ fills in the winsize that its argument points to.
     let known = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
@@ -186,8 +186,16 @@ pub(crate) struct LiveText<'a> {
 impl<'a> LiveText<'a> {
     /// Live text, none of it drawn yet, that goes to `out`, a terminal whose
     /// size `size` gives (see [`terminal_size`]).
-    pub(crate) fn new(out: &'a mut dyn Write, size: fn() -> (usize, usize)) -> LiveText<'a> {
+    fn new(out: &'a mut dyn Write, size: fn() -> (usize, usize)) -> LiveText<'a> {
         LiveText { out, size, drawn_columns: 0, drawn_rows: 0 }
+    }
+
+    /// Live text that goes to `stdout`, if it's a terminal that can move the
+    /// cursor and erase: one whose TERM is set, and isn't "dumb" (like
+    /// Emacs's M-x shell).
+    pub(crate) fn on_stdout(stdout: &'a mut io::Stdout) -> Option<LiveText<'a>> {
+        let capable = stdout.is_terminal() && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
+        capable.then(|| LiveText::new(stdout, terminal_size))
     }
 
     /// Erases the lines drawn last, unless the terminal is no longer the

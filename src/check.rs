@@ -6,7 +6,7 @@ use crate::config::{self, Machine, TmuxPolicy};
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
 use crate::preflight::{self, DiskFacts, Facts};
-use crate::printer::{self, LiveText};
+use crate::printer::LiveText;
 use crate::processes::Activity;
 use crate::resume::{self, Capture, Purpose};
 use crate::smart::Smart;
@@ -16,7 +16,7 @@ use anyhow::{Result, ensure};
 use jiff::tz::TimeZone;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -346,8 +346,8 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// Checks the configured machines called `hostnames` (all of them if
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  On a
-/// terminal, the table is shown from the start and redrawn as the checks
-/// go, with a spinner in what's yet to come.  Below the table, if `verbose`
+/// terminal that can move the cursor, the table is shown from the start and
+/// redrawn as the checks go, with a spinner in what's yet to come.  Below the table, if `verbose`
 /// or if `hostnames` isn't empty, prints the [`details`].  Then warns about
 /// what went wrong without spoiling a check.  Returns the exit status: see
 /// [`exit_status`].
@@ -356,7 +356,7 @@ pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Resu
     let machines = select(&machines, hostnames)?;
     let zone = TimeZone::system();
     let mut stdout = io::stdout();
-    let mut live = (!json && stdout.is_terminal()).then(|| LiveText::new(&mut stdout, printer::terminal_size));
+    let mut live = if json { None } else { LiveText::on_stdout(&mut stdout) };
     let mut checks: Vec<(&Machine, Progress)> = machines.iter().map(|&machine| (machine, Progress::Gathering)).collect();
     // Held until the table is done, as they'd break up the live one
     let mut warnings = Vec::new();
