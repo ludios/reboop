@@ -348,9 +348,9 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  On a
 /// terminal that can move the cursor, the table is shown from the start and
-/// redrawn as the checks go, with a spinner in what's yet to come.  Below
-/// the table, if `verbose` or if `hostnames` isn't empty, prints the
-/// [`details`].  Returns the exit status: see [`exit_status`].
+/// redrawn as the checks go, with a spinner in what's yet to come, except
+/// while it's too tall for the terminal.  Below the table, if `verbose` or
+/// if `hostnames` isn't empty, prints the [`details`].  Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;

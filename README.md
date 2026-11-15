@@ -66,7 +66,7 @@ Whether `nixos-rebuild switch` or `boot` would change the system profile. `bounc
 - The evaluation builds nothing, but it downloads the sources that the configuration fetches, like a rebuild would, and it can take a GB or more of the machine's RAM.
 - `"check_rebuild": false` turns it off.
 
-On a terminal, the table shows up right away and fills in as the machines answer, with a spinner where an answer isn't in yet: in OKAY until a machine's facts are in, and in REBUILD until its evaluation ends.
+On a terminal, the table shows up right away and fills in as the machines answer, with a spinner where an answer isn't in yet: in OKAY until a machine's facts are in, and in REBUILD until its evaluation ends. But if TERM is `dumb`, or while the table is too tall for the terminal, the table is left out until every machine has answered.
 
 Below the table, `reboop check -v` (or naming machines, as in `reboop check HOSTNAME`) prints the details: each reason not to reboot, in full; what a rebuild would change, or why the evaluation failed; and why a machine couldn't be checked.
 
