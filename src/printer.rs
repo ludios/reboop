@@ -7,6 +7,7 @@ use crate::human::{self, Style::{self, Bold, Dim, Plain, Red}};
 use jiff::Zoned;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
+use unicode_width::UnicodeWidthStr;
 
 /// Tells the user how a command is going.  Write errors are ignored: a
 /// command whose stdout is closed should still finish what it started.
@@ -131,8 +132,9 @@ fn time_of_day() -> String {
     Zoned::now().strftime("%H:%M:%S").to_string()
 }
 
-/// The width and height of the terminal on stdout, in columns and rows, or
-/// 80 columns and 24 rows for what's unknown.
+/// The width and height of the terminal on stdout, in columns and rows,
+/// with 80 columns in place of an unknown width, and 24 rows in place of
+/// an unknown height.
 pub(crate) fn terminal_size() -> (usize, usize) {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCGWINSZ fills in the winsize that its argument points to.
@@ -153,26 +155,57 @@ impl Printer<'_> {
     }
 }
 
-/// Lines on a terminal that are drawn over each time they change, by moving
-/// the cursor up as many rows as they took (their own line breaks, and the
-/// terminal's where they're too wide), and erasing from there down.  So
-/// nothing else should be written to the terminal in the meantime, and the
-/// cursor has to start at the beginning of a line.  Write errors are
-/// ignored, as by [`Printer`].
+/// How many rows of a terminal `columns` wide the lines in `text` take up,
+/// leaving out escape sequences: at least one row for each line, and more
+/// for a line that's too wide to fit in one row, which the terminal wraps
+/// onto further rows.  (A wide character that the terminal moves to the
+/// next row, rather than split it between two, can make a line take up one
+/// more row than this counts.)
+fn text_rows(text: &str, columns: usize) -> usize {
+    assert!(columns > 0, "a terminal without columns");
+    text.lines().map(|line| anstream::adapter::strip_str(line).to_string().width().div_ceil(columns).max(1)).sum()
+}
+
+/// Lines on a terminal that are drawn over each time they change.  Each
+/// draw erases the rows that the last draw took up (see [`text_rows`]),
+/// going up from the cursor, so nothing else should be written to the
+/// terminal in the meantime, and the cursor has to start at the beginning
+/// of a line.  Write errors are ignored, as by [`Printer`].
 pub(crate) struct LiveText<'a> {
     out: &'a mut dyn Write,
     /// Gives the terminal's width and height, in columns and rows, which can
     /// change.
     size: fn() -> (usize, usize),
-    /// The lines drawn last, which are on the terminal above the cursor.
-    drawn: String,
+    /// The terminal's width, in columns, when the last lines were drawn.
+    drawn_columns: usize,
+    /// How many rows the last lines drawn took up, all of them above the
+    /// cursor.
+    drawn_rows: usize,
 }
 
 impl<'a> LiveText<'a> {
     /// Live text, none of it drawn yet, that goes to `out`, a terminal whose
     /// size `size` gives (see [`terminal_size`]).
     pub(crate) fn new(out: &'a mut dyn Write, size: fn() -> (usize, usize)) -> LiveText<'a> {
-        LiveText { out, size, drawn: String::new() }
+        LiveText { out, size, drawn_columns: 0, drawn_rows: 0 }
+    }
+
+    /// Erases the lines drawn last, unless the terminal is no longer the
+    /// same width, and draws `text`, given that the terminal is `columns`
+    /// wide.
+    fn replace(&mut self, text: &str, columns: usize) {
+        assert!(text.is_empty() || text.ends_with('\n'), "the last line doesn't end with a newline: {text:?}");
+        // After a change of width, some terminals have wrapped the lines
+        // drawn last anew, and some haven't, so the rows they take up aren't
+        // known: rather than erase what's above them, they're left there.
+        // Each row is erased by itself, as erasing to the end of the screen
+        // from its top left corner makes tmux keep a copy in its history
+        // (with scroll-on-clear, which is on by default).
+        let erase = if columns == self.drawn_columns { "\x1b[1A\x1b[2K".repeat(self.drawn_rows) } else { String::new() };
+        let _ = self.out.write_all(format!("{erase}{text}").as_bytes());
+        let _ = self.out.flush();
+        self.drawn_columns = columns;
+        self.drawn_rows = text_rows(text, columns);
     }
 
     /// Draws `text` (lines that each end with a newline, and can be styled)
@@ -192,25 +225,6 @@ impl<'a> LiveText<'a> {
         let (columns, _) = (self.size)();
         self.replace(text, columns);
     }
-
-    /// Erases the lines drawn last, which take up rows `columns` wide (the
-    /// terminal rewraps lines when its width changes), and draws `text`.
-    fn replace(&mut self, text: &str, columns: usize) {
-        assert!(text.is_empty() || text.ends_with('\n'), "the last line doesn't end with a newline: {text:?}");
-        let up = text_rows(&self.drawn, columns);
-        let erase = if up > 0 { format!("\x1b[{up}A\x1b[J") } else { String::new() };
-        let _ = self.out.write_all(format!("{erase}{text}").as_bytes());
-        let _ = self.out.flush();
-        self.drawn = text.to_string();
-    }
-}
-
-/// How many rows of a terminal `columns` wide the lines in `text` take up:
-/// at least one each, and more for a line too wide to fit in one, which the
-/// terminal breaks into several.
-fn text_rows(text: &str, columns: usize) -> usize {
-    assert!(columns > 0, "a terminal without columns");
-    text.lines().map(|line| human::styled_width(line).div_ceil(columns).max(1)).sum()
 }
 
 /// What `print` printed to a [`Printer`] with these settings (see
@@ -225,6 +239,7 @@ pub(crate) fn printed(color: bool, columns: Option<fn() -> usize>, clock: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn prints_progress_over_itself() {
@@ -293,10 +308,22 @@ mod tests {
         live.draw("1\n2\n3\n4\n5\n");
         live.draw("\n");
         live.finish("1\n2\n3\n4\n5\n");
+        let up = |rows: usize| "\x1b[1A\x1b[2K".repeat(rows);
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, "a\nb\n\x1b[2A\x1b[J0123456789x\n\x1b[31m0123456789\x1b[0m\n\x1b[3A\x1b[J\n\x1b[1A\x1b[J1\n2\n3\n4\n5\n");
-        // Rewrapped in a narrower terminal, the lines take more rows
+        assert_eq!(text, format!("a\nb\n{}0123456789x\n\x1b[31m0123456789\x1b[0m\n{}\n{}1\n2\n3\n4\n5\n", up(2), up(3), up(1)));
         assert_eq!(text_rows("0123456789x\n", 4), 3);
+    }
+
+    #[test]
+    fn leaves_live_text_drawn_before_a_change_of_width() {
+        static COLUMNS: AtomicUsize = AtomicUsize::new(10);
+        let mut out = Vec::new();
+        let mut live = LiveText::new(&mut out, || (COLUMNS.load(Ordering::Relaxed), 5));
+        live.draw("a\n");
+        COLUMNS.store(4, Ordering::Relaxed);
+        live.draw("b\n");
+        live.finish("c\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nb\n\x1b[1A\x1b[2Kc\n");
     }
 
     #[test]
