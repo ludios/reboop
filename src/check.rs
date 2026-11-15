@@ -348,10 +348,9 @@ fn select<'a>(machines: &'a [Machine], hostnames: &[String]) -> Result<Vec<&'a M
 /// empty) at the same time, and prints a table about them (styled if
 /// `color`, with times in the local time zone), or JSON if `json`.  On a
 /// terminal that can move the cursor, the table is shown from the start and
-/// redrawn as the checks go, with a spinner in what's yet to come.  Below the table, if `verbose`
-/// or if `hostnames` isn't empty, prints the [`details`].  Then warns about
-/// what went wrong without spoiling a check.  Returns the exit status: see
-/// [`exit_status`].
+/// redrawn as the checks go, with a spinner in what's yet to come.  Below
+/// the table, if `verbose` or if `hostnames` isn't empty, prints the
+/// [`details`].  Returns the exit status: see [`exit_status`].
 pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Result<u8> {
     let machines = config::load(&config::config_dir()?)?;
     let machines = select(&machines, hostnames)?;
@@ -359,14 +358,19 @@ pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Resu
     let mut stdout = io::stdout();
     let mut live = if json { None } else { LiveText::on_stdout(&mut stdout) };
     let mut checks: Vec<(&Machine, Progress)> = machines.iter().map(|&machine| (machine, Progress::Gathering)).collect();
-    // Held until the table is done, as they'd break up the live one
-    let mut warnings = Vec::new();
     let start = Instant::now();
     let mut drawn_at: Option<Instant> = None;
     check_all(&machines, |update| {
         match update {
             Some((index, Update::Progress(progress))) => checks[index].1 = progress,
-            Some((_, Update::Warning(warning))) => warnings.push(warning),
+            Some((_, Update::Warning(warning))) => {
+                // Above the live table, which is drawn again below it
+                if let Some(live) = &mut live {
+                    live.draw("");
+                    drawn_at = None;
+                }
+                warn!("{warning}");
+            }
             None => {}
         }
         // Updates that come sooner are drawn with the next one, or after
@@ -394,9 +398,6 @@ pub fn run(hostnames: &[String], json: bool, verbose: bool, color: bool) -> Resu
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else if verbose || !hostnames.is_empty() {
         print!("{}", details(&outcomes));
-    }
-    for warning in warnings {
-        warn!("{warning}");
     }
     Ok(exit_status(&outcomes))
 }
