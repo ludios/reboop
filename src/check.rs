@@ -31,9 +31,11 @@ type Outcome = Result<(Facts, Vec<String>, Option<Rebuild>)>;
 enum Progress {
     /// Its facts aren't in yet.
     Gathering,
-    /// Its facts and the reasons not to reboot it are in, and whether a
-    /// nixos-rebuild would change it is being evaluated.
-    Evaluating(Facts, Vec<String>),
+    /// Its facts and the reasons not to reboot it are in, and the rest of
+    /// the check is under way: saving what's in its tmux servers, and then,
+    /// if its check_rebuild is on, evaluating whether a nixos-rebuild would
+    /// change it.
+    Finishing(Facts, Vec<String>),
     /// It's done, as [`Outcome`] says.
     Done(Outcome),
 }
@@ -55,16 +57,13 @@ enum Update {
 }
 
 /// Checks `machine` over `ssh` (see [`Outcome`]), and saves what's in its
-/// tmux servers on it, for after a crash.  Tells `report` if that fails,
-/// with a warning, and if a nixos-rebuild evaluation follows the facts,
-/// tells `report` the facts first.
+/// tmux servers on it, for after a crash.  Tells `report` the facts as soon
+/// as they're in, and if saving fails, a warning.
 fn check_machine(ssh: &Ssh, machine: &Machine, report: &impl Fn(Update)) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     let blockers = preflight::blockers(machine, &facts);
-    if machine.check_rebuild {
-        report(Update::Progress(Progress::Evaluating(facts.clone(), blockers.clone())));
-    }
+    report(Update::Progress(Progress::Finishing(facts.clone(), blockers.clone())));
     // A record of what was in tmux, for after a crash (see resume::DIR),
     // which isn't worth losing the facts over if it can't be written
     if let Err(error) = resume::save(&mut session, &Capture::new(Purpose::Check, &facts.boot_id, facts.tmux.clone()), false) {
@@ -200,7 +199,8 @@ fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
 /// that kernel was built and booted, in `zone`.  Where `progress` says the
 /// check isn't done, `spinner` stands in for what's yet to come: in the
 /// OKAY cell of a row with only the hostname before the facts are in, and
-/// in the REBUILD cell during the evaluation.  If `progress` says that
+/// after that, if `machine`'s check_rebuild is on, in the REBUILD cell
+/// until the evaluation ends.  If `progress` says that
 /// `machine` couldn't be checked, the row has only the hostname and "error",
 /// in yellow.
 fn table_row(machine: &Machine, progress: &Progress, spinner: char, zone: &TimeZone) -> Vec<Cell> {
@@ -212,7 +212,7 @@ fn table_row(machine: &Machine, progress: &Progress, spinner: char, zone: &TimeZ
     let (facts, blockers, rebuild) = match progress {
         Progress::Gathering => return short_row(Plain.cell(spinner)),
         Progress::Done(Err(_)) => return short_row(Yellow.cell("error")),
-        Progress::Evaluating(facts, blockers) => (facts, blockers, Plain.cell(spinner)),
+        Progress::Finishing(facts, blockers) => (facts, blockers, if machine.check_rebuild { Plain.cell(spinner) } else { Plain.cell("") }),
         Progress::Done(Ok((facts, blockers, rebuild))) => (facts, blockers, match rebuild {
             Some(Rebuild::Fresh { .. }) => Green.cell("ok"),
             Some(Rebuild::Stale { .. }) => Plain.cell("stale"),
@@ -513,13 +513,18 @@ mod tests {
 
     #[test]
     fn shows_checks_under_way() {
-        let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }];
-        let checks = [(&machines[0], Progress::Gathering), (&machines[1], Progress::Evaluating(idle_facts(), vec![]))];
+        let machines = [test_machine(), Machine { hostname: "two".into(), ..test_machine() }, Machine { hostname: "three".into(), check_rebuild: false, ..test_machine() }];
+        let checks = [
+            (&machines[0], Progress::Gathering),
+            (&machines[1], Progress::Finishing(idle_facts(), vec![])),
+            (&machines[2], Progress::Finishing(idle_facts(), vec![])),
+        ];
         assert_eq!(
             table(&checks, '⠙', false, &TimeZone::UTC),
             "MACHINE  OKAY  SCRUB  NIX  TMUX  COPY     NET     LOAD  ROOT  SMART  OTHER  REBUILD  REBOOT  KERNEL   BUILT        BOOTED\n\
              one      ⠙\n\
-             two      yes                           1.00 kB/s  0.50   45%  ok            ⠙                6.18.54  09-25T14:35  09-30T08:27\n"
+             two      yes                           1.00 kB/s  0.50   45%  ok            ⠙                6.18.54  09-25T14:35  09-30T08:27\n\
+             three    yes                           1.00 kB/s  0.50   45%  ok                             6.18.54  09-25T14:35  09-30T08:27\n"
         );
     }
 
