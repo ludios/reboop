@@ -3,7 +3,7 @@
 
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine, TmuxPolicy};
-use crate::edac::Edac;
+use crate::edac::{self, Edac};
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
 use crate::preflight::{self, DiskFacts, Facts};
@@ -57,12 +57,18 @@ enum Update {
     Warning(String),
 }
 
-/// Checks `machine` over `ssh` (see [`Outcome`]), and saves what's in its
-/// tmux servers on it, for after a crash.  Tells `report` the facts as soon
-/// as they're in, and if saving fails, a warning.
+/// Checks `machine` over `ssh` (see [`Outcome`]), with what EDAC says about
+/// its RAM, and saves what's in its tmux servers on it, for after a crash.
+/// Tells `report` the facts as soon as they're in, and a warning if reading
+/// EDAC or saving fails.
 fn check_machine(ssh: &Ssh, machine: &Machine, report: &impl Fn(Update)) -> Outcome {
     let mut session = Session::open(ssh, &machine.target(), OPEN_TIMEOUT)?;
-    let facts = preflight::gather(&mut session, &machine.hostname)?;
+    let mut facts = preflight::gather(&mut session, &machine.hostname)?;
+    // Which isn't worth losing the facts over, as it's no reason not to reboot
+    match edac::read(&mut session) {
+        Ok(edac) => facts.edac = Some(edac),
+        Err(error) => report(Update::Warning(format!("couldn't read what EDAC says about the RAM on {}: {error:#}", machine.hostname))),
+    }
     let blockers = preflight::blockers(machine, &facts);
     report(Update::Progress(Progress::Finishing(facts.clone(), blockers.clone())));
     // A record of what was in tmux, for after a crash (see resume::DIR),
@@ -171,10 +177,12 @@ fn smart_cell(facts: &Facts) -> Cell {
     }
 }
 
-/// The ECC cell: if ECC found any errors, how many, in yellow (e.g. "1 UE,3
-/// CE": uncorrected and corrected); otherwise whether the RAM uses ECC: "yes",
-/// "no", or "?" if the EDAC driver doesn't say.
-fn ecc_cell(edac: &Edac) -> Cell {
+/// The ECC cell: "?" if what EDAC says (`edac`) couldn't be read; if ECC
+/// found any errors, how many, in yellow (e.g. "1 UE,3 CE": uncorrected and
+/// corrected); otherwise whether the RAM uses ECC: "yes", "no", or "?" if
+/// the EDAC driver doesn't say.
+fn ecc_cell(edac: Option<&Edac>) -> Cell {
+    let Some(edac) = edac else { return Plain.cell("?") };
     let mut errors = Vec::new();
     if edac.uncorrected_errors > 0 {
         errors.push(format!("{} UE", edac.uncorrected_errors));
@@ -266,7 +274,7 @@ fn table_row(machine: &Machine, progress: &Progress, spinner: char, zone: &TimeZ
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         smart_cell(facts),
         list(Red, other_reasons(facts).iter().map(String::as_str).collect()),
-        ecc_cell(&facts.edac),
+        ecc_cell(facts.edac.as_ref()),
         rebuild,
         list(Plain, reboot_reasons.iter().map(String::as_str).collect()),
         Plain.cell(kernel),
@@ -468,8 +476,9 @@ mod tests {
         };
         facts.inhibitors.push(crawl);
         facts.lasting_jobs.push(Job { id: 361, unit: "nixos-upgrade.service".into(), job_type: "start".into(), state: "running".into() });
-        facts.edac.corrected_errors = 3;
-        facts.edac.uncorrected_errors = 1;
+        let edac = facts.edac.as_mut().unwrap();
+        edac.corrected_errors = 3;
+        edac.uncorrected_errors = 1;
         let blockers = preflight::blockers(&test_machine(), &facts);
         let rebuild = Rebuild::Stale { toplevel: "/nix/store/ccc-nixos-system-one-26.05".into(), nix_path: "nixpkgs=/var/nixpkgs".into() };
         Ok((facts, blockers, Some(rebuild)))
@@ -611,10 +620,10 @@ mod tests {
     #[test]
     fn shows_ecc_in_one_cell() {
         let cell = |edac: &Edac| {
-            let cell = ecc_cell(edac);
+            let cell = ecc_cell(Some(edac));
             (cell.spans[0].0, cell.spans[0].1.clone())
         };
-        let mut edac = idle_facts().edac;
+        let mut edac = idle_facts().edac.unwrap();
         assert_eq!(cell(&edac), (Green, "yes".into()));
         edac.dimm_modes[1] = "Unknown".into();
         assert_eq!(cell(&edac), (Plain, "?".into()));
@@ -627,6 +636,8 @@ mod tests {
         edac.corrected_errors = 0;
         assert_eq!(cell(&edac), (Yellow, "1 UE".into()));
         assert_eq!(cell(&Edac::default()), (Plain, "no".into()));
+        let unread = ecc_cell(None);
+        assert_eq!((unread.spans[0].0, unread.spans[0].1.as_str()), (Plain, "?"));
     }
 
     #[test]
