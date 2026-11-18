@@ -1,15 +1,20 @@
 //! What the kernel's EDAC drivers say about a machine's RAM: whether it uses
-//! ECC, and how many errors that has found.
+//! ECC, and how many memory errors they counted.
 
 use crate::ssh::{QUICK, Session};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
-/// What the EDAC memory controllers in /sys/devices/system/edac/mc say.  The
-/// drivers for AMD's memory controllers and for Intel's server ones register
-/// a memory controller only if ECC is on, but Intel's ie31200_edac (for
-/// Xeon E3 and E-2000, and Core on W680) registers one whenever the CPU can
-/// do ECC, and says that each DIMM's mode is "Unknown".
+/// What the EDAC memory controllers in /sys/devices/system/edac/mc say.
+/// What a DIMM's mode tells depends on the driver: amd64_edac (AMD), and
+/// sb_edac, skx_edac, i10nm_edac and igen6_edac (Intel), register a memory
+/// controller only if ECC is on; i7core_edac (Intel) registers one either
+/// way, with the mode "None" if ECC is off; ie31200_edac (Intel, for Xeon
+/// E3, E-2100 and E-2200, and 12th- to 14th-generation Core on W680)
+/// registers one if the CPU can do ECC, whether or not ECC is on, with each
+/// DIMM's mode "Unknown"; and ghes_edac (where the firmware reports memory
+/// errors, as on HPE servers) takes each DIMM's mode from what SMBIOS says
+/// about the DIMM, not from the memory controller.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Edac {
     /// Each populated DIMM's (or rank's) error correction, as its
@@ -18,10 +23,11 @@ pub struct Edac {
     /// is off, or when Linux has no EDAC driver for the machine's memory
     /// controller.
     pub dimm_modes: Vec<String>,
-    /// The errors that ECC corrected, on all memory controllers, since their
-    /// counters were reset (when their driver loaded, normally at boot).
+    /// The corrected errors (CEs) that the memory controllers counted, in
+    /// all, since their counters were reset: when their driver loaded
+    /// (normally at boot), or when something wrote to their reset_counters.
     pub corrected_errors: u64,
-    /// The errors that ECC found but couldn't correct, counted likewise.
+    /// The uncorrected errors (UEs) that they counted, likewise.
     pub uncorrected_errors: u64,
 }
 

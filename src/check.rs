@@ -177,10 +177,10 @@ fn smart_cell(facts: &Facts) -> Cell {
     }
 }
 
-/// The ECC cell: "?" if what EDAC says (`edac`) couldn't be read; if ECC
-/// found any errors, how many, in yellow (e.g. "1 UE,3 CE": uncorrected and
-/// corrected); otherwise whether the RAM uses ECC: "yes", "no", or "?" if
-/// the EDAC driver doesn't say.
+/// The ECC cell: "?" if what EDAC says (`edac`) couldn't be read; if the
+/// memory controllers counted errors, how many, in yellow (e.g. "1 UE,3
+/// CE": uncorrected and corrected); otherwise whether the RAM uses ECC:
+/// "yes", "no", or "?" if the EDAC driver doesn't say.
 fn ecc_cell(edac: Option<&Edac>) -> Cell {
     let Some(edac) = edac else { return Plain.cell("?") };
     let mut errors = Vec::new();
