@@ -42,10 +42,10 @@ impl Edac {
     /// memory controller is registered; otherwise `None`, as the driver
     /// doesn't say.
     pub fn ecc(&self) -> Option<bool> {
-        let corrects: Vec<_> = self.dimm_modes.iter().map(|mode| corrects(mode)).collect();
-        if corrects.is_empty() || corrects.contains(&Some(false)) {
+        let any = |answer| self.dimm_modes.iter().any(|mode| corrects(mode) == answer);
+        if self.dimm_modes.is_empty() || any(Some(false)) {
             Some(false)
-        } else if corrects.contains(&None) {
+        } else if any(None) {
             None
         } else {
             Some(true)
@@ -67,17 +67,20 @@ for file in /sys/devices/system/edac/mc/mc*/dimm*/dimm_edac_mode /sys/devices/sy
 done
 "#;
 
-/// Parses what [`READ_FILES`] prints.
+/// Parses `output`, which is what [`READ_FILES`] prints: a "PATH VALUE" line
+/// for each file.  Returns the DIMMs' modes in the order of their lines, and
+/// the counts summed over the memory controllers.
 fn parse(output: &str) -> Result<Edac> {
     let mut edac = Edac::default();
     for line in output.lines() {
         let context = || format!("unexpected EDAC line {line:?}");
-        let (path, value) = line.split_once(' ').ok_or_else(|| anyhow!(context()))?;
-        let count = || value.parse::<u64>().with_context(context);
+        let (path, value) = line.split_once(' ').filter(|(_, value)| !value.is_empty()).ok_or_else(|| anyhow!(context()))?;
+        // The kernel's counts are u32s, so no sum of them overflows a u64.
+        let count = || value.parse::<u32>().map(u64::from).with_context(context);
         match path.rsplit_once('/').map(|(_, name)| name) {
             Some("dimm_edac_mode") => edac.dimm_modes.push(value.to_string()),
-            Some("ce_count") => edac.corrected_errors += count()?,
-            Some("ue_count") => edac.uncorrected_errors += count()?,
+            Some("ce_count")       => edac.corrected_errors += count()?,
+            Some("ue_count")       => edac.uncorrected_errors += count()?,
             _ => bail!(context()),
         }
     }
@@ -85,7 +88,8 @@ fn parse(output: &str) -> Result<Edac> {
 }
 
 /// What the EDAC memory controllers say about the RAM of the machine at the
-/// other end of `session`.
+/// other end of `session`: [`Edac::default`] if none is registered.  Fails
+/// if one of their files can't be read, or says something unexpected.
 pub fn read(session: &mut Session) -> Result<Edac> {
     parse(&session.run_ok(READ_FILES, QUICK)?)
 }
@@ -93,6 +97,9 @@ pub fn read(session: &mut Session) -> Result<Edac> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
 
     /// An [`Edac`] with no errors and these `modes`.
     fn modes(modes: &[&str]) -> Edac {
@@ -114,9 +121,49 @@ mod tests {
         assert_eq!(parse("").unwrap(), Edac::default());
     }
 
+    /// Runs [`READ_FILES`] here, on the files under `root` rather than under
+    /// /sys/devices/system/edac/mc, and returns what it prints.
+    fn read_files_under(root: &Path) -> String {
+        let script = READ_FILES.replace("/sys/devices/system/edac/mc", root.to_str().unwrap());
+        let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn reads_files() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_files_under(root.path()), "");
+        let files = [
+            ("mc0/dimm0/dimm_edac_mode", "SECDED"),
+            ("mc0/ce_count", "2"),
+            ("mc0/ue_count", "0"),
+            // Included in mc0/ce_count
+            ("mc0/csrow0/ce_count", "2"),
+            ("mc1/rank3/dimm_edac_mode", "S4ECD4ED"),
+            ("mc1/ce_count", "1"),
+            ("mc1/ue_count", "1"),
+        ];
+        for (file, value) in files {
+            let path = root.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("{value}\n")).unwrap();
+        }
+        let edac = parse(&read_files_under(root.path())).unwrap();
+        assert_eq!(edac, Edac { dimm_modes: vec!["SECDED".into(), "S4ECD4ED".into()], corrected_errors: 3, uncorrected_errors: 1 });
+    }
+
     #[test]
     fn rejects_garbage() {
-        for output in ["SECDED", "/sys/devices/system/edac/mc/mc0/size_mb 4096", "/sys/devices/system/edac/mc/mc0/ce_count", "/sys/devices/system/edac/mc/mc0/ue_count -1"] {
+        let lines = [
+            "SECDED",
+            "/sys/devices/system/edac/mc/mc0/size_mb 4096",
+            "/sys/devices/system/edac/mc/mc0/ce_count",
+            "/sys/devices/system/edac/mc/mc0/ue_count -1",
+            "/sys/devices/system/edac/mc/mc0/ue_count 4294967296",
+            "/sys/devices/system/edac/mc/mc0/dimm0/dimm_edac_mode ",
+        ];
+        for output in lines {
             assert!(parse(output).is_err(), "{output:?}");
         }
     }
@@ -127,6 +174,7 @@ mod tests {
         assert_eq!(modes(&["SECDED", "S8ECD8ED"]).ecc(), Some(true));
         assert_eq!(modes(&["SECDED", "None"]).ecc(), Some(false));
         assert_eq!(modes(&["PARITY"]).ecc(), Some(false));
+        assert_eq!(modes(&["EC", "SECDED"]).ecc(), Some(false));
         assert_eq!(modes(&["Unknown", "SECDED"]).ecc(), None);
         assert_eq!(modes(&["Unknown", "None"]).ecc(), Some(false));
         assert_eq!(modes(&["Reserved"]).ecc(), None);

@@ -194,9 +194,9 @@ fn ecc_cell(edac: Option<&Edac>) -> Cell {
         return Yellow.cell(errors.join(","));
     }
     match edac.ecc() {
-        Some(true) => Green.cell("yes"),
+        Some(true)  => Green.cell("yes"),
         Some(false) => Plain.cell("no"),
-        None => Plain.cell("?"),
+        None        => Plain.cell("?"),
     }
 }
 
