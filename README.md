@@ -66,6 +66,8 @@ Whether `nixos-rebuild switch` or `boot` would change the system profile. `bounc
 - The evaluation builds nothing, but it downloads the sources that the configuration fetches, like a rebuild would, and it can take a GB or more of the machine's RAM.
 - `"check_rebuild": false` turns it off.
 
+Whether the RAM uses ECC, as the kernel's EDAC drivers say: `yes`, `no`, or `?` where the driver doesn't say (Intel's ie31200_edac, for Xeon E3 and E-2000, and for Core on W680). It's also `no` where Linux has no EDAC driver for the memory controller, as in a VM. If ECC has found errors since boot, the column shows how many instead, in yellow: e.g. `1 UE,3 CE` (uncorrected, corrected). Either way, it's no reason to refuse.
+
 On a terminal, the table shows up right away and fills in as the machines answer, with a spinner where an answer isn't in yet: in OKAY until a machine's facts are in, and in REBUILD until its evaluation ends. But if TERM is `dumb`, or while the table is too tall for the terminal, the table is left out until every machine has answered.
 
 Below the table, `reboop check -v` (or naming machines, as in `reboop check HOSTNAME`) prints the details: each reason not to reboot, in full; what a rebuild would change, or why the evaluation failed; and why a machine couldn't be checked.

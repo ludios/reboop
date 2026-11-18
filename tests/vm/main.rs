@@ -17,6 +17,7 @@ use reboop::bounce::{self, Outcome};
 use reboop::btrfs::{self, Device, ScrubState};
 use reboop::config::{Machine, TmuxPolicy};
 use reboop::deadline::{Deadline, Permanent};
+use reboop::edac::Edac;
 use reboop::facts::{self, Rebuild};
 use reboop::initrd::{self, UnlockError};
 use reboop::preflight;
@@ -366,6 +367,8 @@ fn preflight_finds_blockers(vm: &Vm) -> Result<()> {
     let facts = preflight::gather(&mut session, &machine.hostname)?;
     assert_eq!(facts.systems, facts::systems(&mut session)?);
     assert!(facts.btrfs.iter().any(|fs| fs.filesystem.mountpoint == "/"), "{facts:#?}");
+    // qemu's q35 machine has no memory controller that EDAC knows.
+    assert_eq!(facts.edac, Edac::default(), "{facts:#?}");
     assert_eq!(preflight::blockers(&machine, &facts), Vec::<String>::new(), "{facts:#?}");
     // The VM's root is far from full, but not empty.
     let used = facts.root_used_percent;

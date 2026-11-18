@@ -3,6 +3,7 @@
 use crate::boot::{self, DefaultBoot};
 use crate::btrfs::{self, Device, Filesystem, ScrubState, ScrubStatus};
 use crate::config::Machine;
+use crate::edac::{self, Edac};
 use crate::facts::{self, Inhibitor, Job, Systems};
 use crate::human;
 use crate::processes::{self, Activity, Process};
@@ -43,8 +44,8 @@ pub struct DiskFacts {
     pub smart: Smart,
 }
 
-/// What a machine is doing that a reboot would interrupt, and what a reboot
-/// would change.
+/// What a machine is doing that a reboot would interrupt, what a reboot would
+/// change, and whether its RAM uses ECC.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Facts {
     pub boot_id: String,
@@ -75,6 +76,8 @@ pub struct Facts {
     /// The whole disks beneath the btrfs filesystems and what SMART says
     /// about them, or `None` if the machine has no smartctl.
     pub disks: Option<Vec<DiskFacts>>,
+    /// As from [`edac::read`]
+    pub edac: Edac,
 }
 
 /// The whole disks beneath `filesystems`, and what SMART says about them;
@@ -134,6 +137,7 @@ pub fn gather(session: &mut Session, hostname: &str) -> Result<Facts> {
         lasting_jobs,
         btrfs,
         disks,
+        edac: edac::read(session)?,
     })
 }
 
@@ -323,6 +327,7 @@ pub(crate) fn idle_facts() -> Facts {
             disk: Disk { path: "/dev/sda".into(), model: Some("QEMU HARDDISK".into()), serial: Some("QM00001".into()) },
             smart: Smart::Read { passed: Some(true), warnings: BTreeMap::new(), incomplete: None },
         }]),
+        edac: Edac { dimm_modes: vec!["SECDED".into(), "SECDED".into()], corrected_errors: 0, uncorrected_errors: 0 },
     }
 }
 

@@ -7,6 +7,7 @@ pub mod check;
 pub mod child;
 pub mod config;
 pub mod deadline;
+pub mod edac;
 pub mod facts;
 pub mod human;
 pub mod initrd;

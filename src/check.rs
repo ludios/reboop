@@ -3,6 +3,7 @@
 
 use crate::btrfs::{Device, ScrubState};
 use crate::config::{self, Machine, TmuxPolicy};
+use crate::edac::Edac;
 use crate::facts::{self, Inhibitor, Rebuild};
 use crate::human::{self, Align::{Center, Left, Right}, Cell, Style, Style::{Bold, Green, Plain, Red, Yellow}};
 use crate::preflight::{self, DiskFacts, Facts};
@@ -120,7 +121,7 @@ fn check_all(machines: &[&Machine], mut update: impl FnMut(Option<(usize, Update
 /// The activities that have columns of their own.
 const ACTIVITY_COLUMNS: [Activity; 2] = [Activity::Nix, Activity::Copy];
 
-const HEADER: [&str; 16] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "COPY", "NET", "LOAD", "ROOT", "SMART", "OTHER", "REBUILD", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
+const HEADER: [&str; 17] = ["MACHINE", "OKAY", "SCRUB", "NIX", "TMUX", "COPY", "NET", "LOAD", "ROOT", "SMART", "OTHER", "ECC", "REBUILD", "REBOOT", "KERNEL", "BUILT", "BOOTED"];
 
 /// The headers centered over their columns; the rest are flush left.
 const CENTERED: [&str; 2] = ["NET", "OTHER"];
@@ -170,6 +171,27 @@ fn smart_cell(facts: &Facts) -> Cell {
     }
 }
 
+/// The ECC cell: if ECC found any errors, how many, in yellow (e.g. "1 UE,3
+/// CE": uncorrected and corrected); otherwise whether the RAM uses ECC: "yes",
+/// "no", or "?" if the EDAC driver doesn't say.
+fn ecc_cell(edac: &Edac) -> Cell {
+    let mut errors = Vec::new();
+    if edac.uncorrected_errors > 0 {
+        errors.push(format!("{} UE", edac.uncorrected_errors));
+    }
+    if edac.corrected_errors > 0 {
+        errors.push(format!("{} CE", edac.corrected_errors));
+    }
+    if !errors.is_empty() {
+        return Yellow.cell(errors.join(","));
+    }
+    match edac.ecc() {
+        Some(true) => Green.cell("yes"),
+        Some(false) => Plain.cell("no"),
+        None => Plain.cell("?"),
+    }
+}
+
 /// The TMUX cell: nothing if the machine has no tmux server; with `tmux`
 /// block, how many servers it has, in red, as they block a reboot; with
 /// resume, "?" in red if a server couldn't be listed, which blocks a
@@ -192,9 +214,10 @@ fn tmux_cell(machine: &Machine, facts: &Facts) -> Cell {
 }
 
 /// The table row about `machine`: the facts that decide whether to reboot
-/// it, red where they block a reboot, whether a nixos-rebuild would change
-/// it ("ok" if not, "stale" if so, "?" if that couldn't be evaluated, or
-/// nothing if it wasn't checked), why it needs a reboot (if it does),
+/// it, red where they block a reboot, whether its RAM uses ECC (see
+/// [`ecc_cell`]), whether a nixos-rebuild would change it ("ok" if not,
+/// "stale" if so, "?" if that couldn't be evaluated, or nothing if it
+/// wasn't checked), why it needs a reboot (if it does),
 /// the kernel it runs (and the one it would boot, if different), and when
 /// that kernel was built and booted, in `zone`.  Where `progress` says the
 /// check isn't done, `spinner` stands in for what's yet to come: in the
@@ -243,6 +266,7 @@ fn table_row(machine: &Machine, progress: &Progress, spinner: char, zone: &TimeZ
         number(preflight::root_full(machine, facts), format!("{}%", facts.root_used_percent)),
         smart_cell(facts),
         list(Red, other_reasons(facts).iter().map(String::as_str).collect()),
+        ecc_cell(&facts.edac),
         rebuild,
         list(Plain, reboot_reasons.iter().map(String::as_str).collect()),
         Plain.cell(kernel),
@@ -414,8 +438,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// The outcome of checking [`test_machine`] while it has something wrong
-    /// for each column and each of the other reasons, and a nixos-rebuild
-    /// would change it.
+    /// for each column and each of the other reasons, ECC has found errors,
+    /// and a nixos-rebuild would change it.
     fn blocked_outcome() -> Outcome {
         let mut facts = idle_facts();
         facts.systems.default_kernel = "6.18.55".into();
@@ -444,6 +468,8 @@ mod tests {
         };
         facts.inhibitors.push(crawl);
         facts.lasting_jobs.push(Job { id: 361, unit: "nixos-upgrade.service".into(), job_type: "start".into(), state: "running".into() });
+        facts.edac.corrected_errors = 3;
+        facts.edac.uncorrected_errors = 1;
         let blockers = preflight::blockers(&test_machine(), &facts);
         let rebuild = Rebuild::Stale { toplevel: "/nix/store/ccc-nixos-system-one-26.05".into(), nix_path: "nixpkgs=/var/nixpkgs".into() };
         Ok((facts, blockers, Some(rebuild)))
@@ -471,18 +497,18 @@ mod tests {
         ];
         assert_eq!(
             table(&checks, '⠋', false, &TimeZone::UTC),
-            "MACHINE  OKAY   SCRUB  NIX  TMUX  COPY     NET      LOAD   ROOT  SMART                                 OTHER                                 REBUILD  REBOOT                      KERNEL             BUILT        BOOTED\n\
-             one      no                    1        12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  stale    new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
-             two      yes                             1.00 kB/s   0.50   45%  ok                                                                          ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
+            "MACHINE  OKAY   SCRUB  NIX  TMUX  COPY     NET      LOAD   ROOT  SMART                                 OTHER                                 ECC        REBUILD  REBOOT                      KERNEL             BUILT        BOOTED\n\
+             one      no                    1        12.50 MB/s  12.50   98%  sda    btrfs balance,btrfs device trouble,switch,cryptsetup,inhibitor,jobs  1 UE,3 CE  stale    new kernel,rebuilt systemd  6.18.54 → 6.18.55  ?            09-30T08:27\n\
+             two      yes                             1.00 kB/s   0.50   45%  ok                                                                          yes        ok                                   6.18.54            09-25T14:35  09-30T08:27\n\
              three    error\n\
-             four     yes                             1.00 kB/s   0.50   45%  ok                                                                          ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
-             five     yes                             1.00 kB/s   0.50   45%  ok                                                                                                               6.18.54            09-25T14:35  09-30T08:27\n"
+             four     yes                             1.00 kB/s   0.50   45%  ok                                                                          yes        ?                                    6.18.54            09-25T14:35  09-30T08:27\n\
+             five     yes                             1.00 kB/s   0.50   45%  ok                                                                          yes                                             6.18.54            09-25T14:35  09-30T08:27\n"
         );
         let styles = |(machine, progress): &(&Machine, Progress)| table_row(machine, progress, '⠋', &TimeZone::UTC).into_iter().map(|cell| cell.spans[0].0).collect::<Vec<_>>();
-        assert_eq!(styles(&checks[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Plain, Plain, Plain, Plain, Plain]);
-        assert_eq!(styles(&checks[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&checks[0]), [Plain, Red, Plain, Plain, Red, Plain, Red, Red, Red, Red, Red, Yellow, Plain, Plain, Plain, Plain, Plain]);
+        assert_eq!(styles(&checks[1]), [Plain, Green, Plain, Plain, Plain, Plain, Green, Green, Green, Green, Plain, Green, Green, Plain, Plain, Plain, Plain]);
         assert_eq!(styles(&checks[2])[..2], [Plain, Yellow]);
-        assert_eq!(styles(&checks[3])[11], Plain);
+        assert_eq!(styles(&checks[3])[12], Plain);
         assert!(CENTERED.iter().all(|title| HEADER.contains(title)), "a centered header isn't in HEADER");
 
         let outcomes: Vec<_> = checks.into_iter().map(|(machine, progress)| (machine, progress.into_outcome())).collect();
@@ -521,10 +547,10 @@ mod tests {
         ];
         assert_eq!(
             table(&checks, '⠙', false, &TimeZone::UTC),
-            "MACHINE  OKAY  SCRUB  NIX  TMUX  COPY     NET     LOAD  ROOT  SMART  OTHER  REBUILD  REBOOT  KERNEL   BUILT        BOOTED\n\
+            "MACHINE  OKAY  SCRUB  NIX  TMUX  COPY     NET     LOAD  ROOT  SMART  OTHER  ECC  REBUILD  REBOOT  KERNEL   BUILT        BOOTED\n\
              one      ⠙\n\
-             two      yes                           1.00 kB/s  0.50   45%  ok            ⠙                6.18.54  09-25T14:35  09-30T08:27\n\
-             three    yes                           1.00 kB/s  0.50   45%  ok                             6.18.54  09-25T14:35  09-30T08:27\n"
+             two      yes                           1.00 kB/s  0.50   45%  ok            yes  ⠙                6.18.54  09-25T14:35  09-30T08:27\n\
+             three    yes                           1.00 kB/s  0.50   45%  ok            yes                   6.18.54  09-25T14:35  09-30T08:27\n"
         );
     }
 
@@ -583,6 +609,27 @@ mod tests {
     }
 
     #[test]
+    fn shows_ecc_in_one_cell() {
+        let cell = |edac: &Edac| {
+            let cell = ecc_cell(edac);
+            (cell.spans[0].0, cell.spans[0].1.clone())
+        };
+        let mut edac = idle_facts().edac;
+        assert_eq!(cell(&edac), (Green, "yes".into()));
+        edac.dimm_modes[1] = "Unknown".into();
+        assert_eq!(cell(&edac), (Plain, "?".into()));
+        edac.dimm_modes[0] = "None".into();
+        assert_eq!(cell(&edac), (Plain, "no".into()));
+        edac.corrected_errors = 2;
+        assert_eq!(cell(&edac), (Yellow, "2 CE".into()));
+        edac.uncorrected_errors = 1;
+        assert_eq!(cell(&edac), (Yellow, "1 UE,2 CE".into()));
+        edac.corrected_errors = 0;
+        assert_eq!(cell(&edac), (Yellow, "1 UE".into()));
+        assert_eq!(cell(&Edac::default()), (Plain, "no".into()));
+    }
+
+    #[test]
     fn names_each_btrfs_operation_once() {
         let mut facts = idle_facts();
         facts.btrfs[0].exclusive_operation = "device replace".into();
@@ -619,6 +666,7 @@ mod tests {
         assert_eq!(report["facts"]["systems"]["default_kernel"], "6.18.55");
         assert_eq!(report["facts"]["systems"]["running_kernel_built_at"], Value::Null);
         assert_eq!(report["facts"]["booted_at"], "2026-09-30T08:27:56Z");
+        assert_eq!(report["facts"]["edac"], json!({"dimm_modes": ["SECDED", "SECDED"], "corrected_errors": 3, "uncorrected_errors": 1}));
         let report = json(&Err(anyhow!("no route to host")));
         assert_eq!(report, json!({"machine": "one", "okay_to_reboot": false, "error": "no route to host"}));
     }
