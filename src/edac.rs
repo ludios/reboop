@@ -44,14 +44,14 @@ fn corrects(mode: &str) -> Option<bool> {
 
 impl Edac {
     /// Whether the RAM uses ECC: `Some(true)` if every populated DIMM's mode
-    /// corrects errors; `Some(false)` if some DIMM's mode doesn't, or if no
-    /// memory controller is registered; otherwise `None`, as the driver
-    /// doesn't say.
+    /// corrects errors; `Some(false)` if some DIMM's mode doesn't; otherwise
+    /// `None`, as no driver says, as when no memory controller is registered
+    /// (no DIMM has a mode), or when a DIMM's mode is "Unknown".
     pub fn ecc(&self) -> Option<bool> {
         let any = |answer| self.dimm_modes.iter().any(|mode| corrects(mode) == answer);
-        if self.dimm_modes.is_empty() || any(Some(false)) {
+        if any(Some(false)) {
             Some(false)
-        } else if any(None) {
+        } else if self.dimm_modes.is_empty() || any(None) {
             None
         } else {
             Some(true)
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn knows_whether_ecc_is_on() {
-        assert_eq!(modes(&[]).ecc(), Some(false));
+        assert_eq!(modes(&[]).ecc(), None);
         assert_eq!(modes(&["SECDED", "S8ECD8ED"]).ecc(), Some(true));
         assert_eq!(modes(&["SECDED", "None"]).ecc(), Some(false));
         assert_eq!(modes(&["PARITY"]).ecc(), Some(false));

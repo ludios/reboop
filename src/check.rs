@@ -180,7 +180,8 @@ fn smart_cell(facts: &Facts) -> Cell {
 /// The ECC cell: "?" if what EDAC says (`edac`) couldn't be read; if the
 /// memory controllers counted errors, how many, in yellow (e.g. "1 UE,3
 /// CE": uncorrected and corrected); otherwise whether the RAM uses ECC:
-/// "yes", "no", or "?" if the EDAC driver doesn't say.
+/// "yes", "no", "?" if the EDAC driver doesn't say, or nothing if no DIMM
+/// has a mode, as when no EDAC memory controller is registered.
 fn ecc_cell(edac: Option<&Edac>) -> Cell {
     let Some(edac) = edac else { return Plain.cell("?") };
     let mut errors = Vec::new();
@@ -194,9 +195,10 @@ fn ecc_cell(edac: Option<&Edac>) -> Cell {
         return Yellow.cell(errors.join(","));
     }
     match edac.ecc() {
-        Some(true)  => Green.cell("yes"),
+        Some(true) => Green.cell("yes"),
         Some(false) => Plain.cell("no"),
-        None        => Plain.cell("?"),
+        None if edac.dimm_modes.is_empty() => Plain.cell(""),
+        None => Plain.cell("?"),
     }
 }
 
@@ -635,7 +637,9 @@ mod tests {
         assert_eq!(cell(&edac), (Yellow, "1 UE,2 CE".into()));
         edac.corrected_errors = 0;
         assert_eq!(cell(&edac), (Yellow, "1 UE".into()));
-        assert_eq!(cell(&Edac::default()), (Plain, "no".into()));
+        assert_eq!(cell(&Edac::default()), (Plain, "".into()));
+        // A memory controller with no DIMM's mode, but with counts
+        assert_eq!(cell(&Edac { corrected_errors: 1, ..Edac::default() }), (Yellow, "1 CE".into()));
         let unread = ecc_cell(None);
         assert_eq!((unread.spans[0].0, unread.spans[0].1.as_str()), (Plain, "?"));
     }
